@@ -16,6 +16,17 @@ from hisense_loader import NUM_TGC_BANDS, band_edges
 DEFAULT_CYST_CONTRAST_DB = 10.0
 DEFAULT_MIN_CYST_AREA_MM2 = 1.0
 DEFAULT_BACKGROUND_RING_MM = 1.5
+# Distance both CNR regions keep from the lesion boundary, so neither samples the
+# transition zone where the level ramps between lesion and background. Measured on the
+# Field II cyst phantoms, whose masks are exact: a low-contrast lesion's CNR settles at
+# 4.76 / 4.88 / 4.77 for gaps of 0.6 / 1.0 / 1.5 mm, against 2.09 with no gap at all.
+# An anechoic lesion never settles - eroding further keeps finding darker pixels - so
+# the convention has to be fixed here rather than left to a detection threshold.
+#
+# Deliberately a fixed distance rather than a multiple of the resolution cell. Tying it
+# to resolution would make CNR move when focus or frequency changes, which is circular:
+# those are the parameters CNR is being used to judge.
+DEFAULT_CNR_GAP_MM = 0.6
 FWHM_DROP_DB = 6.0
 
 
@@ -133,7 +144,7 @@ def detect_anechoic_targets(
             {
                 "mask": mask,
                 "area_mm2": area_mm2,
-                "depth_mm": float(rows.mean()) * geometry.mm_per_point,
+                "depth_mm": float(rows.mean()) * geometry.mm_per_point + geometry.min_depth_mm,
                 "lateral_mm": float(cols.mean()) * geometry.mm_per_line,
                 "equivalent_diameter_mm": float(2.0 * np.sqrt(area_mm2 / np.pi)),
             }
@@ -141,16 +152,33 @@ def detect_anechoic_targets(
     return sorted(targets, key=lambda target: target["area_mm2"], reverse=True)
 
 
-def cyst_cnr(db_image, target_mask, geometry, ring_mm=DEFAULT_BACKGROUND_RING_MM):
-    """Contrast-to-noise ratio of one anechoic target against a surrounding background ring."""
+def cyst_cnr(db_image, target_mask, geometry, ring_mm=DEFAULT_BACKGROUND_RING_MM,
+             gap_mm=DEFAULT_CNR_GAP_MM):
+    """Contrast-to-noise ratio of one target against a surrounding background ring.
+
+    Both regions are held gap_mm clear of the mask boundary: the target region is eroded
+    by that much and the ring starts outside a matching dilation. Without the gap the
+    transition zone lands inside the target region, which raises its mean and its variance
+    at once and halves the result; see DEFAULT_CNR_GAP_MM.
+
+    Pass gap_mm=0 to reproduce the old behaviour.
+    """
     db_image = np.asarray(db_image, dtype=np.float64)
+    gap_rows = int(round(gap_mm / geometry.mm_per_point))
+    gap_cols = int(round(gap_mm / geometry.mm_per_line))
+    if gap_rows > 0 or gap_cols > 0:
+        gap_rows, gap_cols = max(1, gap_rows), max(1, gap_cols)
+        inner = ~_dilate(~target_mask, gap_rows, gap_cols)
+        outer = _dilate(target_mask, gap_rows, gap_cols)
+    else:
+        inner = outer = target_mask
     radius_rows = max(1, int(round(ring_mm / geometry.mm_per_point)))
     radius_cols = max(1, int(round(ring_mm / geometry.mm_per_line)))
-    background = _dilate(target_mask, radius_rows, radius_cols) & ~_dilate(target_mask, 1, 1)
-    if background.sum() < 10 or target_mask.sum() < 10:
+    background = _dilate(outer, radius_rows, radius_cols) & ~outer
+    if background.sum() < 10 or inner.sum() < 10:
         return float("nan")
 
-    inside, outside = db_image[target_mask], db_image[background]
+    inside, outside = db_image[inner], db_image[background]
     spread = np.sqrt((inside.var() + outside.var()) / 2.0)
     return float(abs(inside.mean() - outside.mean()) / spread) if spread > 0 else float("inf")
 

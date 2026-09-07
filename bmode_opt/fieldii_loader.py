@@ -107,9 +107,13 @@ class FieldIICapture:
     def tissue_median_db(self):
         """Median dB over the middle half of the depth range.
 
-        The exposure handle: adding -tissue_median_db to gain puts the tissue at whatever
-        level the display pivot sits at. Computed over the middle half so the near-field
-        coupling rows and the noise-floor tail stay out of it.
+        The exposure handle: passing this as reference_db puts the tissue median on the
+        display pivot, which normalises frames against each other. It is not a good
+        operating point on its own - GRAY_PIVOT is 43, while the objective prefers tissue
+        nearer gray 115 - so expect the gain search to land well above zero from here.
+
+        Computed over the middle half so the near-field coupling rows and the noise-floor
+        tail stay out of it.
         """
         lo, hi = self.db_image.shape[0] // 4, 3 * self.db_image.shape[0] // 4
         return float(np.median(self.db_image[lo:hi]))
