@@ -1,0 +1,7 @@
+# 数据不进版本库：field_ii 9.3G + hisense_medical 2.8G
+data/
+
+__pycache__/
+*.pyc
+output/
+tmp/
