@@ -185,3 +185,38 @@ def console_tissue_mask(db_image, floor_db, margin_db=DEFAULT_TISSUE_MARGIN_DB):
             "drop the frame as undecidable - do not estimate the floor from the frame itself."
         )
     return np.asarray(db_image, dtype=np.float64) > float(floor_db) + float(margin_db)
+
+
+# Gray level spread that counts as one unit of brightness error. Within a session and mode the
+# accepted tissue level scatters by 2.5 to 12 gray, so 25 makes a full unit a clearly wrong
+# image rather than ordinary operator variation.
+BRIGHTNESS_SCALE_GRAY = 25.0
+
+
+def measure_accepted_brightness(captures, render_fn, tissue_mask_fn):
+    """Where the tissue level sits when a group's frames are rendered at their own settings.
+
+    This is the one brightness reference the data actually contains: not a number chosen for
+    how images ought to look, but where the operator left the knobs on frames they kept. It has
+    to be measured per session and imaging mode for the same reason the noise floor does - the
+    dB scale behind BC0 is a per-session calibration, and rendering one mode's frames through
+    another's constants moves the answer without anyone having touched a knob.
+
+    render_fn(capture) returns the frame rendered at its own gain, sliders and dynamic range;
+    tissue_mask_fn(capture) returns its tissue mask.
+    """
+    values = []
+    for capture in captures:
+        mask = tissue_mask_fn(capture)
+        if mask.sum() < 1000:
+            continue
+        values.append(float(np.median(render_fn(capture)[mask])))
+    if not values:
+        return None
+    values = np.asarray(values, dtype=np.float64)
+    return {
+        "target_gray": float(np.median(values)),
+        "std_gray": float(np.std(values)),
+        "quartiles_gray": (float(np.percentile(values, 25)), float(np.percentile(values, 75))),
+        "num_frames": int(values.size),
+    }

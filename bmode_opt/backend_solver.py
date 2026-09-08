@@ -55,40 +55,47 @@ What *is* reported alongside it is the equivalent set: every action scoring with
 per-frame tolerance of the best. Down that road a model should not be punished for choosing a
 different member of it, and a controller sitting inside it should not move.
 
-    The answer this returns is unique but not yet trustworthy
+    Why dynamic range is held rather than searched
 
-Making the optimum well defined does not make it right, and running this solver exposed a
-defect in the objective it minimises. Sweeping the dynamic range on a Field II uniform phantom
-at 42 mm / 5 MHz, taking the best gain at each setting:
+It is not determined by the data now in hand, and every criterion that could determine it was
+tried and measured:
 
-    dynamic range    crushed   saturated   uniformity   utilisation   objective
-         30           0.0000     0.0000       0.1610       0.3490       0.5100
-         67           0.0000     0.0000       0.1250       0.4941       0.6191
-        400           0.0000     0.0000       0.0411       0.8314       0.8725
+  * Fitting the window to the signal. Gray span is signal dB span over window width, so the
+    old utilisation term was already this comparison written differently - the two agree to
+    0.003 across the whole ladder. On console frames the tissue spans only 19 to 21 dB in
+    harmonic mode and 27 to 31 dB in general mode, against a narrowest settable window of
+    45.6 dB, so the signal never fills even the narrowest window and the term is a constant
+    vote for the minimum whatever the image looks like.
 
-The two terms carrying weight three never fire, at any setting. What is left is uniformity
-pulling wide against utilisation pulling narrow, and utilisation has four times the slope, so
-the search rails to the narrowest window the console offers and then declines to apply any
-depth correction at all - the shape scale comes back at zero on seven of twelve frames.
+  * Widening the window to reach the brightest structure. From the measured noise floor up to
+    the 99.9th percentile of the frame spans 26.5 to 28.2 dB in harmonic mode and 36.8 to 39.6
+    in general mode. Still below 45.6, so this criterion also says minimum. Meanwhile the
+    frames were actually acquired at dynamic range 67, a 58.7 dB window - nearly twice the
+    signal - on 188 of 207 captures.
 
-Why the exposure term is inert: at that optimum 18.7% of the image renders black, and the
-crushed term counts 0.0% of it. Both the signal mask and the crushed test are thresholds on
-the same dB value, and here they sit 2.6 dB apart, so nearly everything that gets crushed has
-already been excluded as noise. Per band, at the optimum:
+  * Lesion separability. gCNR between a cyst and its same-depth background moves from 0.6996
+    to 0.6979 across the entire ladder from 30 to 400. That flatness is not a defect; gCNR is
+    invariant to monotone transforms by construction, which is exactly why it is safe to
+    compare across settings, and exactly why it cannot choose between them.
 
-    band    depth mm     median gray   black pixels   counted as crushed
-      6     24.4-29.2         31           20.4%             0.0%
-      7     29.2-34.1          8           43.4%             0.0%
-      8     34.1-39.0          0           69.6%             0.0%
+The reason none of them bite is that dynamic range governs the discrimination of structures a
+few dB apart, and there are none in the data. The Field II generator sets a cyst's scatterer
+amplitudes to zero, so the two measurable lesions sit at 26.1 and 39.5 dB of contrast; an
+anechoic void is a black hole against gray tissue at any window width.
 
-The mask is that aggressive because objective.signal_mask() takes its floor from the median of
-the deepest rows, and on Field II there is no floor to find: every shard carries
-noise_enabled=0 and the band medians fall from -16.4 to -41.5 dB without a plateau, so the
-"noise floor" is deep tissue and 18.9% of the frame is discarded as noise.
+So dynamic range is reported back unchanged with dr_determined False. Determining it needs
+low-contrast lesions - a few dB, not twenty - which is a phantom to simulate or acquire, not
+a weight to tune.
 
-So the dynamic range and slider parts of what this returns should not be used as labels yet.
-Repairing the mask is one argument here - pass tissue_weight, and valid_mask to the objective -
-but the term also needs to stop coinciding with the mask, which is a change to objective.py.
+    What still depends on the per-session calibration
+
+target_gray comes from tissue.measure_accepted_brightness() and has to be measured per session
+and imaging mode. Within a mode it reproduces well across sessions - general mode reads 92, 90
+and 89 gray on three sessions, harmonic 34, 34, 36 and 36 on four - but the two modes differ by
+a factor of 2.6, and that gap cannot yet be attributed. DEFAULT_PIVOT_DB and
+DEFAULT_COUNTS_PER_DB were calibrated on one session in one mode, and counts_per_db has been
+seen to differ by 20% between sessions, which moves rendered gray without anyone touching a
+knob. Until that is settled, brightness targets are usable within a group and not across one.
 """
 
 import numpy as np
@@ -282,116 +289,115 @@ def solve_tgc_shape(
     }
 
 
-class GainWindowSweep:
-    """Scores the whole gain by dynamic-range sweep for one TGC shape without re-rendering.
+class GainSweep:
+    """Scores a whole gain sweep for one TGC shape and window without re-rendering.
 
-    Rendering a frame takes about 19 ms, and a useful sweep is a thousand settings, so the
-    direct route costs twenty seconds a frame and a full day over the dataset. It is also
-    unnecessary work: for a fixed TGC shape, gain only shifts the dB image by a constant and
-    the dynamic range only rescales dB onto gray. Both leave the *order* of the pixels alone,
-    and every term of the objective is an order statistic or a threshold count:
+    Rendering a frame takes about 19 ms and a useful sweep is hundreds of settings, so the
+    direct route costs tens of seconds a frame and days over the dataset. It is also
+    unnecessary: for a fixed TGC shape, gain only shifts the dB image by a constant and the
+    window only rescales dB onto gray. Both leave the *order* of the pixels alone, and every
+    term of the objective is a threshold count, a fixed constant, or a histogram of gray:
 
-        crushed      pixels below a dB threshold that gain and window width place
-        saturated    pixels above another such threshold
-        uniformity   the per-band median gray, which is the median dB mapped through
-        utilisation  the 1st and 99th percentile gray, likewise
+        crushed             tissue pixels below a dB threshold gain and window width place
+        saturated           all pixels above another such threshold
+        uniformity          the spread of band levels in dB, which neither gain nor the
+                            window can touch, so it is computed once per shape
+        noise brightening   the mean excess gray of void pixels, taken from their exact
+                            per-gray-level histogram rather than from an affine approximation
 
-    So sorting the dB values once turns each of the thousand evaluations into two binary
-    searches and a handful of scalar maps. The mapping is monotone, so medians and percentiles
-    commute with it exactly - including the interpolation numpy does between order statistics,
-    which is reproduced here on the two neighbours rather than approximated. Verified against
-    the renderer to the last bit; see the step 1 verification.
+    So sorting the dB values once turns each evaluation into a handful of binary searches.
+    Verified against the renderer to the last bit; see tests/verify_backend_solver_fastpath.py.
 
-    The signal mask is taken from the pre-display image and therefore does not move during the
-    sweep. That is deliberate: a mask that responded to the setting being searched would let
-    the search improve its score by pushing awkward pixels out of the scored region.
+    The masks come from the pre-display image and do not move during the sweep. That is
+    deliberate: a mask that responded to the setting being searched would let the search
+    improve its score by pushing awkward pixels out of the scored region.
     """
 
-    def __init__(self, db_image, tgc_levels, signal_mask, num_bands=NUM_TGC_BANDS,
-                 db_per_level=DEFAULT_DB_PER_LEVEL, weights=None):
+    def __init__(self, db_image, tgc_levels, valid_mask, void_mask=None,
+                 num_bands=NUM_TGC_BANDS, db_per_level=DEFAULT_DB_PER_LEVEL, weights=None,
+                 uniformity_scale_db=OBJ.DEFAULT_UNIFORMITY_SCALE_DB, target_gray=None,
+                 brightness_scale_gray=25.0):
         shaped = apply_tgc(np.asarray(db_image, dtype=np.float64), tgc_levels, db_per_level)
-        mask = np.asarray(signal_mask, dtype=bool)
+        valid_mask = np.asarray(valid_mask, dtype=bool)
+        if void_mask is None:
+            void_mask = ~valid_mask
+        void_mask = np.asarray(void_mask, dtype=bool)
+
         self.weights = OBJ.DEFAULT_WEIGHTS if weights is None else weights
         self.total_pixels = int(shaped.size)
-        self.signal_values = np.sort(shaped[mask])
+        self.tissue_values = np.sort(shaped[valid_mask])
         self.all_values = np.sort(shaped.ravel())
-        self.num_signal = int(self.signal_values.size)
+        self.void_values = np.sort(shaped[void_mask])
+        self.num_tissue = int(self.tissue_values.size)
+        self.num_void = int(self.void_values.size)
 
-        edges = band_edges(shaped.shape[0], num_bands)
-        self.band_pairs = []
-        for index in range(num_bands):
-            band_mask = mask[edges[index]:edges[index + 1]]
-            if band_mask.sum() < 50:
-                continue
-            values = np.sort(shaped[edges[index]:edges[index + 1]][band_mask])
-            middle = values.size // 2
-            if values.size % 2:
-                self.band_pairs.append((values[middle], values[middle]))
-            else:
-                self.band_pairs.append((values[middle - 1], values[middle]))
+        # Independent of gain and of the window, so it is a property of this shape alone.
+        uniformity = OBJ.depth_uniformity_db_cost(shaped, valid_mask, num_bands,
+                                                  uniformity_scale_db)
+        self.uniformity = 0.0 if not np.isfinite(uniformity) else float(uniformity)
 
-        self.low_parts = self._percentile_parts(self.signal_values, 1.0)
-        self.high_parts = self._percentile_parts(self.signal_values, 99.0)
+        # Excess gray charged to a void pixel at each of the 256 possible gray levels.
+        self.void_excess = np.clip(np.arange(256.0) - OBJ.VOID_GRAY_LIMIT, 0.0, None) \
+            / (GRAY_MAX - OBJ.VOID_GRAY_LIMIT)
 
-    @staticmethod
-    def _percentile_parts(values, percent):
-        """The two order statistics and the weight numpy's linear percentile interpolates."""
-        if values.size == 0:
-            return None
-        position = percent / 100.0 * (values.size - 1)
-        lower = int(np.floor(position))
-        upper = min(lower + 1, values.size - 1)
-        return values[lower], values[upper], position - lower
+        # The two order statistics numpy's median interpolates between, so the tissue level
+        # can be mapped through the display rather than approximated.
+        self.target_gray = target_gray
+        self.brightness_scale_gray = float(brightness_scale_gray)
+        if self.num_tissue:
+            middle = self.num_tissue // 2
+            self.tissue_median_pair = (
+                (self.tissue_values[middle], self.tissue_values[middle])
+                if self.num_tissue % 2
+                else (self.tissue_values[middle - 1], self.tissue_values[middle]))
+        else:
+            self.tissue_median_pair = None
 
     @staticmethod
-    def _to_gray(value, gain_db, window_db, reference_db):
-        raw = GRAY_PIVOT + (np.asarray(value, dtype=np.float64) + gain_db - reference_db) / window_db * GRAY_MAX
-        return np.clip(np.round(raw), 0.0, GRAY_MAX)
+    def _db_of_gray(level, gain_db, window_db, reference_db):
+        """The dB value that renders to a given (possibly fractional) gray level."""
+        return float(reference_db) - float(gain_db) + (level - GRAY_PIVOT) * window_db / GRAY_MAX
 
     def evaluate(self, gain_db, window_db, reference_db, return_terms=False):
-        """Objective for one (gain, window) pair, identical to rendering and scoring it."""
+        """Objective for one gain, identical to rendering at that gain and scoring it."""
         window_db = max(1.0, float(window_db))
-        offset = float(reference_db) - float(gain_db)
+        edge = lambda level: self._db_of_gray(level, gain_db, window_db, reference_db)
 
         # gray <= 2 needs the pre-round value at or below 2.5; numpy rounds 2.5 down to 2.
-        crushed_threshold = offset + (2.5 - GRAY_PIVOT) * window_db / GRAY_MAX
-        # gray >= 253 needs it strictly above 252.5; numpy rounds 252.5 down to 252.
-        saturated_threshold = offset + (252.5 - GRAY_PIVOT) * window_db / GRAY_MAX
-
-        if self.num_signal:
-            below = int(np.searchsorted(self.signal_values, crushed_threshold, side="right"))
-            crushed = below / float(self.num_signal)
+        if self.num_tissue:
+            below = int(np.searchsorted(self.tissue_values, edge(2.5), side="right"))
+            crushed = below / float(self.num_tissue)
         else:
             crushed = 0.0
+        # gray >= 253 needs it strictly above 252.5; numpy rounds 252.5 down to 252.
         above = self.total_pixels - int(
-            np.searchsorted(self.all_values, saturated_threshold, side="right")
-        )
+            np.searchsorted(self.all_values, edge(252.5), side="right"))
         saturated = above / float(self.total_pixels)
 
-        if len(self.band_pairs) >= 2:
-            band_grays = [
-                0.5 * (self._to_gray(low, gain_db, window_db, reference_db)
-                       + self._to_gray(high, gain_db, window_db, reference_db))
-                for low, high in self.band_pairs
-            ]
-            uniformity = float(np.std(band_grays) / GRAY_MAX)
+        if self.num_void:
+            boundaries = np.array([edge(level + 0.5) for level in range(255)])
+            cumulative = np.searchsorted(self.void_values, boundaries, side="right")
+            counts = np.empty(256, dtype=np.float64)
+            counts[0] = cumulative[0]
+            counts[1:255] = np.diff(cumulative)
+            counts[255] = self.num_void - cumulative[254]
+            brightening = float((counts * self.void_excess).sum() / self.num_void)
         else:
-            uniformity = 0.0
+            brightening = 0.0
 
-        if self.num_signal < 50 or self.low_parts is None:
-            utilisation = 1.0
+        if self.target_gray is None or self.tissue_median_pair is None or self.num_tissue < 50:
+            brightness = 0.0
         else:
-            def interpolate(parts):
-                lower, upper, weight = parts
-                low_gray = self._to_gray(lower, gain_db, window_db, reference_db)
-                high_gray = self._to_gray(upper, gain_db, window_db, reference_db)
-                return float(low_gray + weight * (high_gray - low_gray))
-
-            span = interpolate(self.high_parts) - interpolate(self.low_parts)
-            utilisation = float(np.clip(1.0 - span / GRAY_MAX, 0.0, 1.0))
+            def to_gray(value):
+                raw = GRAY_PIVOT + (value + gain_db - reference_db) / window_db * GRAY_MAX
+                return float(np.clip(np.round(raw), 0.0, GRAY_MAX))
+            low, high = self.tissue_median_pair
+            level = 0.5 * (to_gray(low) + to_gray(high))
+            brightness = abs(level - float(self.target_gray)) / self.brightness_scale_gray
 
         terms = {"crushed": crushed, "saturated": saturated,
-                 "uniformity": uniformity, "utilisation": utilisation}
+                 "uniformity": self.uniformity, "noise_brightening": brightening,
+                 "brightness": brightness}
         total = float(sum(self.weights[key] * value for key, value in terms.items()))
         if return_terms:
             terms["total"] = total
@@ -419,19 +425,20 @@ def action_distance(gain_db, tgc_levels, dr_ui, reference,
 # the measured tissue trend; how much of it is worth applying is a trade the objective has to
 # make, because the sliders span only +-8.33 dB (127 levels either side of centre at 0.06559 dB
 # per level) while a Field II phantom's tissue falls about 25 dB from 16 to 42 mm. Asked to
-# flatten that completely the fit rails at both ends, and railing costs more in clipping than
-# it wins in uniformity. Nought is a flat slider set, so the flat case is inside this grid.
-DEFAULT_SHAPE_SCALES = (0.0, 0.25, 0.5, 0.75, 1.0)
+# flatten that completely the fit rails at both ends. Nought is a flat slider set, so the flat
+# case is inside this grid.
+DEFAULT_SHAPE_SCALES = (0.0, 0.2, 0.4, 0.6, 0.8, 1.0)
 
 
 def solve_backend(
     db_image,
+    valid_mask,
+    dr_ui,
     reference_db=DEFAULT_PIVOT_DB,
     current=None,
-    valid_mask=None,
+    void_mask=None,
     tissue_weight=None,
     gain_db_grid=DEFAULT_GAIN_DB_GRID,
-    dr_ui_candidates=DEFAULT_DR_UI_CANDIDATES,
     shape_scales=DEFAULT_SHAPE_SCALES,
     num_bands=NUM_TGC_BANDS,
     db_per_level=DEFAULT_DB_PER_LEVEL,
@@ -439,31 +446,37 @@ def solve_backend(
     deadband_db=DEFAULT_DEADBAND_DB,
     weights=None,
     graymap_lut=None,
+    target_gray=None,
     fast=True,
 ):
-    """Best back-end setting for one pre-display dB image, as a unique canonical action.
+    """Best gain and TGC for one pre-display dB image, as a unique canonical action.
+
+    dr_ui is held, not searched, and is reported back unchanged so the delta for dynamic range
+    is zero by construction. See the module note: nothing in the data now in hand determines
+    it, and a label that always reads "set it to the minimum" is not information.
+
+    valid_mask must be supplied - build it with tissue.fieldii_tissue_mask() or
+    tissue.console_tissue_mask(). void_mask defaults to its complement.
 
     The answer depends only on the image, not on where the knobs currently sit. current is used
-    solely to express the answer as a delta, and defaults to neutral sliders at the reference
-    gain with a mid dynamic range.
-
-    The tolerance that defines the equivalent set is derived per frame rather than fixed: it is
-    how far the objective moves when gain is nudged by the deadband, so "indistinguishable"
-    means indistinguishable at the scale at which re-acquiring the same frame twice already
-    disagrees with itself.
+    solely to express the answer as a delta.
     """
     db_image = np.asarray(db_image, dtype=np.float64)
-    mask = _default_valid_mask(db_image) if valid_mask is None else np.asarray(valid_mask, bool)
+    valid_mask = np.asarray(valid_mask, dtype=bool)
+    if void_mask is None:
+        void_mask = ~valid_mask
+    void_mask = np.asarray(void_mask, dtype=bool)
     if tissue_weight is None:
-        tissue_weight = tissue_weight_from_mask(mask)
+        tissue_weight = tissue_weight_from_mask(valid_mask)
     tissue_weight = np.asarray(tissue_weight, dtype=np.float64).reshape(-1)
     basis = tgc_basis(db_image.shape[0], num_bands)
+    window_db = dr_ui_to_window_db(dr_ui)
 
     if current is None:
-        current = (0.0, np.full(num_bands, TGC_CENTER_LEVEL, dtype=np.float64), 67.0)
+        current = (0.0, np.full(num_bands, TGC_CENTER_LEVEL, dtype=np.float64), float(dr_ui))
 
     full_levels, shape_info = solve_tgc_shape(
-        db_image, valid_mask=mask, tissue_weight=tissue_weight, num_bands=num_bands,
+        db_image, valid_mask=valid_mask, tissue_weight=tissue_weight, num_bands=num_bands,
         db_per_level=db_per_level, smoothness=smoothness,
     )
     full_db = (np.asarray(full_levels, dtype=np.float64) - TGC_CENTER_LEVEL) * db_per_level
@@ -483,50 +496,45 @@ def solve_backend(
     # inverted through it; until that is needed, fall back to rendering.
     fast = bool(fast) and graymap_lut is None
     sweeps = {
-        scale: (GainWindowSweep(db_image, levels, mask, num_bands, db_per_level, weights)
-                if fast else None)
+        scale: (GainSweep(db_image, levels, valid_mask, void_mask, num_bands, db_per_level,
+                          weights, target_gray=target_gray) if fast else None)
         for scale, levels, _ in candidates
     }
 
-    def score(scale, levels, gain_db, dr_ui):
+    def score(scale, levels, gain_db):
         if fast:
-            return sweeps[scale].evaluate(gain_db, dr_ui_to_window_db(dr_ui), reference_db)
+            return sweeps[scale].evaluate(gain_db, window_db, reference_db)
         gray = render(
             db_image=db_image, tgc_levels=levels, gain_db=gain_db,
-            dynamic_range_db=dr_ui_to_window_db(dr_ui), reference_db=reference_db,
+            dynamic_range_db=window_db, reference_db=reference_db,
             depth_response_db=None, db_per_level=db_per_level, graymap_lut=graymap_lut,
         )
-        return OBJ.backend_objective(gray, db_image, weights=weights, num_bands=num_bands,
-                                    valid_mask=mask)
+        shaped = apply_tgc(db_image, levels, db_per_level)
+        return OBJ.backend_objective(gray, shaped, valid_mask, void_mask, weights=weights,
+                                     num_bands=num_bands, target_gray=target_gray)
 
     evaluations = []
     for scale, levels, gain_offset in candidates:
-        for dr_ui in dr_ui_candidates:
-            for gain_db in np.asarray(gain_db_grid, dtype=np.float64):
-                total = float(gain_db) + gain_offset
-                evaluations.append({
-                    "scale": scale,
-                    "tgc_levels": levels,
-                    "gain_db": total,
-                    "dr_ui": float(dr_ui),
-                    "objective": score(scale, levels, total, dr_ui),
-                })
+        for gain_db in np.asarray(gain_db_grid, dtype=np.float64):
+            total = float(gain_db) + gain_offset
+            evaluations.append({
+                "scale": scale,
+                "tgc_levels": levels,
+                "gain_db": total,
+                "objective": score(scale, levels, total),
+            })
 
     def ordering(item):
         return (
             item["objective"],
             abs(item["gain_db"]),
             float(np.abs(item["tgc_levels"] - TGC_CENTER_LEVEL).sum()),
-            item["dr_ui"],
         )
 
     best = min(evaluations, key=ordering)
 
-    nudged = [
-        score(best["scale"], best["tgc_levels"], best["gain_db"] + sign * deadband_db,
-              best["dr_ui"])
-        for sign in (-1.0, 1.0)
-    ]
+    nudged = [score(best["scale"], best["tgc_levels"], best["gain_db"] + sign * deadband_db)
+              for sign in (-1.0, 1.0)]
     tolerance = max(abs(value - best["objective"]) for value in nudged)
     equivalent = [item for item in evaluations
                   if item["objective"] <= best["objective"] + tolerance]
@@ -536,27 +544,26 @@ def solve_backend(
     )
     levels = np.clip(np.round(tgc_levels), TGC_MIN_LEVEL, TGC_MAX_LEVEL).astype(np.int32)
 
-    at_gain_edge = best["gain_db"] <= float(gain_db_grid[0]) + 1e-9 or \
-        best["gain_db"] >= float(gain_db_grid[-1]) - 1e-9
-    at_dr_edge = best["dr_ui"] in (float(dr_ui_candidates[0]), float(dr_ui_candidates[-1]))
+    at_gain_edge = (best["gain_db"] <= float(gain_db_grid[0]) + 1e-9
+                    or best["gain_db"] >= float(gain_db_grid[-1]) - 1e-9)
 
     return {
         "gain_db": float(gain_db),
         "tgc_levels": levels,
-        "dr_ui": float(best["dr_ui"]),
+        "dr_ui": float(dr_ui),
+        "dr_determined": False,
+        "brightness_anchored": target_gray is not None,
         "shape_scale": best["scale"],
         "objective": float(best["objective"]),
         "tolerance": float(tolerance),
         "equivalent_count": len(equivalent),
         "equivalent_gain_db": (min(i["gain_db"] for i in equivalent),
                                max(i["gain_db"] for i in equivalent)),
-        "equivalent_dr_ui": sorted({i["dr_ui"] for i in equivalent}),
         "equivalent_scales": sorted({i["scale"] for i in equivalent}),
         "at_gain_edge": bool(at_gain_edge),
-        "at_dr_edge": bool(at_dr_edge),
         "shape_fit_rms_db": shape_info["fit_rms_db"],
         "shape_usable_rows": shape_info["usable_rows"],
         "delta_gain_levels": (float(gain_db) - float(current[0])) / GAIN_DB_PER_LEVEL,
         "delta_tgc_levels": levels.astype(np.float64) - np.asarray(current[1], dtype=np.float64),
-        "delta_dr_ui": float(best["dr_ui"]) - float(current[2]),
+        "delta_dr_ui": 0.0,
     }
