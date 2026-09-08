@@ -45,6 +45,42 @@ The mode gap narrowed from 61% to 27% once the depth response was included, whic
 within-mode scatter. So the earlier reading that counts per dB is systematically mode-dependent
 does not survive; what does survive is that the constants are group-specific.
 
+    How faithful the rebuild actually is, and why the band metric hid it
+
+The per-band criterion this module fits against is blind to most of what an eye sees, because
+it takes a median inside each band before comparing. Asked to look at rebuilds beside their own
+screenshots, the operator called them plainly worse. They are:
+
+    session / mode                    band-median error    per-pixel median error
+    20260903 harmonic                       2.12                   3.0
+    20260903_replication_check harmonic     1.50                   3.0
+    20260903_GEN general                    8.12                   8.0
+    20260904 general                        4.25                   7.0
+
+Three candidate causes were measured. The tone curve is real - fit as a lookup table, the
+console reads brighter than the linear model above mid gray, general mode by 159 against 130
+and 199 against 150 - but applying it recovers only about a tenth of the per-pixel error, and
+the table has no data above gray 130 in harmonic mode, so using it inside a search that
+deliberately explores brighter settings would extrapolate a flat top. It is measured and
+recorded here, and deliberately not wired into render() for that reason. Registration is not
+the cause either: the best whole-image shift is zero or one pixel and buys at most one gray.
+What is left is fine texture and a residual level error of a few gray, and the console's own
+post-processing is not recoverable from BC0.
+
+What matters is whether that reaches the labels, and it does. Scoring the objective on a
+console screenshot and on its own rebuild, over 42 frames, the two disagree by 0.111 - 13.8% of
+the objective's own magnitude - while the whole deadband, the objective's response to the
+0.22 dB that repeat captures of the same scene already disagree by, is 0.007 to 0.030. In gain
+clicks the simulator's error is worth 0.6 to 1.8 on most harmonic frames and 3.2 to 10.6 on
+general ones. Replacing the hard per-pixel thresholds with percentile-based ones does not help
+(14.3% instead of 13.8%), which says the sensitivity is a genuine level error rather than
+pixels tipping across a threshold.
+
+So back-end labels drawn from console frames carry an uncertainty comparable to the correction
+they are proposing, general mode especially. Field II frames do not have this problem at all -
+there is no screenshot to match, the render is the ground truth by construction - and they are
+4560 of the 4686 frames in the plan.
+
 The recovered depth responses do reproduce. Sampled every 5 mm, the four harmonic sessions give
 (1.1, -3.6, -5.6, -2.8, 0.3, 1.7, ...), (-0.4, -3.8, -6.7, -3.3, -0.1, 1.0, ...),
 (-2.7, -5.0, -7.5, -3.4, 0.4, 1.1, ...) and (1.1, -5.3, -6.6, -3.1, 0.7, 1.3, ...) - the same
@@ -93,6 +129,7 @@ class GroupCalibration:
     num_fit_frames: int
     depth_axis_mm: np.ndarray = field(default=None)
     depth_response_db: np.ndarray = field(default=None)
+    graymap_lut: np.ndarray = field(default=None)
 
     def db_image(self, capture):
         """The capture's BC0 in dB under this group's calibration."""
@@ -114,8 +151,15 @@ def _select_fit_frames(captures, limit=DEFAULT_FIT_FRAMES):
 
 def screenshot_gray_error(capture, counts_per_db, pivot_db, depth_response_db=None,
                           num_bands=NUM_TGC_BANDS,
-                          calibration_gain_level=CALIBRATION_GAIN_LEVEL):
-    """Mean absolute per-band gray error between a simulated render and the real screenshot."""
+                          calibration_gain_level=CALIBRATION_GAIN_LEVEL,
+                          graymap_lut=None, per_pixel=False):
+    """Error between a simulated render and the real screenshot, in gray levels.
+
+    Per-band medians by default, which is what the scalar fit minimises. Pass per_pixel to get
+    the median absolute error over every pixel instead - the band version takes a median inside
+    each band first and so is blind to anything that does not move a band's level, which is how
+    a visibly wrong tone curve survived a band error of 1.5 to 8 gray.
+    """
     actual = crop_capture_image(capture)[0]
     predicted = render(
         capture.bc0,
@@ -125,8 +169,11 @@ def screenshot_gray_error(capture, counts_per_db, pivot_db, depth_response_db=No
         depth_response_db=depth_response_db,
         reference_db=pivot_db,
         counts_per_db=counts_per_db,
+        graymap_lut=graymap_lut,
         out_shape=actual.shape,
     ).astype(np.float64)
+    if per_pixel:
+        return float(np.median(np.abs(actual - predicted)))
     edges = np.linspace(0, actual.shape[0], num_bands + 1).round().astype(int)
     errors = [
         abs(np.median(actual[edges[k]:edges[k + 1]]) - np.median(predicted[edges[k]:edges[k + 1]]))
@@ -275,3 +322,55 @@ def depth_response_for(capture, calibration):
     return np.interp(rows_mm, calibration.depth_axis_mm, calibration.depth_response_db,
                      left=calibration.depth_response_db[0],
                      right=calibration.depth_response_db[-1])
+
+
+def fit_graymap(captures, calibration, limit=None, min_samples=300, num_levels=256):
+    """Recover the console's gray mapping as a lookup table, pooled over a group's frames.
+
+    The simulator maps dB to gray with a straight line. The console does not. Comparing a
+    rebuilt frame against its own screenshot, level by level, the two agree through the dark
+    and middle of the range and then diverge upwards:
+
+        rebuilt gray      10    30    50    70    90   110   130   150   170
+        screenshot        11    31    53    78   102   124   159   199   225   (general)
+        screenshot         9    31    47    66    97   120     -     -     -   (harmonic)
+
+    That is the display response hisense_display_response recovered from the 20260819 sweep by
+    a different route, and which render() has never applied. Leaving it out costs little on the
+    per-band medians the scalar fit uses - those sit in the middle of the range where the line
+    is nearly right - but it is plainly visible in the image, and the per-pixel error tells the
+    same story the eye does.
+
+    Pooled over a group rather than fitted per frame, so only the part of the discrepancy that
+    depends on gray level survives; a frame's own gain error is not gray-level shaped and
+    averages out. Forced monotone, because a display response that is not would reorder pixels.
+    """
+    frames = _select_fit_frames(captures, limit or len(captures))
+    if not frames:
+        return None
+
+    sums = np.zeros(num_levels)
+    counts = np.zeros(num_levels)
+    for capture in frames:
+        actual = crop_capture_image(capture)[0]
+        predicted = render(
+            capture.bc0,
+            tgc_levels=capture.tgc_levels,
+            gain_db=gain_level_to_db(capture.gain_level),
+            dynamic_range_db=capture_window_db(capture),
+            depth_response_db=depth_response_for(capture, calibration),
+            reference_db=calibration.pivot_db,
+            counts_per_db=calibration.counts_per_db,
+            out_shape=actual.shape,
+        ).astype(np.int64).ravel()
+        np.add.at(sums, predicted, actual.ravel())
+        np.add.at(counts, predicted, 1.0)
+
+    measured = counts >= int(min_samples)
+    if measured.sum() < 8:
+        return None
+    levels = np.arange(num_levels, dtype=np.float64)
+    curve = np.interp(levels, levels[measured], (sums[measured] / counts[measured]))
+    # A response that dipped would swap the order of two pixels the beamformer had ranked.
+    curve = np.maximum.accumulate(curve)
+    return np.clip(np.round(curve), 0, 255).astype(np.uint8)
