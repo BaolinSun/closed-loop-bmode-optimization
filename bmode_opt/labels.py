@@ -1,0 +1,199 @@
+"""One label schema for both data sources, with the uncertainty that belongs to each.
+
+Field II frames pretrain and console frames fine-tune, so they have to carry the same fields.
+What they cannot carry is the same confidence, and pretending otherwise would hide the one
+thing a fine-tuning stage most needs to know.
+
+    Why the two sources differ, and by how much
+
+On a Field II frame the render *is* the ground truth: there is no console screenshot it has to
+agree with, the phantom's structure is known exactly, and the objective scores exactly the
+image the simulator produced. On a console frame the objective scores a rebuild, and the
+rebuild is not the screenshot.
+
+Measured on the three sessions that swept the back end at a fixed probe position, the error
+J(rebuild) - J(screenshot) splits into two parts:
+
+    session          settings   bias    residual   J span over settings   residual / span
+    20260819            10     -0.038    0.036            0.916                3.9%
+    20260901_E3          7     -0.032    0.089            0.781               11.3%
+    20260904_DR         28     +0.022    0.238            3.391                7.0%
+
+The bias is a constant and cannot move an argmin, so it is not an error in the label at all.
+The residual is what can. It runs 4 to 11 percent of the range the objective spans across the
+settings being chosen between, and the rank correlation between deciding by screenshot and
+deciding by rebuild is 0.82 to 0.97. Where the two disagreed on the single best setting, they
+disagreed between candidates whose true objectives differ by less than the residual - on
+20260901_E3 by 0.030 against a residual of 0.089, on 20260819 by 0.010 against 0.036. That is a
+tie being broken differently, not a wrong answer.
+
+So a console label is usable, and its honest form is an optimum plus an equivalence band wide
+enough to hold the simulator's own residual. That band is what label_uncertainty carries into
+the tolerance, and it is why the direction fields here go through the band rather than through
+a fixed threshold.
+
+    What is not measured
+
+Only harmonic sessions swept the back end. General mode has no capture set with several
+back-end settings at one probe position, so its residual is borrowed from harmonic and marked
+label_uncertainty_measured false. A general-mode sweep - gain, sliders and dynamic range at one
+position, with screenshots - is the single acquisition that would close this.
+
+Dynamic range is reported unchanged with a zero delta on every frame; see backend_solver for
+why the data cannot determine it.
+"""
+
+from dataclasses import asdict, dataclass, field
+from typing import List, Optional
+
+import numpy as np
+
+from hisense_backend_sim import (
+    GAIN_DB_PER_LEVEL,
+    DEFAULT_DB_PER_LEVEL,
+    TGC_CENTER_LEVEL,
+)
+from hisense_loader import NUM_TGC_BANDS
+import backend_solver as BS
+
+
+# The three slider groups the direction labels report. Eight numbers is more than a controller
+# or an operator reasons about; near, mid and far is the vocabulary the acquisition protocol
+# and the console's own presets already use.
+SLIDER_GROUPS = {"near": (0, 3), "mid": (3, 5), "far": (5, 8)}
+
+GAIN_DIRECTIONS = ("dark", "correct", "bright")
+SLIDER_DIRECTIONS = ("low", "correct", "high")
+DYNAMIC_RANGE_DIRECTIONS = ("narrow", "correct", "wide")
+
+
+@dataclass
+class FrameLabel:
+    """Everything one frame contributes to training, in the same shape for both sources."""
+
+    # Identity and split
+    source: str                       # "fieldii" or "console"
+    frame_id: str
+    group_id: str                     # scene seed, or session and imaging mode
+    split: Optional[str]
+
+    # Front-end state the frame was acquired at
+    depth_mm: float
+    frequency_mhz: Optional[float]
+    focus_mm: Optional[float]
+    imaging_mode: str
+
+    # Back-end state the frame was acquired at
+    gain_db: float
+    tgc_levels: List[int]
+    dr_ui: float
+
+    # The optimum, in the same units
+    optimal_gain_db: float
+    optimal_tgc_levels: List[int]
+    optimal_dr_ui: float
+
+    # Form B: relative direction, then the magnitude
+    gain_direction: str
+    slider_directions: dict
+    dr_direction: str
+    delta_gain_levels: float
+    delta_tgc_levels: List[float]
+    delta_dr_ui: float
+
+    # How much of this to believe
+    objective: float
+    tolerance: float
+    label_uncertainty: float
+    deadband_gain_levels: float
+    equivalent_count: int
+    dr_determined: bool
+    at_gain_edge: bool
+    calibration_borrowed: bool
+    notes: List[str] = field(default_factory=list)
+
+    def as_dict(self):
+        return asdict(self)
+
+
+def _direction(delta, deadband, names):
+    """Form B on one axis: below, at, or above the optimum, with the band in the middle."""
+    if abs(float(delta)) <= float(deadband):
+        return names[1]
+    return names[0] if float(delta) > 0 else names[2]
+
+
+def gain_deadband_levels(sweep, gain_db, window_db, reference_db, tolerance,
+                         limit_db=8.0, step_db=0.05):
+    """How far gain can move before the objective moves by more than the tolerance.
+
+    Expressed in console clicks, because that is the unit the label is emitted in and the unit
+    an operator would act in. Derived per frame rather than fixed: the objective's slope in
+    gain depends on how much of the image is near a clip, which varies a lot across the grid.
+    """
+    base = sweep.evaluate(gain_db, window_db, reference_db)
+    for offset in np.arange(step_db, float(limit_db), step_db):
+        moved = max(abs(sweep.evaluate(gain_db + offset, window_db, reference_db) - base),
+                    abs(sweep.evaluate(gain_db - offset, window_db, reference_db) - base))
+        if moved >= float(tolerance):
+            return float(offset / GAIN_DB_PER_LEVEL)
+    return float(limit_db / GAIN_DB_PER_LEVEL)
+
+
+def label_frame(db_image, valid_mask, dr_ui, reference_db, current, target_gray,
+                source, frame_id, group_id, imaging_mode, depth_mm,
+                frequency_mhz=None, focus_mm=None, split=None,
+                label_uncertainty=0.0, void_mask=None, calibration_borrowed=False,
+                notes=None, **solver_kwargs):
+    """Solve one frame and express the answer as a label.
+
+    label_uncertainty widens the equivalence band by the simulator's own residual, so a console
+    frame's "correct" covers everything the rebuild cannot tell apart from the optimum. On a
+    Field II frame it is zero and the band narrows to the objective's response to the 0.22 dB
+    that repeat captures of one scene already disagree by.
+    """
+    result = BS.solve_backend(
+        db_image, valid_mask, dr_ui=dr_ui, reference_db=reference_db, current=current,
+        void_mask=void_mask, target_gray=target_gray,
+        j_uncertainty=float(label_uncertainty), **solver_kwargs)
+
+    from hisense_backend_sim import dr_ui_to_window_db
+    sweep = BS.GainSweep(db_image, result["tgc_levels"], valid_mask,
+                         void_mask if void_mask is not None else ~np.asarray(valid_mask, bool),
+                         target_gray=target_gray)
+    deadband = gain_deadband_levels(sweep, result["gain_db"], dr_ui_to_window_db(dr_ui),
+                                    reference_db, result["tolerance"])
+
+    delta_tgc = np.asarray(result["delta_tgc_levels"], dtype=np.float64)
+    slider_deadband = deadband * GAIN_DB_PER_LEVEL / DEFAULT_DB_PER_LEVEL
+    slider_directions = {
+        name: _direction(delta_tgc[lo:hi].mean(), slider_deadband, SLIDER_DIRECTIONS)
+        for name, (lo, hi) in SLIDER_GROUPS.items()
+    }
+
+    return FrameLabel(
+        source=source, frame_id=frame_id, group_id=group_id, split=split,
+        depth_mm=float(depth_mm), frequency_mhz=frequency_mhz, focus_mm=focus_mm,
+        imaging_mode=imaging_mode,
+        gain_db=float(current[0]),
+        tgc_levels=[int(v) for v in np.asarray(current[1])],
+        dr_ui=float(current[2]),
+        optimal_gain_db=result["gain_db"],
+        optimal_tgc_levels=[int(v) for v in result["tgc_levels"]],
+        optimal_dr_ui=result["dr_ui"],
+        gain_direction=_direction(result["delta_gain_levels"], deadband, GAIN_DIRECTIONS),
+        slider_directions=slider_directions,
+        dr_direction=DYNAMIC_RANGE_DIRECTIONS[1],
+        delta_gain_levels=float(result["delta_gain_levels"]),
+        delta_tgc_levels=[float(v) for v in delta_tgc],
+        delta_dr_ui=0.0,
+        objective=result["objective"],
+        tolerance=result["tolerance"],
+        label_uncertainty=float(label_uncertainty),
+        deadband_gain_levels=float(deadband),
+        equivalent_count=result["equivalent_count"],
+        dr_determined=False,
+        at_gain_edge=result["at_gain_edge"],
+        calibration_borrowed=bool(calibration_borrowed),
+        notes=list(notes or []),
+    )

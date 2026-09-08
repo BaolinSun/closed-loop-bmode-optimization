@@ -444,6 +444,7 @@ def solve_backend(
     db_per_level=DEFAULT_DB_PER_LEVEL,
     smoothness=DEFAULT_SMOOTHNESS,
     deadband_db=DEFAULT_DEADBAND_DB,
+    j_uncertainty=0.0,
     weights=None,
     graymap_lut=None,
     target_gray=None,
@@ -535,7 +536,10 @@ def solve_backend(
 
     nudged = [score(best["scale"], best["tgc_levels"], best["gain_db"] + sign * deadband_db)
               for sign in (-1.0, 1.0)]
-    tolerance = max(abs(value - best["objective"]) for value in nudged)
+    # Two things can make a setting indistinguishable from the best one: the scene itself,
+    # which repeat captures already disagree about by the deadband, and the simulator, whose
+    # own residual is measured per group and passed in. Both belong in the band.
+    tolerance = max(abs(value - best["objective"]) for value in nudged) + float(j_uncertainty)
     equivalent = [item for item in evaluations
                   if item["objective"] <= best["objective"] + tolerance]
 
