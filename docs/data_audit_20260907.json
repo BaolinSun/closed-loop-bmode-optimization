@@ -1,0 +1,58 @@
+{
+  "date": "2026-09-07",
+  "fieldii": {
+    "shards": 4560,
+    "phantom_files": 60,
+    "independent_scene_ids": 60,
+    "settings_per_scene": {
+      "76": 60
+    },
+    "split_scene_counts": {
+      "test": 12,
+      "train": 36,
+      "val": 12
+    },
+    "split_overlap": {
+      "train_val": 0,
+      "train_test": 0,
+      "val_test": 0
+    },
+    "attribute_counts": {
+      "noise_enabled": {
+        "0": 4560
+      },
+      "display_reference": {
+        "4.3692650695726423e-23": 4560
+      },
+      "simulation_max_depth_mm": {
+        "65.0": 4560
+      },
+      "shape": {
+        "(128, 1851)": 4560
+      }
+    },
+    "missing_fields": []
+  },
+  "hisense": {
+    "raw_capture_count": 263,
+    "sessions": {
+      "20260814": 3,
+      "20260819": 10,
+      "20260828": 10,
+      "20260831": 8,
+      "20260901": 5,
+      "20260901_E2": 13,
+      "20260901_E3": 7,
+      "20260903": 74,
+      "20260903_GEN": 44,
+      "20260903_replication_check": 36,
+      "20260904": 25,
+      "20260904_DR": 28
+    },
+    "loaded_shapes": {
+      "(870, 256)": 263
+    },
+    "load_failures": []
+  },
+  "scope": "All shard headers and all Hisense captures validated with existing loader; no image-quality optimization, training or device experiment performed. Raw Hisense total is not the number of independent scenes or selected front-end grid captures."
+}
