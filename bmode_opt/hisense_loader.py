@@ -186,7 +186,15 @@ def crop_capture_image(capture, **kwargs):
 
 
 def load_screenshot(capture_dir):
-    """Load Screenthum.bmp as a float grayscale array."""
+    """Load Screenthum.bmp as a float grayscale array, via PIL's luma weights.
+
+    Careful: the console's B-mode image is not neutral. It is drawn through a tinted palette,
+    so this luma projection reads 3 to 16 levels below the gray index the console actually
+    computed, and the shortfall depends on the level. Anything comparing against the console's
+    own gray - calibration, fidelity, the objective's gray-domain terms - should go through
+    display_palette.capture_display_gray() instead. This function is kept because the earlier
+    display-response and TGC work was measured on it, and those numbers refer to luma.
+    """
     from PIL import Image
 
     path = Path(capture_dir) / SCREENSHOT_FILE

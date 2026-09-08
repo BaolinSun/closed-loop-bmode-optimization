@@ -107,7 +107,8 @@ from hisense_backend_sim import (
     scan_convert_linear,
     tgc_level_to_db,
 )
-from hisense_loader import NUM_TGC_BANDS, crop_capture_image
+from hisense_loader import NUM_TGC_BANDS
+import display_palette as DP
 
 
 # Gray levels outside this band carry no information about the mapping, because the display has
@@ -155,12 +156,15 @@ def screenshot_gray_error(capture, counts_per_db, pivot_db, depth_response_db=No
                           graymap_lut=None, per_pixel=False):
     """Error between a simulated render and the real screenshot, in gray levels.
 
+    The screenshot is read through display_palette, not through PIL's luma: the console's
+    display map is tinted, so luma reads 3 to 16 levels low and level-dependently.
+
     Per-band medians by default, which is what the scalar fit minimises. Pass per_pixel to get
     the median absolute error over every pixel instead - the band version takes a median inside
     each band first and so is blind to anything that does not move a band's level, which is how
     a visibly wrong tone curve survived a band error of 1.5 to 8 gray.
     """
-    actual = crop_capture_image(capture)[0]
+    actual = DP.capture_display_gray(capture)[0]
     predicted = render(
         capture.bc0,
         tgc_levels=capture.tgc_levels,
@@ -200,7 +204,7 @@ def band_summary(capture, num_bands=FIT_BANDS, db_per_level=DEFAULT_DB_PER_LEVEL
     display depths, and the console's own depth gain follows depth; without the physical axis
     the same band index from two frames would be averaged as though it were the same place.
     """
-    actual = crop_capture_image(capture)[0]
+    actual = DP.capture_display_gray(capture)[0]
     counts = scan_convert_linear(capture.bc0, actual.shape[0], actual.shape[1])
     edges = np.linspace(0, actual.shape[0], num_bands + 1).round().astype(int)
     centres = (0.5 * (edges[:-1] + edges[1:]) / actual.shape[0]) * capture.geometry.depth_mm
@@ -352,7 +356,7 @@ def fit_graymap(captures, calibration, limit=None, min_samples=300, num_levels=2
     sums = np.zeros(num_levels)
     counts = np.zeros(num_levels)
     for capture in frames:
-        actual = crop_capture_image(capture)[0]
+        actual = DP.capture_display_gray(capture)[0]
         predicted = render(
             capture.bc0,
             tgc_levels=capture.tgc_levels,
