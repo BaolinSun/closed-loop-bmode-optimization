@@ -9,30 +9,39 @@ DEFAULT_DB_PER_LEVEL = 0.06559（滑块每档多少 dB）与 GAIN_DB_PER_LEVEL =
 灰阶，且随亮度段变化（暗端 +3、中段 +16、亮端 +7）。凡是按亮度拟合的常数都要
 重拟，这两个也不例外。
 
-    为什么只有一个场次能看出来
-
-tools_refit_calibration.py 重拟后，15 个组里 14 个的逐带误差落在 1.0–11.6，
-只有 20260819 是 27.22。那不是数据坏了，是它【唯一有资格检验这两个常数】：
-
-    场次              滑块档取值                          能否暴露滑块常数的错误
-    20260819         0 38 77 127 174 214 254           能，跨度 254 档
-    20260901_E3      6 127 242                         能，但只有 3 个点
-    20260904_DR      3 69 127 176 254                  能
-    其余 11 组        几乎全是 127                        不能
+    哪些帧真正能约束这两个常数
 
 组内滑块不动时，滑块常数错了会被 pivot_db 整体吸收，残差看不出来；增益同理
-（谐波固定 75、通用固定 167/169）。所以只有真正扫过这两个旋钮的场次会把错误
-顶到残差上，而 20260819 的滑块跨度最大，误差也最大 —— 这本身就是证据。
+（谐波固定 75、通用固定 167/169）。所以只有真正扫过这两个旋钮的场次有约束力，
+全部 15 组里只有三个：
 
-    这个脚本做什么
+    场次           帧数   滑块档取值                    斜坡帧
+    20260819       10    0 38 77 127 174 214 254      无（非平帧只抖动 <=5 档）
+    20260901_E3     7    6 127 242                    3 帧
+    20260904_DR    28    3 69 127 176 254             无（非平帧只抖动 <=8 档）
 
-对三个扫过后端的场次各拟合三次：沿用现有常数、只重拟滑块常数、滑块与增益都
-重拟。判据与 calibration.fit_group 一致（与主机截图的逐带灰阶误差），并同样
-交替求解深度响应，因为不带深度响应拟标量是不适定的。
+其中 20260901_E3 的三帧斜坡最有价值 —— [242 210 178 146 114 78 42 6]、它的镜像、
+以及一条拱形 [127 172 202 254 249 197 158 127]，顶到底跨 236 档约 15.5 dB。
+【滑块在单帧之内就变化】，对 dB/档 的约束力远强于跨帧比较，因为帧间还混着位置、
+漂移和其他差异。
 
-假设成立的话，20260819 的误差会从 27 大幅下降，且三个场次解出的滑块常数应当
-彼此接近 —— 那就是新的常数值。若三者互不相同，说明这两个常数在不同场次并不
-通用，那是另一件事，得单独记下来。
+    第一版的教训
+
+第一版只取 tgc_levels[0] 当整条曲线，等于把那三帧斜坡当成「平的、值 242/6/127」。
+后果是 E3 的逐带误差报成 29.69，而 tools_refit_calibration.py 在同一场次上（它按
+is_flat_tgc 把斜坡帧滤掉了）报 2.70。十一倍的差距不是常数不对，是模型不对。
+
+同一版还解出三个互不相容的滑块常数：20260819 得 0.18297（冲出搜索上界）、
+E3 得 0.00500（顶到下界）、20260904_DR 得 0.07523，误差只降 15%。那不是三个
+场次不通用，是拟合在跟一个错的模型较劲。
+
+现在按每个深度带的实际滑块曲线值建模，斜坡帧也能正确参与。
+
+    看什么
+
+三个场次解出的滑块 dB/档 若彼此接近，即为新的常数值。若仍互不相同，才谈得上
+「这个常数不跨场次通用」，那要单独记。20260819 在两版里都是误差最大的一组，
+若模型修好后它仍然突出，说明那一组另有问题。
 
 用法：python tests/measure_actuator_constants.py
 """
@@ -66,14 +75,26 @@ def summarise(capture):
     actual = DP.capture_display_gray(capture)[0]
     counts = S.scan_convert_linear(capture.bc0, actual.shape[0], actual.shape[1])
     edges = np.linspace(0, actual.shape[0], FIT_BANDS + 1).round().astype(int)
-    centres = (0.5 * (edges[:-1] + edges[1:]) / actual.shape[0]) * capture.geometry.depth_mm
+    fraction = 0.5 * (edges[:-1] + edges[1:]) / actual.shape[0]
+    centres = fraction * capture.geometry.depth_mm
+
+    # The whole slider curve, in levels relative to neutral, sampled where each band sits.
+    # Taking only tgc_levels[0] and calling the frame flat is wrong on the ramped frames -
+    # 20260901_E3 holds [242 210 178 146 114 78 42 6] and its mirror, 236 levels top to
+    # bottom - and those are the most informative frames there are, because the slider varies
+    # inside a single frame rather than only between frames.
+    sliders = np.asarray(capture.tgc_levels, dtype=np.float64) - S.TGC_CENTER_LEVEL
+    slider_fraction = (np.arange(sliders.size) + 0.5) / sliders.size
+    tgc_levels_at_band = np.interp(fraction, slider_fraction, sliders)
+
     return {
         "actual": np.array([np.median(actual[edges[k]:edges[k + 1]])
                             for k in range(FIT_BANDS)]),
         "counts": np.array([np.median(counts[edges[k]:edges[k + 1]])
                             for k in range(FIT_BANDS)]),
         "centres_mm": centres,
-        "tgc_level": float(capture.tgc_levels[0]),
+        "tgc_levels_at_band": tgc_levels_at_band,
+        "tgc_span": float(sliders.max() - sliders.min()),
         "gain_level": float(capture.gain_level),
         "window_db": S.capture_window_db(capture),
         "depth_mm": float(capture.geometry.depth_mm),
@@ -83,7 +104,7 @@ def summarise(capture):
 
 def predict(summary, counts_per_db, pivot_db, tgc_per_level, gain_per_level,
             axis_mm=None, response_db=None):
-    offset = ((summary["tgc_level"] - S.TGC_CENTER_LEVEL) * tgc_per_level
+    offset = (summary["tgc_levels_at_band"] * tgc_per_level
               + (summary["gain_level"] - S.CALIBRATION_GAIN_LEVEL) * gain_per_level)
     response = 0.0 if response_db is None else np.interp(
         summary["centres_mm"], axis_mm, response_db,
@@ -110,7 +131,7 @@ def solve_response(summaries, counts_per_db, pivot_db, tgc_per_level, gain_per_l
                   & (summary["actual"] < CAL.USABLE_GRAY[1]))
         if not usable.any():
             continue
-        offset = ((summary["tgc_level"] - S.TGC_CENTER_LEVEL) * tgc_per_level
+        offset = (summary["tgc_levels_at_band"][usable] * tgc_per_level
                   + (summary["gain_level"] - S.CALIBRATION_GAIN_LEVEL) * gain_per_level)
         wanted = ((summary["actual"][usable] - S.GRAY_PIVOT) / S.GRAY_MAX
                   * summary["window_db"] + pivot_db - offset
@@ -134,7 +155,7 @@ def fit(summaries, fit_tgc, fit_gain, iterations=4, refinements=4, num_axis_poin
     """交替求解：网格解标量，残差解深度响应，反复。"""
     axis_mm = np.linspace(0.0, max(s["depth_mm"] for s in summaries), num_axis_points)
     response = np.zeros_like(axis_mm)
-    tgc_span = (0.02, 0.16) if fit_tgc else (S.DEFAULT_DB_PER_LEVEL,) * 2
+    tgc_span = (0.01, 0.30) if fit_tgc else (S.DEFAULT_DB_PER_LEVEL,) * 2
     gain_span = (0.05, 0.40) if fit_gain else (S.GAIN_DB_PER_LEVEL,) * 2
     best = None
 
@@ -161,7 +182,7 @@ def fit(summaries, fit_tgc, fit_gain, iterations=4, refinements=4, num_axis_poin
             pivot_span = (pivot_db - pivot_step, pivot_db + pivot_step)
             if fit_tgc:
                 step = (tgc[1] - tgc[0]) / 8
-                tgc = (max(0.005, tgc_per_level - step), tgc_per_level + step)
+                tgc = (max(0.001, tgc_per_level - step), tgc_per_level + step)
             if fit_gain:
                 step = (gain[1] - gain[0]) / 8
                 gain = (max(0.01, gain_per_level - step), gain_per_level + step)
@@ -179,7 +200,12 @@ def main():
         summaries = [summarise(c) for c in captures]
         emit(u"")
         emit(u"=========== %s（%s，%d 帧）===========" % (session, note, len(summaries)))
-        emit(u"  滑块档取值 %s" % sorted({int(s["tgc_level"]) for s in summaries}))
+        ramped = [s for s in summaries if s["tgc_span"] > 20]
+        emit(u"  帧数 %d，其中滑块有明显斜坡的 %d 帧（跨度 >20 档）"
+             % (len(summaries), len(ramped)))
+        if ramped:
+            emit(u"  斜坡帧的滑块跨度 %s 档"
+                 % sorted(int(s["tgc_span"]) for s in ramped))
         emit(u"  增益档取值 %s" % sorted({int(s["gain_level"]) for s in summaries}))
         emit(u"")
         emit(u"%-26s %11s %10s %13s %13s %11s" % (
