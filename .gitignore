@@ -5,3 +5,6 @@ __pycache__/
 *.pyc
 output/
 tmp/
+
+# Measurement scripts write their output next to themselves.
+tests/*.txt
