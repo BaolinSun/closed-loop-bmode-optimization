@@ -11,8 +11,9 @@ import hisense_backend_sim as S
 import objective as OBJ
 import backend_solver as BS
 from fieldii_loader import find_shards, load_shard
+import tissue as T
 
-OUT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "step1_fast.txt")
+OUT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "s2_fast.txt")
 lines = []
 w = lines.append
 
@@ -30,7 +31,7 @@ for ptype in ["uniform", "cyst", "point"]:
                                      frequency_mhz=freq, focus_mm=15.0)[0])
         db = cap.db_image
         pivot = cap.tissue_median_db
-        mask = OBJ.signal_mask(db)
+        mask = T.fieldii_tissue_mask(cap)
         levels, _ = BS.solve_tgc_shape(db)
         sweep = BS.GainWindowSweep(db, levels, mask)
 
@@ -41,7 +42,8 @@ for ptype in ["uniform", "cyst", "point"]:
                 gray = S.render(db_image=db, tgc_levels=levels, gain_db=gain,
                                 dynamic_range_db=window, reference_db=pivot,
                                 depth_response_db=None)
-                slow, slow_terms = OBJ.backend_objective(gray, db, return_terms=True)
+                slow, slow_terms = OBJ.backend_objective(gray, db, return_terms=True,
+                                                         valid_mask=mask)
                 fast, fast_terms = sweep.evaluate(gain, window, pivot, return_terms=True)
                 worst = max(worst, abs(slow - fast))
                 for key in ("crushed", "saturated", "uniformity", "utilisation"):
@@ -63,11 +65,12 @@ cap = load_shard(find_shards(phantom_type="cyst", depth_mm=42.0,
 db, pivot = cap.db_image, cap.tissue_median_db
 
 t0 = time.time()
-res_slow = BS.solve_backend(db, reference_db=pivot, fast=False)
+mask_c = T.fieldii_tissue_mask(cap)
+res_slow = BS.solve_backend(db, reference_db=pivot, fast=False, valid_mask=mask_c)
 t_slow = time.time() - t0
 
 t0 = time.time()
-res_fast = BS.solve_backend(db, reference_db=pivot, fast=True)
+res_fast = BS.solve_backend(db, reference_db=pivot, fast=True, valid_mask=mask_c)
 t_fast = time.time() - t0
 
 n_eval = 2 * len(BS.DEFAULT_DR_UI_CANDIDATES) * len(BS.DEFAULT_GAIN_DB_GRID)

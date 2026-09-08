@@ -91,13 +91,28 @@ def signal_mask(db_image, floor_db=None, margin_db=DEFAULT_SIGNAL_MARGIN_DB):
     return db_image > floor_db + margin_db
 
 
-def exposure_cost(gray_image, db_image, floor_db=None, margin_db=DEFAULT_SIGNAL_MARGIN_DB):
+def _resolve_mask(db_image, valid_mask, floor_db, margin_db):
+    """The tissue mask to score against: the caller's if given, else the estimated one.
+
+    Passing valid_mask is the supported path; see tissue.py, which derives it from the Field II
+    truth mask or from a console noise floor measured per session and imaging mode. The
+    fallback exists so older callers keep working, and it is wrong on both data sources - it
+    discards 18.9% of a Field II frame as noise when the simulation has none, and it sits five
+    to sixteen dB high on console frames shallower than the penetration limit.
+    """
+    if valid_mask is not None:
+        return np.asarray(valid_mask, dtype=bool)
+    return signal_mask(db_image, floor_db, margin_db)
+
+
+def exposure_cost(gray_image, db_image, floor_db=None, margin_db=DEFAULT_SIGNAL_MARGIN_DB,
+                  valid_mask=None):
     """(crushed, saturated) fractions, with crushed counted only where there is signal.
 
     Both are fractions in 0..1 and both are costs, so either one rising is a worse image.
     """
     gray = np.asarray(gray_image)
-    has_signal = signal_mask(db_image, floor_db, margin_db)
+    has_signal = _resolve_mask(db_image, valid_mask, floor_db, margin_db)
     total = int(has_signal.sum())
     crushed = float((gray[has_signal] <= CRUSHED_GRAY).mean()) if total else 0.0
     saturated = float((gray >= SATURATED_GRAY).mean())
@@ -105,7 +120,8 @@ def exposure_cost(gray_image, db_image, floor_db=None, margin_db=DEFAULT_SIGNAL_
 
 
 def depth_uniformity_cost(gray_image, db_image, num_bands=NUM_TGC_BANDS,
-                          floor_db=None, margin_db=DEFAULT_SIGNAL_MARGIN_DB):
+                          floor_db=None, margin_db=DEFAULT_SIGNAL_MARGIN_DB,
+                          valid_mask=None):
     """Spread of the per-band tissue level, in gray levels, normalised to the full range.
 
     Bands are summarised over signal-carrying pixels only, for the same reason exposure is:
@@ -113,7 +129,7 @@ def depth_uniformity_cost(gray_image, db_image, num_bands=NUM_TGC_BANDS,
     too little signal left are dropped rather than counted as dark.
     """
     gray = np.asarray(gray_image, dtype=np.float64)
-    has_signal = signal_mask(db_image, floor_db, margin_db)
+    has_signal = _resolve_mask(db_image, valid_mask, floor_db, margin_db)
     edges = band_edges(gray.shape[0], num_bands)
     levels = []
     for k in range(num_bands):
@@ -127,14 +143,14 @@ def depth_uniformity_cost(gray_image, db_image, num_bands=NUM_TGC_BANDS,
 
 
 def utilisation_cost(gray_image, db_image, low_pct=1.0, high_pct=99.0,
-                     floor_db=None, margin_db=DEFAULT_SIGNAL_MARGIN_DB):
+                     floor_db=None, margin_db=DEFAULT_SIGNAL_MARGIN_DB, valid_mask=None):
     """Fraction of the 0..255 range the tissue does *not* occupy.
 
     Pushes against the exposure term: widening the dynamic range removes clipping but squeezes
     everything toward mid gray, and this is the cost of that squeeze.
     """
     gray = np.asarray(gray_image, dtype=np.float64)
-    has_signal = signal_mask(db_image, floor_db, margin_db)
+    has_signal = _resolve_mask(db_image, valid_mask, floor_db, margin_db)
     if has_signal.sum() < 50:
         return 1.0
     values = gray[has_signal]
@@ -154,17 +170,20 @@ DEFAULT_WEIGHTS = {
 
 
 def backend_objective(gray_image, db_image, weights=None, num_bands=NUM_TGC_BANDS,
-                      margin_db=DEFAULT_SIGNAL_MARGIN_DB, return_terms=False):
+                      margin_db=DEFAULT_SIGNAL_MARGIN_DB, return_terms=False,
+                      valid_mask=None):
     """Cost of one rendered image, for searching over gain, TGC and dynamic range.
 
     Lower is better. db_image is the pre-display dB image the render came from; it decides
     which pixels are supposed to be visible, so the same rendering cannot be scored without it.
     """
     weights = DEFAULT_WEIGHTS if weights is None else weights
-    floor = noise_floor_db(db_image)
-    crushed, saturated = exposure_cost(gray_image, db_image, floor, margin_db)
-    uniformity = depth_uniformity_cost(gray_image, db_image, num_bands, floor, margin_db)
-    utilisation = utilisation_cost(gray_image, db_image, floor_db=floor, margin_db=margin_db)
+    floor = None if valid_mask is not None else noise_floor_db(db_image)
+    crushed, saturated = exposure_cost(gray_image, db_image, floor, margin_db, valid_mask)
+    uniformity = depth_uniformity_cost(gray_image, db_image, num_bands, floor, margin_db,
+                                       valid_mask)
+    utilisation = utilisation_cost(gray_image, db_image, floor_db=floor, margin_db=margin_db,
+                                   valid_mask=valid_mask)
 
     terms = {
         "crushed": crushed,

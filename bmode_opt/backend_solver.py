@@ -178,6 +178,11 @@ def tissue_weight_from_mask(valid_mask):
 
 
 def _default_valid_mask(db_image, margin_db=OBJ.DEFAULT_SIGNAL_MARGIN_DB):
+    """Fallback tissue mask when the caller supplies none.
+
+    Only a fallback. Callers should pass valid_mask from tissue.fieldii_tissue_mask() or
+    tissue.console_tissue_mask(); this estimator discards deep tissue on both data sources.
+    """
     return OBJ.signal_mask(db_image, margin_db=margin_db)
 
 
@@ -491,7 +496,8 @@ def solve_backend(
             dynamic_range_db=dr_ui_to_window_db(dr_ui), reference_db=reference_db,
             depth_response_db=None, db_per_level=db_per_level, graymap_lut=graymap_lut,
         )
-        return OBJ.backend_objective(gray, db_image, weights=weights, num_bands=num_bands)
+        return OBJ.backend_objective(gray, db_image, weights=weights, num_bands=num_bands,
+                                    valid_mask=mask)
 
     evaluations = []
     for scale, levels, gain_offset in candidates:
