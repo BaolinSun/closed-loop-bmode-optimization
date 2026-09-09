@@ -199,31 +199,31 @@ def main():
         captures = [load_capture(p) for p in find_captures(DEFAULT_DATA_DIR / session)]
         summaries = [summarise(c) for c in captures]
         emit(u"")
-        emit(u"=========== %s（%s，%d 帧）===========" % (session, note, len(summaries)))
+        emit(u"=========== %s (%s, %d frames) ===========" % (session, note, len(summaries)))
         ramped = [s for s in summaries if s["tgc_span"] > 20]
-        emit(u"  帧数 %d，其中滑块有明显斜坡的 %d 帧（跨度 >20 档）"
+        emit(u"  %d frames, of which %d carry a ramped slider curve (span > 20 levels)"
              % (len(summaries), len(ramped)))
         if ramped:
-            emit(u"  斜坡帧的滑块跨度 %s 档"
+            emit(u"  ramped frames span %s levels"
                  % sorted(int(s["tgc_span"]) for s in ramped))
-        emit(u"  增益档取值 %s" % sorted({int(s["gain_level"]) for s in summaries}))
+        emit(u"  gain levels present: %s" % sorted({int(s["gain_level"]) for s in summaries}))
         emit(u"")
         emit(u"%-26s %11s %10s %13s %13s %11s" % (
-            u"拟合方式", u"counts/dB", u"pivot_dB", u"滑块dB/档", u"增益dB/档", u"逐带误差"))
-        for label, fit_tgc, fit_gain in [(u"沿用现有常数", False, False),
-                                         (u"只重拟滑块常数", True, False),
-                                         (u"滑块+增益都重拟", True, True)]:
+            u"fit", u"counts/dB", u"pivot_dB", u"slider dB/lvl", u"gain dB/lvl", u"band error"))
+        for label, fit_tgc, fit_gain in [(u"current constants", False, False),
+                                         (u"refit slider only", True, False),
+                                         (u"refit slider and gain", True, True)]:
             result = fit(summaries, fit_tgc, fit_gain)
             emit(u"%-26s %11.1f %10.2f %13.5f %13.5f %11.2f" % (
                 label, result[1], result[2], result[3], result[4], result[0]))
-        emit(u"  （现有常数：滑块 %.5f，增益 %.5f）耗时 %.0f 秒"
+        emit(u"  (current constants: slider %.5f, gain %.5f) took %.0f s"
              % (S.DEFAULT_DB_PER_LEVEL, S.GAIN_DB_PER_LEVEL, time.time() - started))
 
     text = u"\n".join(lines)
     out = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                        "measure_actuator_constants.txt")
     io.open(out, "w", encoding="utf-8").write(text)
-    print(text.encode("ascii", "replace").decode())
+    print(text)
     print("\nwrote %s" % out)
 
 

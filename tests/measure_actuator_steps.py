@@ -77,6 +77,7 @@ def summarise(capture):
         "gray": np.array([np.median(display[edges[k]:edges[k + 1]])
                           for k in range(FIT_BANDS)]),
         "tgc_at_band": np.interp(fraction, slider_fraction, sliders),
+        "tgc_span": float(sliders.max() - sliders.min()),
         "gain_level": float(capture.gain_level),
         "window_db": S.capture_window_db(capture),
         "depth_mm": float(capture.geometry.depth_mm),
@@ -98,21 +99,41 @@ def pair_rows(a, b):
     return np.column_stack([delta_db, delta_tgc, delta_gain])
 
 
+def is_flat(summary):
+    """Whether the slider curve is flat enough to be one number (jitter of a few levels)."""
+    return summary["tgc_span"] <= 10.0
+
+
+def solve(rows, label, emit):
+    if not rows:
+        return None
+    stack = np.vstack(rows)
+    solution, *_ = np.linalg.lstsq(stack[:, 1:], stack[:, 0], rcond=None)
+    residual = stack[:, 0] - stack[:, 1:] @ solution
+    emit(u"  %-34s slider %.5f  gain %.5f  residual sd %7.3f dB  (%d readings)"
+         % (label, solution[0], solution[1], residual.std(), stack.shape[0]))
+    return solution
+
+
 def main():
     lines = []
     emit = lines.append
-    everything = []
+    every, clean = [], []
 
     for session in SESSIONS:
         captures = [load_capture(p) for p in find_captures(DEFAULT_DATA_DIR / session)]
         summaries = [summarise(c) for c in captures]
-        # 只在同一显示深度、同一动态范围内配对；深度不同则场景采样不同，不可直接相减。
         emit(u"")
-        emit(u"=========== %s（%d 帧）===========" % (session, len(summaries)))
-        emit(u"%-22s %-22s %7s %7s %8s %10s %12s" % (
-            u"帧 A", u"帧 B", u"Δ滑块", u"Δ增益", u"可用带", u"实测ΔdB", u"ΔdB/Δ档"))
+        emit(u"=========== %s (%d frames) ===========" % (session, len(summaries)))
+        ramped = [s for s in summaries if not is_flat(s)]
+        if ramped:
+            emit(u"  %d frame(s) carry a ramped slider curve, span %s levels"
+                 % (len(ramped), sorted(int(s["tgc_span"]) for s in ramped)))
+        emit(u"%-22s %-22s %7s %7s %7s %9s %11s %6s" % (
+            u"frame A", u"frame B", u"d_tgc", u"d_gain", u"bands", u"d_dB",
+            u"dB/level", u"flat"))
 
-        rows = []
+        session_rows, session_clean = [], []
         for a, b in itertools.combinations(summaries, 2):
             if abs(a["depth_mm"] - b["depth_mm"]) > 1e-6 or a["dr_ui"] != b["dr_ui"]:
                 continue
@@ -122,60 +143,57 @@ def main():
             mean_tgc = block[:, 1].mean()
             mean_gain = block[:, 2].mean()
             if abs(mean_tgc) < 1e-6 and abs(mean_gain) < 1e-6:
-                continue                       # 重复帧，用来看噪声，不进拟合
-            rows.append(block)
-            everything.append(block)
-            # 只动了一个旋钮时，比值才有单独的意义
+                continue                       # repeat frame, kept out of the fit
+            both_flat = is_flat(a) and is_flat(b)
+            single_knob = abs(mean_tgc) < 1e-6 or abs(mean_gain) < 1e-6
+            session_rows.append(block)
+            every.append(block)
+            if both_flat and single_knob:
+                session_clean.append(block)
+                clean.append(block)
             if abs(mean_gain) < 1e-6:
-                ratio = u"%12.5f" % (block[:, 0].mean() / mean_tgc)
+                ratio = u"%11.5f" % (block[:, 0].mean() / mean_tgc)
             elif abs(mean_tgc) < 1e-6:
-                ratio = u"%12.5f" % (block[:, 0].mean() / mean_gain)
+                ratio = u"%11.5f" % (block[:, 0].mean() / mean_gain)
             else:
-                ratio = u"%12s" % u"两个都动"
-            emit(u"%-22s %-22s %7.0f %7.0f %8d %10.2f %s" % (
+                ratio = u"%11s" % u"both moved"
+            emit(u"%-22s %-22s %7.0f %7.0f %7d %9.2f %s %6s" % (
                 a["name"][:22], b["name"][:22], mean_tgc, mean_gain,
-                block.shape[0], block[:, 0].mean(), ratio))
+                block.shape[0], block[:, 0].mean(), ratio,
+                u"yes" if both_flat else u"no"))
 
-        if rows:
-            stack = np.vstack(rows)
-            solution, *_ = np.linalg.lstsq(stack[:, 1:], stack[:, 0], rcond=None)
-            residual = stack[:, 0] - stack[:, 1:] @ solution
-            emit(u"  本场次最小二乘：滑块 %.5f dB/档，增益 %.5f dB/档，残差标准差 %.3f dB"
-                 % (solution[0], solution[1], residual.std()))
+        solve(session_rows, u"all pairs", emit)
+        solve(session_clean, u"flat frames, one knob only", emit)
 
-    if everything:
-        stack = np.vstack(everything)
-        solution, *_ = np.linalg.lstsq(stack[:, 1:], stack[:, 0], rcond=None)
-        residual = stack[:, 0] - stack[:, 1:] @ solution
+    emit(u"")
+    emit(u"=========== all three sessions ===========")
+    solve(every, u"all pairs", emit)
+    solve(clean, u"flat frames, one knob only", emit)
+    emit(u"  current constants                  slider %.5f  gain %.5f"
+         % (S.DEFAULT_DB_PER_LEVEL, S.GAIN_DB_PER_LEVEL))
+
+    if clean:
+        stack = np.vstack(clean)
         emit(u"")
-        emit(u"=========== 三个场次合并 ===========")
-        emit(u"  读数 %d 条" % stack.shape[0])
-        emit(u"  滑块 %.5f dB/档（现值 %.5f）" % (solution[0], S.DEFAULT_DB_PER_LEVEL))
-        emit(u"  增益 %.5f dB/档（现值 %.5f）" % (solution[1], S.GAIN_DB_PER_LEVEL))
-        emit(u"  残差标准差 %.3f dB" % residual.std())
-
-        emit(u"")
-        emit(u"=========== 线性检验：比值随步长变不变 ===========")
-        emit(u"  只取单独动滑块的读数，按 |Δ档数| 分组")
-        emit(u"%14s %10s %14s %12s" % (u"|Δ档数| 区间", u"读数", u"ΔdB/Δ档", u"标准差"))
+        emit(u"=========== linearity: does dB per level depend on step size ===========")
+        emit(u"  slider-only readings from flat frames, grouped by |d_tgc|")
+        emit(u"%14s %10s %14s %12s" % (u"|d_tgc|", u"readings", u"dB/level", u"sd"))
         only_tgc = stack[np.abs(stack[:, 2]) < 1e-6]
         only_tgc = only_tgc[np.abs(only_tgc[:, 1]) > 5]
         for low, high in [(5, 25), (25, 50), (50, 80), (80, 120), (120, 300)]:
-            sel = only_tgc[(np.abs(only_tgc[:, 1]) >= low) & (np.abs(only_tgc[:, 1]) < high)]
+            sel = only_tgc[(np.abs(only_tgc[:, 1]) >= low)
+                           & (np.abs(only_tgc[:, 1]) < high)]
             if sel.shape[0] < 4:
                 continue
             per_level = sel[:, 0] / sel[:, 1]
             emit(u"%14s %10d %14.5f %12.5f" % (
-                u"%d–%d" % (low, high), sel.shape[0], per_level.mean(), per_level.std()))
-        emit(u"")
-        emit(u"  若各行的 ΔdB/Δ档 明显不同，说明一个标量常数不足以描述滑块，")
-        emit(u"  需要改成查找表 —— 那才是 20260819 拟不动的原因。")
+                u"%d-%d" % (low, high), sel.shape[0], per_level.mean(), per_level.std()))
 
-    text = u"\n".join(lines)
+    text = "\n".join(lines)
     out = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                        "measure_actuator_steps.txt")
     io.open(out, "w", encoding="utf-8").write(text)
-    print(text.encode("ascii", "replace").decode())
+    print(text)
     print("\nwrote %s" % out)
 
 
