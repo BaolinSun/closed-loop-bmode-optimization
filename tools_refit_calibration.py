@@ -28,7 +28,7 @@ SESSIONS = ["20260814", "20260819", "20260831", "20260901", "20260901_E2",
             "20260901_E3", "20260903", "20260903_GEN",
             "20260903_replication_check", "20260904", "20260904_DR",
             "20260828/GEN", "20260828/THI"]
-MODE_NAME = {0: "general", 1: "harmonic"}
+MODE_NAME = {0: "fundamental", 1: "harmonic"}
 
 
 def load_groups():

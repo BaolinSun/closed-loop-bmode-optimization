@@ -556,7 +556,7 @@
     {
       "session": "20260828/GEN",
       "image_mode": 0,
-      "image_mode_name": "general",
+      "image_mode_name": "fundamental",
       "num_frames": 5,
       "counts_per_db": 1633.96,
       "pivot_db": 51.182,
@@ -2212,7 +2212,7 @@
     {
       "session": "20260903",
       "image_mode": 0,
-      "image_mode_name": "general",
+      "image_mode_name": "fundamental",
       "num_frames": 6,
       "counts_per_db": 507.76,
       "pivot_db": 44.386,
@@ -2764,7 +2764,7 @@
     {
       "session": "20260903_GEN",
       "image_mode": 0,
-      "image_mode_name": "general",
+      "image_mode_name": "fundamental",
       "num_frames": 44,
       "counts_per_db": 513.52,
       "pivot_db": 43.717,
@@ -3316,7 +3316,7 @@
     {
       "session": "20260904",
       "image_mode": 0,
-      "image_mode_name": "general",
+      "image_mode_name": "fundamental",
       "num_frames": 19,
       "counts_per_db": 511.09,
       "pivot_db": 44.153,

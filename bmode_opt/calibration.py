@@ -7,15 +7,15 @@ fitted on one session in harmonic mode. Predicting each group's own screenshots 
 mean absolute per-band gray error:
 
     session                       mode        with the defaults    with this module
-    20260903                      general           30.33                3.79
-    20260903_GEN                  general           26.91                6.82
-    20260904                      general           29.05                5.02
+    20260903                      fundamental           30.33                3.79
+    20260903_GEN                  fundamental           26.91                6.82
+    20260904                      fundamental           29.05                5.02
     20260903                      harmonic           9.94                3.93
     20260903_replication_check    harmonic           9.65                3.12
     20260904                      harmonic          10.90                1.75
     20260904_DR                   harmonic           8.92                1.78
 
-General mode is off by around 30 gray levels under the harmonic-fitted constants. That is a
+Fundamental mode is off by around 30 gray levels under the harmonic-fitted constants. That is a
 large enough error to move every threshold in the objective, and it is the reason this exists.
 
     Why the two scalars have to be fitted with the depth response, not before it
@@ -34,7 +34,7 @@ residual. Solving both together, alternating, brings the residual down to the ta
 
     What is still not separated
 
-Even solved jointly, counts_per_db and pivot_db stay anti-correlated: general reads 579, 772,
+Even solved jointly, counts_per_db and pivot_db stay anti-correlated: fundamental reads 579, 772,
 603 across three sessions and harmonic 884, 819, 679, 923 across four, about 30% either way,
 while the paired pivot moves the opposite direction each time. The pair predicts screenshots
 well; the members individually are not pinned. So use them together, within their own group,
@@ -54,11 +54,11 @@ screenshots, the operator called them plainly worse. They are:
     session / mode                    band-median error    per-pixel median error
     20260903 harmonic                       2.12                   3.0
     20260903_replication_check harmonic     1.50                   3.0
-    20260903_GEN general                    8.12                   8.0
-    20260904 general                        4.25                   7.0
+    20260903_GEN fundamental                    8.12                   8.0
+    20260904 fundamental                        4.25                   7.0
 
 Three candidate causes were measured. The tone curve is real - fit as a lookup table, the
-console reads brighter than the linear model above mid gray, general mode by 159 against 130
+console reads brighter than the linear model above mid gray, fundamental mode by 159 against 130
 and 199 against 150 - but applying it recovers only about a tenth of the per-pixel error, and
 the table has no data above gray 130 in harmonic mode, so using it inside a search that
 deliberately explores brighter settings would extrapolate a flat top. It is measured and
@@ -72,12 +72,12 @@ console screenshot and on its own rebuild, over 42 frames, the two disagree by 0
 the objective's own magnitude - while the whole deadband, the objective's response to the
 0.22 dB that repeat captures of the same scene already disagree by, is 0.007 to 0.030. In gain
 clicks the simulator's error is worth 0.6 to 1.8 on most harmonic frames and 3.2 to 10.6 on
-general ones. Replacing the hard per-pixel thresholds with percentile-based ones does not help
+fundamental ones. Replacing the hard per-pixel thresholds with percentile-based ones does not help
 (14.3% instead of 13.8%), which says the sensitivity is a genuine level error rather than
 pixels tipping across a threshold.
 
 So back-end labels drawn from console frames carry an uncertainty comparable to the correction
-they are proposing, general mode especially. Field II frames do not have this problem at all -
+they are proposing, fundamental mode especially. Field II frames do not have this problem at all -
 there is no screenshot to match, the render is the ground truth by construction - and they are
 4560 of the 4686 frames in the plan.
 
@@ -120,9 +120,9 @@ USABLE_GRAY = (10, 245)
 DEFAULT_FIT_FRAMES = 12
 
 # Below this fraction of unclipped pixels a group is reported as not calibratable. 20260828/GEN
-# was acquired in general mode at gain 75, where the others use 167 or 169, so it sits about
+# was acquired in fundamental mode at gain 75, where the others use 167 or 169, so it sits about
 # 18 dB dark: three of its five frames are 90% black and only 9 to 40% of any frame is usable.
-# Fitted anyway it returned counts_per_db 1634 against 508 to 514 for every other general
+# Fitted anyway it returned counts_per_db 1634 against 508 to 514 for every other fundamental
 # session, with 11.6 gray of band error - the fit wandering, not a measurement. Every other
 # group runs 62 to 97% usable, so the gap is wide and this threshold sits inside it.
 MIN_USABLE_FRACTION = 0.40
@@ -357,7 +357,7 @@ def fit_graymap(captures, calibration, limit=None, min_samples=300, num_levels=2
     and middle of the range and then diverge upwards:
 
         rebuilt gray      10    30    50    70    90   110   130   150   170
-        screenshot        11    31    53    78   102   124   159   199   225   (general)
+        screenshot        11    31    53    78   102   124   159   199   225   (fundamental)
         screenshot         9    31    47    66    97   120     -     -     -   (harmonic)
 
     That is the display response hisense_display_response recovered from the 20260819 sweep by

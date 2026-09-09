@@ -42,7 +42,7 @@ for r, (sess, mode) in enumerate(PICKS):
         else:
             ax.imshow(img, cmap="gray", vmin=0, vmax=255)
         ax.set_title("%s\n%s / %s" % (title, sess[:18],
-                                      "harmonic" if mode else "general"), fontsize=8)
+                                      "harmonic" if mode else "fundamental"), fontsize=8)
         ax.set_xticks([]); ax.set_yticks([])
 fig.tight_layout()
 out = os.path.join(HERE, "zoom.png")

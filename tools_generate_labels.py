@@ -146,7 +146,7 @@ def label_fieldii(target_gray, limit=None, seed=20260909):
             current=None, rng=rng,
             target_gray=target_gray, source="fieldii", frame_id=shard.name,
             group_id="seed%s/%s" % (shard.seed, shard.phantom_type),
-            imaging_mode="general", depth_mm=shard.geometry.depth_mm,
+            imaging_mode="fundamental", depth_mm=shard.geometry.depth_mm,
             frequency_mhz=shard.frequency_mhz, focus_mm=shard.focus_mm,
             split=shard.split, label_uncertainty=0.0,
             notes=["render is ground truth; no screenshot to match",
@@ -169,8 +169,8 @@ def main():
     rows = label_console(cal_by_group, targets, args.console_limit)
     print("console labels: %d  (%.0f s)" % (len(rows), time.time() - started))
 
-    general = [v for k, v in targets.items() if k[1] == 0]
-    fieldii_target = float(np.median(general)) if general else 64.0
+    fundamental = [v for k, v in targets.items() if k[1] == 0]
+    fieldii_target = float(np.median(fundamental)) if fundamental else 64.0
     rows += label_fieldii(fieldii_target, args.fieldii_limit)
     print("total labels: %d  (%.0f s)" % (len(rows), time.time() - started))
 

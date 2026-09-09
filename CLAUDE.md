@@ -27,3 +27,10 @@ messages and conversation — none of which go through the console.
 - `tests/verify_*.py` — checks that assert an invariant
 - `tools_*.py` — pipeline steps that write artefacts
 - `data/` — gitignored
+
+## Naming
+
+`BImageMode` 0 is **fundamental** transmit, 1 is **tissue harmonic**. Say
+fundamental, not "general" — the console's own label for mode 0 reads as "the
+ordinary one", which is not what tells the two apart, and it caused real
+confusion. In Chinese: 基波成像 / 谐波成像.

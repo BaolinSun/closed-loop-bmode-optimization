@@ -124,7 +124,7 @@ def main():
             reference_db=calibration.pivot_db, depth_response_db=None,
             out_shape=actual_gray.shape)
 
-        mode_name = "harmonic" if key[1] else "general"
+        mode_name = "harmonic" if key[1] else "fundamental"
         titles = [
             "console screenshot\n%s / %s / %.1f mm"
             % (key[0][:20], mode_name, capture.geometry.depth_mm),

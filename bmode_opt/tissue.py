@@ -21,7 +21,7 @@ it.
 On the console there is a real floor, but a single frame is usually too shallow to see it.
 Comparing the per-frame estimate against the floor measured from that session's deepest frames:
 
-    display depth mm    harmonic overestimate dB    general overestimate dB
+    display depth mm    harmonic overestimate dB    fundamental overestimate dB
           25.1                  +11.63                      +15.69
           33.5                   +8.56                       +9.98
           41.9                   +4.71                    +5.08, +6.58
@@ -30,7 +30,7 @@ Comparing the per-frame estimate against the floor measured from that session's 
           67.0                   -0.12                       -0.04
 
 The estimate only converges once the display depth is well past the penetration limit, which
-is 31.0 mm in harmonic mode and 40.6 mm at 11.4 MHz in general mode. Most of the data sits at
+is 31.0 mm in harmonic mode and 40.6 mm at 11.4 MHz in fundamental mode. Most of the data sits at
 41.9 mm, where it is five to seven dB high.
 
     What is done instead
@@ -41,7 +41,7 @@ noise floor is applied, because there is no noise.
 
 Console: measure the floor once per session and imaging mode, from the frames whose display
 depth clears the penetration limit by a margin, then apply it to every frame in that group.
-The two general-mode sessions that can be measured independently agree to 0.32 dB, and within
+The two fundamental-mode sessions that can be measured independently agree to 0.32 dB, and within
 a group the frame-to-frame spread is 0.44 to 0.85 dB.
 
 Where a group has no frame deep enough, this module says so rather than guessing. Borrowing a
@@ -65,7 +65,7 @@ from hisense_loader import get_leaf
 
 # A frame can only show its own noise floor if the display window reaches well past where the
 # echo dies. Penetration was measured at 31.0 mm for harmonic and 40.6 mm at 11.4 MHz for
-# general mode, so 58 mm leaves a margin of at least 17 mm on the worse case; it also happens
+# fundamental mode, so 58 mm leaves a margin of at least 17 mm on the worse case; it also happens
 # to be the second-deepest rung of the console's depth ladder.
 NOISE_FLOOR_MIN_DEPTH_MM = 58.0
 
@@ -83,7 +83,7 @@ DEFAULT_TISSUE_MARGIN_DB = 3.0
 # grid.
 POINT_TARGET_EXCLUSION_MM = 1.0
 
-IMAGE_MODE_NAMES = {0: "general", 1: "harmonic"}
+IMAGE_MODE_NAMES = {0: "fundamental", 1: "harmonic"}
 
 
 def capture_image_mode(capture):

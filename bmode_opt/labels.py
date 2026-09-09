@@ -34,9 +34,9 @@ a fixed threshold.
 
     What is not measured
 
-Only harmonic sessions swept the back end. General mode has no capture set with several
+Only harmonic sessions swept the back end. Fundamental mode has no capture set with several
 back-end settings at one probe position, so its residual is borrowed from harmonic and marked
-label_uncertainty_measured false. A general-mode sweep - gain, sliders and dynamic range at one
+label_uncertainty_measured false. A fundamental-mode sweep - gain, sliders and dynamic range at one
 position, with screenshots - is the single acquisition that would close this.
 
 Dynamic range is reported unchanged with a zero delta on every frame; see backend_solver for

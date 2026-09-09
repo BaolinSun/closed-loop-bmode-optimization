@@ -63,13 +63,13 @@ tried and measured:
   * Fitting the window to the signal. Gray span is signal dB span over window width, so the
     old utilisation term was already this comparison written differently - the two agree to
     0.003 across the whole ladder. On console frames the tissue spans only 19 to 21 dB in
-    harmonic mode and 27 to 31 dB in general mode, against a narrowest settable window of
+    harmonic mode and 27 to 31 dB in fundamental mode, against a narrowest settable window of
     45.6 dB, so the signal never fills even the narrowest window and the term is a constant
     vote for the minimum whatever the image looks like.
 
   * Widening the window to reach the brightest structure. From the measured noise floor up to
     the 99.9th percentile of the frame spans 26.5 to 28.2 dB in harmonic mode and 36.8 to 39.6
-    in general mode. Still below 45.6, so this criterion also says minimum. Meanwhile the
+    in fundamental mode. Still below 45.6, so this criterion also says minimum. Meanwhile the
     frames were actually acquired at dynamic range 67, a 58.7 dB window - nearly twice the
     signal - on 188 of 207 captures.
 
@@ -90,7 +90,7 @@ a weight to tune.
     What still depends on the per-session calibration
 
 target_gray comes from tissue.measure_accepted_brightness() and has to be measured per session
-and imaging mode. Within a mode it reproduces well across sessions - general mode reads 92, 90
+and imaging mode. Within a mode it reproduces well across sessions - fundamental mode reads 92, 90
 and 89 gray on three sessions, harmonic 34, 34, 36 and 36 on four - but the two modes differ by
 a factor of 2.6, and that gap cannot yet be attributed. DEFAULT_PIVOT_DB and
 DEFAULT_COUNTS_PER_DB were calibrated on one session in one mode, and counts_per_db has been
