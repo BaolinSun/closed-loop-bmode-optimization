@@ -97,7 +97,9 @@ def main():
         palette = DP.session_palette(captures)[0]
         calibration = CAL.GroupCalibration(
             entry["counts_per_db"], entry["pivot_db"], 0.0, 0,
-            np.array(entry["depth_axis_mm"]), np.array(entry["depth_response_db"]))
+            np.array(entry["depth_axis_mm"]), np.array(entry["depth_response_db"]),
+            {float(k): np.array(v) for k, v in
+             entry.get("depth_response_by_frequency", {}).items()})
         for capture in captures[:2]:
             db = (S.bc0_to_db(capture.bc0, calibration.counts_per_db)
                   + CAL.depth_response_for(capture, calibration)[:, None])

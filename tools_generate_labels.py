@@ -33,7 +33,9 @@ def load_calibration():
             "cal": CAL.GroupCalibration(g["counts_per_db"], g["pivot_db"],
                                         g["screenshot_gray_error"], 0,
                                         np.array(g["depth_axis_mm"]),
-                                        np.array(g["depth_response_db"])),
+                                        np.array(g["depth_response_db"]),
+                                        {float(k): np.array(v) for k, v in
+                                         g.get("depth_response_by_frequency", {}).items()}),
             "floor": g["noise_floor_db"], "floor_measured": g["noise_floor_measured"],
             "uncertainty": g["label_uncertainty"],
             "uncertainty_measured": g["label_uncertainty_measured"],

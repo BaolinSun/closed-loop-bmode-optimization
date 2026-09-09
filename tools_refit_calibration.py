@@ -197,6 +197,10 @@ def main():
             "label_uncertainty_measured": bool(swept.get(key)),
             "depth_axis_mm": [round(float(v), 3) for v in calibration.depth_axis_mm],
             "depth_response_db": [round(float(v), 4) for v in calibration.depth_response_db],
+            "depth_response_by_frequency": {
+                str(frequency): [round(float(v), 4) for v in curve]
+                for frequency, curve in sorted(
+                    calibration.depth_response_by_frequency.items())},
         })
     io.open(args.out, "w", encoding="utf-8").write(
         json.dumps(payload, indent=2, ensure_ascii=False))

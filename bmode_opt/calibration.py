@@ -107,7 +107,7 @@ from hisense_backend_sim import (
     scan_convert_linear,
     tgc_level_to_db,
 )
-from hisense_loader import NUM_TGC_BANDS
+from hisense_loader import NUM_TGC_BANDS, get_leaf
 import display_palette as DP
 
 
@@ -127,6 +127,11 @@ DEFAULT_FIT_FRAMES = 12
 # group runs 62 to 97% usable, so the gap is wide and this threshold sits inside it.
 MIN_USABLE_FRACTION = 0.40
 
+# Frames a transmit frequency needs before it gets its own depth response rather than the
+# group's pooled one. Three is enough to take a median at each depth and to notice a frequency
+# that disagrees with the rest.
+MIN_FRAMES_PER_FREQUENCY = 3
+
 
 @dataclass
 class GroupCalibration:
@@ -138,6 +143,9 @@ class GroupCalibration:
     num_fit_frames: int
     depth_axis_mm: np.ndarray = field(default=None)
     depth_response_db: np.ndarray = field(default=None)
+    # One depth response per transmit frequency, keyed by BFreqValue rounded to 0.1 MHz.
+    # depth_response_db above stays as the pooled fallback for a frequency with too few frames.
+    depth_response_by_frequency: dict = field(default_factory=dict)
     graymap_lut: np.ndarray = field(default=None)
     # Fraction of the fit frames' pixels that are neither crushed nor saturated. A group whose
     # frames are mostly black carries almost no information about the mapping, and the fit then
@@ -203,6 +211,14 @@ def screenshot_gray_error(capture, counts_per_db, pivot_db, depth_response_db=No
 FIT_BANDS = 32
 
 
+def capture_frequency(capture):
+    """Transmit frequency in MHz, rounded to the tenth the console reports it at."""
+    try:
+        return round(float(get_leaf(capture.fe_params, "BFreqValue")), 1)
+    except Exception:
+        return None
+
+
 def band_summary(capture, num_bands=FIT_BANDS, db_per_level=DEFAULT_DB_PER_LEVEL,
                  palette=None):
     """Everything about one frame the fit needs, reduced to a few dozen numbers.
@@ -229,6 +245,7 @@ def band_summary(capture, num_bands=FIT_BANDS, db_per_level=DEFAULT_DB_PER_LEVEL
                      + gain_level_to_db(capture.gain_level),
         "window_db": capture_window_db(capture),
         "depth_mm": float(capture.geometry.depth_mm),
+        "frequency_mhz": capture_frequency(capture),
     }
 
 
@@ -304,12 +321,20 @@ def fit_group(captures, counts_range=(300.0, 1600.0), pivot_range=(5.0, 50.0),
         return None
     if palette is None:
         palette = DP.session_palette(captures)[0]
-    summaries = [band_summary(c, palette=palette) for c in frames]
+
+    # The two scalars are pinned by a dozen frames spread over the group's settings, but the
+    # depth responses want every frame there is - especially the per-frequency ones, which get
+    # only the frames at their own frequency. So summarise everything and let the grid search
+    # use the spread subset.
+    everything = _select_fit_frames(captures, len(captures))
+    all_summaries = [band_summary(c, palette=palette) for c in everything]
+    chosen = {c.name for c in frames}
+    summaries = [s for c, s in zip(everything, all_summaries) if c.name in chosen]
 
     usable = float(np.mean([
         np.mean((s["actual"] > USABLE_GRAY[0]) & (s["actual"] < USABLE_GRAY[1]))
         for s in summaries]))
-    axis_mm = np.linspace(0.0, max(s["depth_mm"] for s in summaries), int(num_axis_points))
+    axis_mm = np.linspace(0.0, max(s["depth_mm"] for s in all_summaries), int(num_axis_points))
     response = np.zeros_like(axis_mm)
     best = None
 
@@ -328,24 +353,50 @@ def fit_group(captures, counts_range=(300.0, 1600.0), pivot_range=(5.0, 50.0),
             pivot_step = (high_pivot - low_pivot) / (coarse - 1)
             low_counts, high_counts = counts_per_db - counts_step, counts_per_db + counts_step
             low_pivot, high_pivot = pivot_db - pivot_step, pivot_db + pivot_step
-        response = _solve_response(summaries, best[1], best[2], axis_mm)
+        response = _solve_response(all_summaries, best[1], best[2], axis_mm)
+
+    # The console applies something frequency dependent between BC0 and the display, and one
+    # curve per group cannot hold it. In fundamental mode the residual steps by about 3.5 dB
+    # between 8.0 and 11.4 MHz, reproducing across two sessions to within 0.4 dB, and pooling
+    # every frequency into one curve leaves 2.22 dB rms - eleven gain clicks, larger than the
+    # correction a label proposes. Splitting the curve by frequency brings that to 0.33 dB.
+    by_frequency = {}
+    for frequency in sorted({s["frequency_mhz"] for s in all_summaries} - {None}):
+        subset = [s for s in all_summaries if s["frequency_mhz"] == frequency]
+        if len(subset) < MIN_FRAMES_PER_FREQUENCY:
+            continue
+        by_frequency[frequency] = _solve_response(subset, best[1], best[2], axis_mm)
+
+    # Report the error the renderer will actually make, which means scoring each frame against
+    # the curve it will be rendered with rather than against the pooled one.
+    per_frame = [
+        group_cost([summary], best[1], best[2], axis_mm,
+                   by_frequency.get(summary["frequency_mhz"], response))
+        for summary in all_summaries]
 
     return GroupCalibration(
         counts_per_db=best[1], pivot_db=best[2],
-        gray_error=group_cost(summaries, best[1], best[2], axis_mm, response),
+        gray_error=float(np.mean(per_frame)),
         num_fit_frames=len(frames), depth_axis_mm=axis_mm, depth_response_db=response,
-        usable_fraction=usable)
+        depth_response_by_frequency=by_frequency, usable_fraction=usable)
 
 
 def depth_response_for(capture, calibration):
-    """The group's depth response resampled onto one capture's BC0 depth grid."""
+    """The depth response for one capture, resampled onto its BC0 depth grid.
+
+    Its own transmit frequency's curve when the group had enough frames at that frequency to
+    fit one, otherwise the group's pooled curve.
+    """
     if calibration.depth_response_db is None:
         return None
+    frequency = capture_frequency(capture)
+    curve = calibration.depth_response_by_frequency.get(frequency)
+    if curve is None:
+        curve = calibration.depth_response_db
     rows_mm = np.linspace(capture.geometry.min_depth_mm, capture.geometry.depth_mm,
                           capture.bc0.shape[0])
-    return np.interp(rows_mm, calibration.depth_axis_mm, calibration.depth_response_db,
-                     left=calibration.depth_response_db[0],
-                     right=calibration.depth_response_db[-1])
+    return np.interp(rows_mm, calibration.depth_axis_mm, curve,
+                     left=curve[0], right=curve[-1])
 
 
 def fit_graymap(captures, calibration, limit=None, min_samples=300, num_levels=256,
