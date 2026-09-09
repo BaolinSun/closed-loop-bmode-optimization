@@ -59,8 +59,13 @@ FIT_BANDS = CAL.FIT_BANDS
 # 两帧都要落在这个灰阶区间内，该带才算数。裁剪处灰阶差不再是 dB 差。
 UNCLIPPED_GRAY = (15, 240)
 
-# 场景静止、只扫后端的三个场次。
-SESSIONS = ["20260819", "20260901_E3", "20260904_DR"]
+# 场景静止、只扫后端的场次。前三个是谐波（增益 59-125），最后一个是基波
+# （增益 129-229）。两段增益区间不重叠，这正是 GAIN_DB_PER_LEVEL 必须分段、
+# 而分段的成因（档位区间还是成像模式）又分不开的原因。
+SESSIONS = ["20260819", "20260901_E3", "20260904_DR", "20260909_GEN"]
+
+# 增益阶梯换斜率的档位。谐波数据止于 125，基波数据始于 129，界在其间。
+GAIN_LADDER_BOUNDARY = 127.0
 
 
 def summarise(capture, palette):
@@ -82,7 +87,18 @@ def summarise(capture, palette):
         "window_db": S.capture_window_db(capture),
         "depth_mm": float(capture.geometry.depth_mm),
         "dr_ui": float(capture.dynamic_range_level),
+        "frequency_mhz": CAL.capture_frequency(capture),
     }
+
+
+def split_gain(a_level, b_level, boundary=GAIN_LADDER_BOUNDARY):
+    """把一次增益改变拆成界下与界上两段，各自带符号。"""
+    low = min(a_level, b_level)
+    high = max(a_level, b_level)
+    below = max(0.0, min(high, boundary) - min(low, boundary))
+    above = max(0.0, max(high, boundary) - max(low, boundary))
+    sign = 1.0 if b_level >= a_level else -1.0
+    return sign * below, sign * above
 
 
 def pair_rows(a, b):
@@ -96,7 +112,10 @@ def pair_rows(a, b):
                 - a["gray"][usable] / 255.0 * a["window_db"])
     delta_tgc = b["tgc_at_band"][usable] - a["tgc_at_band"][usable]
     delta_gain = np.full(delta_db.shape, b["gain_level"] - a["gain_level"])
-    return np.column_stack([delta_db, delta_tgc, delta_gain])
+    below, above = split_gain(a["gain_level"], b["gain_level"])
+    return np.column_stack([delta_db, delta_tgc, delta_gain,
+                            np.full(delta_db.shape, below),
+                            np.full(delta_db.shape, above)])
 
 
 def is_flat(summary):
@@ -104,14 +123,21 @@ def is_flat(summary):
     return summary["tgc_span"] <= 10.0
 
 
-def solve(rows, label, emit):
+def solve(rows, label, emit, split=False):
+    """One gain slope, or one either side of the boundary."""
     if not rows:
         return None
     stack = np.vstack(rows)
-    solution, *_ = np.linalg.lstsq(stack[:, 1:], stack[:, 0], rcond=None)
-    residual = stack[:, 0] - stack[:, 1:] @ solution
-    emit(u"  %-34s slider %.5f  gain %.5f  residual sd %7.3f dB  (%d readings)"
-         % (label, solution[0], solution[1], residual.std(), stack.shape[0]))
+    columns = [1, 3, 4] if split else [1, 2]
+    solution, *_ = np.linalg.lstsq(stack[:, columns], stack[:, 0], rcond=None)
+    residual = stack[:, 0] - stack[:, columns] @ solution
+    if split:
+        emit(u"  %-34s slider %.5f  gain<=%d %.5f  gain>%d %.5f  residual sd %7.3f dB  (%d)"
+             % (label, solution[0], GAIN_LADDER_BOUNDARY, solution[1],
+                GAIN_LADDER_BOUNDARY, solution[2], residual.std(), stack.shape[0]))
+    else:
+        emit(u"  %-34s slider %.5f  gain %.5f  residual sd %7.3f dB  (%d readings)"
+             % (label, solution[0], solution[1], residual.std(), stack.shape[0]))
     return solution
 
 
@@ -136,7 +162,12 @@ def main():
 
         session_rows, session_clean = [], []
         for a, b in itertools.combinations(summaries, 2):
-            if abs(a["depth_mm"] - b["depth_mm"]) > 1e-6 or a["dr_ui"] != b["dr_ui"]:
+            # Same scene means same depth, same window and same transmit frequency. The
+            # frequency guard matters: the console applies something frequency dependent
+            # between BC0 and the display worth about 3.5 dB between 8.0 and 11.4 MHz in
+            # fundamental mode, and pairing across it would charge that to the actuators.
+            if (abs(a["depth_mm"] - b["depth_mm"]) > 1e-6 or a["dr_ui"] != b["dr_ui"]
+                    or a["frequency_mhz"] != b["frequency_mhz"]):
                 continue
             block = pair_rows(a, b)
             if block is None or block.shape[0] < 4:
@@ -167,11 +198,17 @@ def main():
         solve(session_clean, u"flat frames, one knob only", emit)
 
     emit(u"")
-    emit(u"=========== all three sessions ===========")
+    emit(u"=========== all sessions together ===========")
+    emit(u"  one gain slope over the whole ladder:")
     solve(every, u"all pairs", emit)
     solve(clean, u"flat frames, one knob only", emit)
-    emit(u"  current constants                  slider %.5f  gain %.5f"
-         % (S.DEFAULT_DB_PER_LEVEL, S.GAIN_DB_PER_LEVEL))
+    emit(u"  gain slope split at level %d:" % GAIN_LADDER_BOUNDARY)
+    solve(every, u"all pairs", emit, split=True)
+    solve(clean, u"flat frames, one knob only", emit, split=True)
+    emit(u"  current constants                  slider %.5f  gain<=%d %.5f  gain>%d %.5f"
+         % (S.DEFAULT_DB_PER_LEVEL, GAIN_LADDER_BOUNDARY,
+            S.GAIN_DB_PER_LEVEL_TABLE[0][2], GAIN_LADDER_BOUNDARY,
+            S.GAIN_DB_PER_LEVEL_TABLE[1][2]))
 
     if clean:
         stack = np.vstack(clean)

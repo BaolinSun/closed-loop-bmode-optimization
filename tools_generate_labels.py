@@ -118,6 +118,7 @@ def label_console(cal_by_group, targets, limit=None):
                 group_id="%s/%d" % key, imaging_mode=T.IMAGE_MODE_NAMES[key[1]],
                 depth_mm=cap.geometry.depth_mm, frequency_mhz=freq,
                 focus_mm=focus, split=None,
+                gain_level=cap.gain_level,
                 label_uncertainty=entry["uncertainty"],
                 calibration_borrowed=not entry["floor_measured"],
                 notes=notes).as_dict())

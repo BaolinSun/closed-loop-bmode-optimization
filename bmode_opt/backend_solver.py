@@ -101,7 +101,9 @@ knob. Until that is settled, brightness targets are usable within a group and no
 import numpy as np
 
 from hisense_backend_sim import (
+    CALIBRATION_GAIN_LEVEL,
     DEFAULT_DB_PER_LEVEL,
+    gain_db_to_levels,
     DEFAULT_PIVOT_DB,
     GAIN_DB_PER_LEVEL,
     GRAY_MAX,
@@ -406,7 +408,8 @@ class GainSweep:
 
 
 def action_distance(gain_db, tgc_levels, dr_ui, reference,
-                    db_per_level=DEFAULT_DB_PER_LEVEL, dr_step=3.5):
+                    db_per_level=DEFAULT_DB_PER_LEVEL, dr_step=3.5,
+                    at_level=CALIBRATION_GAIN_LEVEL):
     """How far an action is from a reference one, counted in console clicks.
 
     Gain is converted at its own dB per level, the sliders at theirs, and dynamic range at the
@@ -414,7 +417,7 @@ def action_distance(gain_db, tgc_levels, dr_ui, reference,
     a number of detents the operator would have to turn.
     """
     gain_ref, tgc_ref, dr_ref = reference
-    gain_clicks = abs(float(gain_db) - float(gain_ref)) / GAIN_DB_PER_LEVEL
+    gain_clicks = abs(gain_db_to_levels(float(gain_db) - float(gain_ref), at_level))
     tgc_clicks = float(np.mean(np.abs(np.asarray(tgc_levels, dtype=np.float64)
                                       - np.asarray(tgc_ref, dtype=np.float64))))
     dr_clicks = abs(float(dr_ui) - float(dr_ref)) / float(dr_step)
@@ -448,6 +451,7 @@ def solve_backend(
     weights=None,
     graymap_lut=None,
     target_gray=None,
+    gain_level=None,
     fast=True,
 ):
     """Best gain and TGC for one pre-display dB image, as a unique canonical action.
@@ -567,7 +571,9 @@ def solve_backend(
         "at_gain_edge": bool(at_gain_edge),
         "shape_fit_rms_db": shape_info["fit_rms_db"],
         "shape_usable_rows": shape_info["usable_rows"],
-        "delta_gain_levels": (float(gain_db) - float(current[0])) / GAIN_DB_PER_LEVEL,
+        "delta_gain_levels": gain_db_to_levels(
+            float(gain_db) - float(current[0]),
+            CALIBRATION_GAIN_LEVEL if gain_level is None else gain_level),
         "delta_tgc_levels": levels.astype(np.float64) - np.asarray(current[1], dtype=np.float64),
         "delta_dr_ui": 0.0,
     }

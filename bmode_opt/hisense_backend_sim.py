@@ -69,7 +69,12 @@ TGC_CENTER_LEVEL = 127
 #     20260819           0.07770          0.20108       0.285 dB
 #     20260901_E3        0.07728          0.19920       0.664 dB
 #     20260904_DR        0.07722          0.19958       0.449 dB
-#     combined           0.07734          0.20004       0.446 dB
+#     20260909_GEN       0.08229          0.28649       0.498 dB   <- fundamental, high gain
+#
+# Refitting all four together with the gain ladder split at level 127 (see GAIN_DB_PER_LEVEL
+# below for why it has to be split) gives 0.07940 for the slider over 4473 readings, residual
+# 0.508 dB. The slider needs no split of its own: both datasets sweep it over its whole 0 to
+# 254 range and the two agree to 6%, inside each session's own scatter.
 #
 # One scalar is enough: grouping the readings by step size gives 0.0766, 0.0765, 0.0778 and
 # 0.0774 dB per level for steps of 25-50, 50-80, 80-120 and 120-300 levels.
@@ -82,7 +87,7 @@ TGC_CENTER_LEVEL = 127
 # 762.5 came from a fit that treated the console's dynamic-range number as dB, so it is not
 # comparable. Both constants are session defaults; calibration.fit_group() refits them per
 # session and imaging mode.
-DEFAULT_DB_PER_LEVEL = 0.07734
+DEFAULT_DB_PER_LEVEL = 0.07940
 DEFAULT_COUNTS_PER_DB = 877.3
 # The display-dB level that lands on GRAY_PIVOT, at the calibration gain (BUIGainLevel 75).
 # Refitted after the anchor fix; the old 84.58 was a top-of-window value under the
@@ -134,14 +139,52 @@ DR_WINDOW_INTERCEPT = 35.09
 DR_UI_RANGE = (30.0, 400.0)
 
 # --- Gain ------------------------------------------------------------------------
-# BUIGainLevel steps, in dB. From the same pairwise measurement as DEFAULT_DB_PER_LEVEL above:
-# three sessions give 0.20108, 0.19920 and 0.19958, combining to 0.20004 - within 0.02% of an
-# even 0.2 dB per level, which is probably what the console was designed to do.
+# BUIGainLevel steps, in dB. Not one number: the console's gain ladder is coarser above the
+# middle of its range than below it. Measured by tests/measure_actuator_steps.py, which
+# subtracts pairs of frames of one static scene differing in a single knob, so the reading
+# needs no calibration at all. Fitting all four swept sessions together, 4473 band readings:
 #
-# Supersedes 0.1705, fitted on PIL luma and therefore 15% low for the same reason the slider
-# constant was. The evidence that gain and dynamic range are separable knobs still stands: in
-# 20260904_DR a 40-step gain change read the same at dynamic range 30 and at 67, to 1%.
-GAIN_DB_PER_LEVEL = 0.20004
+#     model                              residual sd
+#     one constant over the whole range     1.316 dB
+#     split at level 127                    0.508 dB
+#
+# and 0.508 is what each session's own fit gives, so the split accounts for essentially all of
+# the discrepancy. The cross-check frame settles it on its own: gain 129 with sliders at 196,
+# against gain 169 with sliders at 127, measures -6.212 dB. The split constants predict -5.992;
+# a single 0.20004 predicts -2.820.
+#
+#     gain level    dB per level    measured on
+#     0 to 127        0.20359       20260819, 20260901_E3, 20260904_DR (all harmonic)
+#     127 to 255      0.28675       20260909_GEN (fundamental)
+#
+# WHAT IS NOT SEPARATED. Every harmonic capture in the archive sits between gain 59 and 125,
+# and every usable fundamental one between 129 and 229. They overlap only at level 75, in
+# 20260828/GEN, which is 90% black and holds a single gain level, so it yields no pair. The
+# split above is therefore equally consistent with "the ladder is coarser at high gain" and
+# with "fundamental mode steps differently from harmonic". It is written as a property of the
+# level because a digital gain applied after beamforming has no way to know the transmit mode,
+# but that is reasoning, not measurement. Three harmonic frames at gain 129, 169 and 209 at one
+# probe position would settle it; see the acquisition protocol.
+GAIN_DB_PER_LEVEL_TABLE = ((0.0, 127.0, 0.20359), (127.0, 255.0, 0.28675))
+
+# The slope at the low end, kept for callers that only need an order of magnitude. Anything
+# converting a real dB difference into console clicks should use gain_db_to_levels() with the
+# level it is at, because a click is worth 41% more above 127 than below it.
+GAIN_DB_PER_LEVEL = GAIN_DB_PER_LEVEL_TABLE[0][2]
+
+
+def gain_db_per_level(level):
+    """Local slope of the gain ladder, in dB per level, at one gain level."""
+    level = float(level)
+    for low, high, slope in GAIN_DB_PER_LEVEL_TABLE:
+        if low <= level < high:
+            return float(slope)
+    return float(GAIN_DB_PER_LEVEL_TABLE[-1][2])
+
+
+def gain_db_to_levels(delta_db, at_level):
+    """Convert a dB difference into console clicks, at the level it is measured from."""
+    return float(delta_db) / gain_db_per_level(at_level)
 
 # --- Where the display window is anchored ----------------------------------------
 # Changing the dynamic range rotates the dB-to-gray mapping about a fixed gray level,
@@ -175,8 +218,21 @@ def capture_window_db(capture):
 
 
 def gain_level_to_db(level, reference_level=CALIBRATION_GAIN_LEVEL):
-    """Convert BUIGainLevel to a dB offset relative to the calibration gain."""
-    return (float(level) - float(reference_level)) * GAIN_DB_PER_LEVEL
+    """dB the console's gain adds at one level, relative to another.
+
+    Integrates GAIN_DB_PER_LEVEL_TABLE rather than multiplying by one slope: the ladder is
+    coarser above level 127 than below, so a span that crosses the boundary is not the level
+    difference times any single constant.
+    """
+    level = float(level)
+    reference_level = float(reference_level)
+    sign = 1.0 if level >= reference_level else -1.0
+    low, high = min(level, reference_level), max(level, reference_level)
+    total = 0.0
+    for start, stop, slope in GAIN_DB_PER_LEVEL_TABLE:
+        span = max(0.0, min(high, stop) - max(low, start))
+        total += span * slope
+    return sign * total
 
 
 def bc0_to_db(bc0, counts_per_db=DEFAULT_COUNTS_PER_DB):
