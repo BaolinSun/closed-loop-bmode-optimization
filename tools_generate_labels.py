@@ -13,7 +13,7 @@ from hisense_loader import DEFAULT_DATA_DIR, find_captures, get_leaf, load_captu
 CAL_PATH = "bmode_opt/console_calibration.json"
 CONSOLE_SESSIONS = ["20260814", "20260819", "20260831", "20260901", "20260901_E2",
                     "20260901_E3", "20260903", "20260903_GEN",
-                    "20260903_replication_check", "20260904", "20260904_DR",
+                    "20260903_replication_check", "20260904", "20260904_DR", "20260909_GEN",
                     "20260828/GEN", "20260828/THI"]
 
 
@@ -96,7 +96,7 @@ def label_console(cal_by_group, targets, limit=None):
             if not entry["floor_measured"]:
                 notes.append("noise floor borrowed from another session in this mode")
             if not entry["uncertainty_measured"]:
-                notes.append("label uncertainty borrowed; this mode has no back-end sweep")
+                notes.append("label uncertainty borrowed from another session in this mode")
             def leaf(name):
                 try:
                     return float(get_leaf(cap.fe_params, name))

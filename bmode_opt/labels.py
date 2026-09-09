@@ -34,10 +34,15 @@ a fixed threshold.
 
     What is not measured
 
-Only harmonic sessions swept the back end. Fundamental mode has no capture set with several
-back-end settings at one probe position, so its residual is borrowed from harmonic and marked
-label_uncertainty_measured false. A fundamental-mode sweep - gain, sliders and dynamic range at one
-position, with screenshots - is the single acquisition that would close this.
+Both modes now have a session that swept the back end at one probe position, so nothing is
+borrowed across the mode boundary any more: 20260909_GEN measures 0.1102 for fundamental and
+the three harmonic sessions give 0.046 to 0.309. Groups without their own sweep still borrow,
+but from a session in their own mode.
+
+What remains open is the gain ladder, not the uncertainty. Every harmonic capture sits between
+gain 59 and 125 and every usable fundamental one between 129 and 229, so the 41% step in dB per
+level at the boundary is equally consistent with the ladder being coarser at high gain and with
+the two modes stepping differently. See hisense_backend_sim.GAIN_DB_PER_LEVEL_TABLE.
 
 Dynamic range is reported unchanged with a zero delta on every frame; see backend_solver for
 why the data cannot determine it.
