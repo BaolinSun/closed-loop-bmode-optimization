@@ -140,7 +140,7 @@ def invert_palette_fast(screen_rgb, palette):
     return np.searchsorted(bounds, screen_rgb.sum(axis=-1)).astype(np.float64)
 
 
-def capture_display_gray(capture, crop=True):
+def capture_display_gray(capture, crop=True, palette=None):
     """The B-mode rectangle of a capture, in the console's own gray index rather than luma.
 
     This is what every gray-domain comparison should run on. hisense_loader.load_screenshot()
@@ -150,9 +150,68 @@ def capture_display_gray(capture, crop=True):
     from hisense_loader import crop_image_area
 
     screen = capture_screen_rgb(capture)
-    palette = extract_palette(screen)
+    if palette is None:
+        # Per-frame extraction can misread; pass a session_palette() when one is available.
+        palette = extract_palette(screen)
+        if not palette_is_plausible(palette):
+            raise ValueError(
+                "The colour bar in %s does not read as a display ramp. Pass a palette from "
+                "display_palette.session_palette() instead of relying on this frame."
+                % capture.name)
     if not crop:
         return invert_palette_fast(screen, palette), palette
     luma = 0.299 * screen[..., 0] + 0.587 * screen[..., 1] + 0.114 * screen[..., 2]
     _, (row0, row1, col0, col1) = crop_image_area(luma, capture.geometry.image_width_px)
     return invert_palette_fast(screen[row0:row1, col0:col1], palette), palette
+
+
+# A real ramp climbs steadily from black to white, so its middle entry sits near the middle of
+# its own range. A misread one does not: on 20260819 two frames returned a bar that is flat for
+# five eighths of its length and then jumps, giving a midpoint fraction of 0.005 against 0.51
+# for the same session's good frames.
+PALETTE_MIDPOINT_RANGE = (0.25, 0.75)
+PALETTE_MIN_SPAN = 120.0
+
+
+def palette_is_plausible(palette, midpoint_range=PALETTE_MIDPOINT_RANGE,
+                         min_span=PALETTE_MIN_SPAN):
+    """Whether an extracted bar looks like a display ramp rather than a misread.
+
+    extract_palette() takes the longest monotone run in a fixed column range. That is right
+    whenever the bar is the only thing there, and wrong when something else on screen is, and
+    it fails silently - the run it settles on is still monotone, just not the palette.
+    """
+    palette = np.asarray(palette, dtype=np.float64)
+    if palette.ndim != 2 or palette.shape[0] < 16:
+        return False
+    luminance = palette.mean(axis=1)
+    span = float(luminance[-1] - luminance[0])
+    if span < float(min_span):
+        return False
+    middle = float(luminance[luminance.size // 2] - luminance[0]) / span
+    return midpoint_range[0] <= middle <= midpoint_range[1]
+
+
+def session_palette(captures, columns=BAR_COLUMNS, size=PALETTE_SIZE):
+    """One palette for a whole session, from the frames whose bar reads plausibly.
+
+    The palette is a property of the display configuration, not of a frame, so reading it per
+    frame only adds a chance to get it wrong. Taking the median over the frames that pass
+    palette_is_plausible() keeps the one bad frame from deciding anything.
+
+    Returns (palette, num_used, num_rejected).
+    """
+    good, rejected = [], 0
+    for capture in captures:
+        try:
+            candidate = extract_palette(capture_screen_rgb(capture), columns, size)
+        except ValueError:
+            rejected += 1
+            continue
+        if palette_is_plausible(candidate):
+            good.append(candidate)
+        else:
+            rejected += 1
+    if not good:
+        raise ValueError("No frame in this session yielded a plausible display palette")
+    return np.median(np.stack(good, axis=0), axis=0), len(good), rejected

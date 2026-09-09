@@ -70,9 +70,9 @@ SWEPT_SESSIONS = [
 ]
 
 
-def summarise(capture):
+def summarise(capture, palette):
     """与 calibration.band_summary 相同，但把滑块档与增益档分开留着当自由参数。"""
-    actual = DP.capture_display_gray(capture)[0]
+    actual = DP.capture_display_gray(capture, palette=palette)[0]
     counts = S.scan_convert_linear(capture.bc0, actual.shape[0], actual.shape[1])
     edges = np.linspace(0, actual.shape[0], FIT_BANDS + 1).round().astype(int)
     fraction = 0.5 * (edges[:-1] + edges[1:]) / actual.shape[0]
@@ -197,7 +197,8 @@ def main():
     for session, note in SWEPT_SESSIONS:
         started = time.time()
         captures = [load_capture(p) for p in find_captures(DEFAULT_DATA_DIR / session)]
-        summaries = [summarise(c) for c in captures]
+        palette = DP.session_palette(captures)[0]
+        summaries = [summarise(c, palette) for c in captures]
         emit(u"")
         emit(u"=========== %s (%s, %d frames) ===========" % (session, note, len(summaries)))
         ramped = [s for s in summaries if s["tgc_span"] > 20]

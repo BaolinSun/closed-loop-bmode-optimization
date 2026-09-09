@@ -44,9 +44,10 @@ def load_groups():
     return groups
 
 
-def per_pixel_error(capture, counts_per_db, pivot_db, depth_response_db):
+def per_pixel_error(capture, counts_per_db, pivot_db, depth_response_db,
+                    palette=None):
     """Median absolute error between the rebuild and the console's own gray index."""
-    actual = DP.capture_display_gray(capture)[0]
+    actual = DP.capture_display_gray(capture, palette=palette)[0]
     predicted = S.render(
         capture.bc0, tgc_levels=capture.tgc_levels,
         gain_db=S.gain_level_to_db(capture.gain_level),
@@ -64,14 +65,27 @@ def main():
 
     started = time.time()
     groups = load_groups()
-    print("groups: %d, captures: %d\n" % (len(groups), sum(len(v) for v in groups.values())))
+    print("groups: %d, captures: %d" % (len(groups), sum(len(v) for v in groups.values())))
+
+    # One palette per group, taken as the median over the frames whose colour bar reads as
+    # a ramp. Reading it per frame silently misfires: six frames across the archive return
+    # a bar that is flat for most of its length, and on 20260819 that made two frames read
+    # 33 dB too bright and poisoned the whole group's fit.
+    palettes, rejected_total = {}, 0
+    for key, captures in groups.items():
+        palettes[key], _, rejected = DP.session_palette(captures)
+        rejected_total += rejected
+    print("palette: %d group(s), %d frame(s) rejected as unreadable\n"
+          % (len(palettes), rejected_total))
 
     print("%-30s %-9s %6s %11s %10s %11s %13s" % (
         "session", "mode", "frames", "counts/dB", "pivot_dB", "band error", "per-pixel err"))
     calibrations, swept = {}, {}
     for key in sorted(groups):
         captures = groups[key]
-        calibration = CAL.fit_group(captures, limit=min(args.fit_frames, len(captures)))
+        palette = palettes[key]
+        calibration = CAL.fit_group(captures, limit=min(args.fit_frames, len(captures)),
+                                    palette=palette)
         if calibration is None:
             continue
         calibrations[key] = calibration
@@ -80,7 +94,8 @@ def main():
         check = [c for c in captures if S.is_flat_tgc(c)]
         check = check[::max(1, len(check) // 6)][:6]
         errors = [per_pixel_error(c, calibration.counts_per_db, calibration.pivot_db,
-                                  CAL.depth_response_for(c, calibration)) for c in check]
+                                  CAL.depth_response_for(c, calibration), palette)
+                  for c in check]
         print("%-30s %-9s %6d %11.1f %10.2f %11.2f %13.1f" % (
             key[0][:28], MODE_NAME[key[1]], len(captures), calibration.counts_per_db,
             calibration.pivot_db, calibration.gray_error, float(np.mean(errors))))
@@ -117,9 +132,10 @@ def main():
             targets[key] = result["target_gray"]
 
         if swept.get(key):
+            palette = palettes[key]
             screenshot, rebuilt = [], []
             for capture in captures:
-                actual = DP.capture_display_gray(capture)[0]
+                actual = DP.capture_display_gray(capture, palette=palette)[0]
                 db = (S.bc0_to_db(capture.bc0, calibration.counts_per_db)
                       + CAL.depth_response_for(capture, calibration)[:, None])
                 shaped_screen = S.scan_convert_linear(db, actual.shape[0], actual.shape[1])

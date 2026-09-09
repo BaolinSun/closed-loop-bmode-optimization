@@ -153,7 +153,7 @@ def _select_fit_frames(captures, limit=DEFAULT_FIT_FRAMES):
 def screenshot_gray_error(capture, counts_per_db, pivot_db, depth_response_db=None,
                           num_bands=NUM_TGC_BANDS,
                           calibration_gain_level=CALIBRATION_GAIN_LEVEL,
-                          graymap_lut=None, per_pixel=False):
+                          graymap_lut=None, per_pixel=False, palette=None):
     """Error between a simulated render and the real screenshot, in gray levels.
 
     The screenshot is read through display_palette, not through PIL's luma: the console's
@@ -164,7 +164,7 @@ def screenshot_gray_error(capture, counts_per_db, pivot_db, depth_response_db=No
     each band first and so is blind to anything that does not move a band's level, which is how
     a visibly wrong tone curve survived a band error of 1.5 to 8 gray.
     """
-    actual = DP.capture_display_gray(capture)[0]
+    actual = DP.capture_display_gray(capture, palette=palette)[0]
     predicted = render(
         capture.bc0,
         tgc_levels=capture.tgc_levels,
@@ -191,7 +191,8 @@ def screenshot_gray_error(capture, counts_per_db, pivot_db, depth_response_db=No
 FIT_BANDS = 32
 
 
-def band_summary(capture, num_bands=FIT_BANDS, db_per_level=DEFAULT_DB_PER_LEVEL):
+def band_summary(capture, num_bands=FIT_BANDS, db_per_level=DEFAULT_DB_PER_LEVEL,
+                 palette=None):
     """Everything about one frame the fit needs, reduced to a few dozen numbers.
 
     Scan conversion is bilinear and the counts-to-dB step is a division, so they commute, and a
@@ -204,7 +205,7 @@ def band_summary(capture, num_bands=FIT_BANDS, db_per_level=DEFAULT_DB_PER_LEVEL
     display depths, and the console's own depth gain follows depth; without the physical axis
     the same band index from two frames would be averaged as though it were the same place.
     """
-    actual = DP.capture_display_gray(capture)[0]
+    actual = DP.capture_display_gray(capture, palette=palette)[0]
     counts = scan_convert_linear(capture.bc0, actual.shape[0], actual.shape[1])
     edges = np.linspace(0, actual.shape[0], num_bands + 1).round().astype(int)
     centres = (0.5 * (edges[:-1] + edges[1:]) / actual.shape[0]) * capture.geometry.depth_mm
@@ -275,7 +276,7 @@ def _solve_response(summaries, counts_per_db, pivot_db, axis_mm, smooth_mm=2.0):
 
 def fit_group(captures, counts_range=(300.0, 1600.0), pivot_range=(5.0, 50.0),
               coarse=41, refinements=4, limit=DEFAULT_FIT_FRAMES, iterations=5,
-              num_axis_points=128):
+              num_axis_points=128, palette=None):
     """Fit counts_per_db, pivot_db and the depth response for one group, against screenshots.
 
     Alternates: solve the two scalars on a grid with the current depth response held, then
@@ -289,7 +290,9 @@ def fit_group(captures, counts_range=(300.0, 1600.0), pivot_range=(5.0, 50.0),
     frames = _select_fit_frames(captures, limit)
     if not frames:
         return None
-    summaries = [band_summary(c) for c in frames]
+    if palette is None:
+        palette = DP.session_palette(captures)[0]
+    summaries = [band_summary(c, palette=palette) for c in frames]
     axis_mm = np.linspace(0.0, max(s["depth_mm"] for s in summaries), int(num_axis_points))
     response = np.zeros_like(axis_mm)
     best = None
@@ -328,7 +331,8 @@ def depth_response_for(capture, calibration):
                      right=calibration.depth_response_db[-1])
 
 
-def fit_graymap(captures, calibration, limit=None, min_samples=300, num_levels=256):
+def fit_graymap(captures, calibration, limit=None, min_samples=300, num_levels=256,
+                palette=None):
     """Recover the console's gray mapping as a lookup table, pooled over a group's frames.
 
     The simulator maps dB to gray with a straight line. The console does not. Comparing a
@@ -356,7 +360,7 @@ def fit_graymap(captures, calibration, limit=None, min_samples=300, num_levels=2
     sums = np.zeros(num_levels)
     counts = np.zeros(num_levels)
     for capture in frames:
-        actual = DP.capture_display_gray(capture)[0]
+        actual = DP.capture_display_gray(capture, palette=palette)[0]
         predicted = render(
             capture.bc0,
             tgc_levels=capture.tgc_levels,

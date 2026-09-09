@@ -63,9 +63,9 @@ UNCLIPPED_GRAY = (15, 240)
 SESSIONS = ["20260819", "20260901_E3", "20260904_DR"]
 
 
-def summarise(capture):
+def summarise(capture, palette):
     """一帧的逐带显示灰阶、逐带滑块档、增益档与窗宽。"""
-    display = DP.capture_display_gray(capture)[0]
+    display = DP.capture_display_gray(capture, palette=palette)[0]
     edges = np.linspace(0, display.shape[0], FIT_BANDS + 1).round().astype(int)
     fraction = 0.5 * (edges[:-1] + edges[1:]) / display.shape[0]
 
@@ -122,7 +122,8 @@ def main():
 
     for session in SESSIONS:
         captures = [load_capture(p) for p in find_captures(DEFAULT_DATA_DIR / session)]
-        summaries = [summarise(c) for c in captures]
+        palette = DP.session_palette(captures)[0]
+        summaries = [summarise(c, palette) for c in captures]
         emit(u"")
         emit(u"=========== %s (%d frames) ===========" % (session, len(summaries)))
         ramped = [s for s in summaries if not is_flat(s)]
