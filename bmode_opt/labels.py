@@ -239,6 +239,10 @@ def label_frame(db_image, valid_mask, dr_ui, reference_db, current, target_gray,
 
     if drawn:
         start_gain_db, start_levels = draw_start(rng, result["gain_db"], result["tgc_levels"])
+        # Round the start to settable levels before taking the difference. The label records
+        # the setting a machine would actually be at, so a consumer recomputing the delta from
+        # the recorded fields must land on the recorded delta rather than up to a level away.
+        start_levels = np.round(start_levels)
         current = (start_gain_db, start_levels, float(dr_ui))
         # The optimum is a property of the scene and does not move with the starting point, so
         # only the deltas are restated here.

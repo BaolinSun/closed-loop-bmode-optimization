@@ -21,6 +21,8 @@ import sys
 sys.path.insert(0, "bmode_opt")
 import numpy as np
 
+from hisense_backend_sim import GAIN_DB_PER_LEVEL
+
 DEFAULT_PATH = "data/labels_backend.jsonl"
 
 # 某个方向轴上超过这个比例落在同一类，就等于没有标签。
@@ -165,6 +167,77 @@ def main():
     say("  console notes:")
     for note, count in sorted(borrowed.items(), key=lambda kv: -kv[1]):
         say("    %4d  %s" % (count, note))
+
+    say()
+    say("=========== arithmetic and derived fields ===========")
+    worst_gain = max(abs(r["delta_gain_levels"]
+                         - (r["optimal_gain_db"] - r["gain_db"]) / GAIN_DB_PER_LEVEL)
+                     for r in rows)
+    worst_slider = max(
+        float(np.abs(np.asarray(r["delta_tgc_levels"])
+                     - (np.asarray(r["optimal_tgc_levels"], dtype=np.float64)
+                        - np.asarray(r["tgc_levels"], dtype=np.float64))).max())
+        for r in rows)
+    say("  max |delta_gain   - (optimal - current)| = %.6f clicks" % worst_gain)
+    say("  max |delta_slider - (optimal - current)| = %.6f levels" % worst_slider)
+    if worst_gain > 1e-6 or worst_slider > 1e-6:
+        problems.append("delta fields do not equal optimal minus current")
+
+    mismatched = 0
+    for r in rows:
+        delta, band = r["delta_gain_levels"], r["deadband_gain_levels"]
+        want = "correct" if abs(delta) <= band else ("dark" if delta > 0 else "bright")
+        mismatched += want != r["gain_direction"]
+    say("  gain_direction disagreeing with its own delta and deadband: %d" % mismatched)
+    if mismatched:
+        problems.append("%d gain_direction label(s) disagree with the delta" % mismatched)
+
+    say()
+    say("=========== split integrity (Field II) ===========")
+    scenes = collections.defaultdict(set)
+    for r in field:
+        scenes[r["split"]].add(r["group_id"].split("/")[0])
+    for first in ["train", "val", "test"]:
+        for second in ["train", "val", "test"]:
+            if first >= second:
+                continue
+            shared = scenes[first] & scenes[second]
+            say("  %-6s (%2d scenes) vs %-5s (%2d): %d shared"
+                % (first, len(scenes[first]), second, len(scenes[second]), len(shared)))
+            if shared:
+                problems.append("%s and %s share %d scene(s)"
+                                % (first, second, len(shared)))
+
+    say()
+    say("=========== how much the optimum itself moves with the scene ===========")
+    say("  reference_db is anchored per frame, so the optimum is a relative target and is")
+    say("  expected to be nearly constant. The task the labels pose is the delta, which the")
+    say("  model reads off the rendered image; this table is here so that stays visible.")
+    for axis in ["depth_mm", "frequency_mhz"]:
+        buckets = collections.defaultdict(list)
+        for r in field:
+            buckets[r[axis]].append(r["optimal_gain_db"])
+        say("  optimal_gain_db by %s" % axis)
+        for key in sorted(k for k in buckets if k is not None):
+            values = np.asarray(buckets[key])
+            say("    %-6s n=%4d  median %6.2f dB  p5 %6.2f  p95 %6.2f"
+                % (key, values.size, np.median(values),
+                   np.percentile(values, 5), np.percentile(values, 95)))
+
+    say()
+    say("=========== optimal sliders sitting at an end ===========")
+    for source, subset in [("fieldii", field), ("console", console)]:
+        if not subset:
+            continue
+        railed = sum(1 for r in subset
+                     if min(r["optimal_tgc_levels"]) <= 1
+                     or max(r["optimal_tgc_levels"]) >= 254)
+        say("  %-10s %d / %d (%.0f%%)" % (source, railed, len(subset),
+                                          100.0 * railed / len(subset)))
+    say("  Field II runs high because its phantom falls about 25 dB over the display depth")
+    say("  while the sliders span 254 x %.5f = %.1f dB. The console's BC0 arrives already"
+        % (0.07734, 254 * 0.07734))
+    say("  partly compensated, so its optimum lands inside the range more often.")
 
     say()
     say("=========== verdict ===========")
