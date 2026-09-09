@@ -8,8 +8,9 @@ Use the conda env `cubdl` — it has h5py, which the Field II loader needs:
 C:/Users/sunbaolin/miniconda3/envs/cubdl/python.exe
 ```
 
-Long jobs (calibration fits, label generation) are for the user to run, not the
-agent. Write the script, hand over the command.
+Run things yourself. Hand a command over to the user only when it would take
+roughly half an hour or more — a full label generation, a sweep over every
+capture. Anything shorter, just run it and report what came back.
 
 ## Script output
 

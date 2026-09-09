@@ -60,12 +60,29 @@ TGC_MIN_LEVEL = 0
 TGC_MAX_LEVEL = 255
 TGC_CENTER_LEVEL = 127
 
-# TGC slider slope: fitted from the 20260814 sweep; RMS residual 0.26 dB.
+# TGC slider slope. Measured by tests/measure_actuator_steps.py, which subtracts pairs of
+# frames of one static scene that differ in a single knob: counts, depth response and pivot are
+# identical between the two frames and cancel, so the reading needs no calibration at all.
+# Three sessions agree, over 2497 band readings with a residual of 0.446 dB:
+#
+#     session        slider dB/level   gain dB/level   residual
+#     20260819           0.07770          0.20108       0.285 dB
+#     20260901_E3        0.07728          0.19920       0.664 dB
+#     20260904_DR        0.07722          0.19958       0.449 dB
+#     combined           0.07734          0.20004       0.446 dB
+#
+# One scalar is enough: grouping the readings by step size gives 0.0766, 0.0765, 0.0778 and
+# 0.0774 dB per level for steps of 25-50, 50-80, 80-120 and 120-300 levels.
+#
+# Supersedes 0.06559, which was fitted from the 20260814 sweep on PIL luma. The console does
+# not display luma - it maps through a colour palette - so every constant fitted that way reads
+# low; see display_palette. The old value is 15% below this one.
+#
 # COUNTS_PER_DB: refitted on 20260904_DR after the window-width and anchor fixes. The old
 # 762.5 came from a fit that treated the console's dynamic-range number as dB, so it is not
-# comparable. Both constants are session defaults; calibrate_counts_per_db() refits them
-# from whichever flat-TGC capture a caller supplies.
-DEFAULT_DB_PER_LEVEL = 0.06559
+# comparable. Both constants are session defaults; calibration.fit_group() refits them per
+# session and imaging mode.
+DEFAULT_DB_PER_LEVEL = 0.07734
 DEFAULT_COUNTS_PER_DB = 877.3
 # The display-dB level that lands on GRAY_PIVOT, at the calibration gain (BUIGainLevel 75).
 # Refitted after the anchor fix; the old 84.58 was a top-of-window value under the
@@ -117,11 +134,14 @@ DR_WINDOW_INTERCEPT = 35.09
 DR_UI_RANGE = (30.0, 400.0)
 
 # --- Gain ------------------------------------------------------------------------
-# BUIGainLevel steps, in dB. Measured in 20260904_DR: gain 75 -> 115 (40 steps) produced
-# 6.79 dB at UI dynamic range 30 and 6.86 dB at 67. Those agree to 1%, which is also the
-# evidence that gain and dynamic range are separable knobs. Supersedes the 0.165 dB/step
-# estimate from the 20260819 TGC cross-calibration, whose R^2 was only 0.826.
-GAIN_DB_PER_LEVEL = 0.1705
+# BUIGainLevel steps, in dB. From the same pairwise measurement as DEFAULT_DB_PER_LEVEL above:
+# three sessions give 0.20108, 0.19920 and 0.19958, combining to 0.20004 - within 0.02% of an
+# even 0.2 dB per level, which is probably what the console was designed to do.
+#
+# Supersedes 0.1705, fitted on PIL luma and therefore 15% low for the same reason the slider
+# constant was. The evidence that gain and dynamic range are separable knobs still stands: in
+# 20260904_DR a 40-step gain change read the same at dynamic range 30 and at 67, to 1%.
+GAIN_DB_PER_LEVEL = 0.20004
 
 # --- Where the display window is anchored ----------------------------------------
 # Changing the dynamic range rotates the dB-to-gray mapping about a fixed gray level,
