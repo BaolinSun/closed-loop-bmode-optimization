@@ -52,6 +52,8 @@ from hisense_backend_sim import (
     GAIN_DB_PER_LEVEL,
     DEFAULT_DB_PER_LEVEL,
     TGC_CENTER_LEVEL,
+    TGC_MAX_LEVEL,
+    TGC_MIN_LEVEL,
 )
 from hisense_loader import NUM_TGC_BANDS
 import backend_solver as BS
@@ -116,6 +118,72 @@ class FrameLabel:
         return asdict(self)
 
 
+# ---------------------------------------------------------------------------------------
+#   Where a frame's starting point comes from
+#
+# The label says how far it is from the current setting to the optimum, so every frame needs a
+# current setting. A console frame has one already: wherever the operator left the knobs. A
+# Field II frame does not, and the first version of this file used the neutral setting - gain 0,
+# sliders flat at 127 - for all 4560 of them. The optimum is a property of the scene, so
+# subtracting one fixed point from it produced one fixed answer: the gain label came out 'dark'
+# on 4560 frames out of 4560, with a median delta of 34.99 clicks and a 5th-to-95th spread of
+# only 17 clicks around it. That is not a label.
+#
+# So a starting point is drawn instead, over the span the console's own frames turned out to
+# need: their gain deltas ran -17.5 to +25.0 clicks between the 5th and 95th percentiles. A
+# Field II frame perturbed over that range yields labels on the same scale as a console frame's,
+# which is what pretraining on one and fine-tuning on the other requires.
+#
+# The slider perturbation is zero-mean by construction. An offset would only be a gain change
+# wearing a different hat - backend_solver's zero-mean constraint hands the overall level to
+# gain - so what is left is the shape, and the near/mid/far triple can report two things about
+# a shape: whether it leans, and whether it bows. A tilt alone leaves the mid group at exactly
+# zero, because mid straddles the centre the tilt pivots about, and the first version of this
+# drew only a tilt: 100% of Field II frames came back with slider_directions[mid] == 'correct'.
+# So an arch is drawn alongside it.
+#
+# The ranges are set to cover what the console's own frames need, not to match it: console
+# slider deltas reach 128 levels because its optimum often rails at an end while the operator
+# left the sliders near neutral. Field II should span at least that, so the pretrained model
+# sees the whole range it will later be asked about.
+FIELDII_GAIN_DELTA_CLICKS = (-20.0, 25.0)
+FIELDII_SLIDER_TILT_LEVELS = (-110.0, 110.0)
+FIELDII_SLIDER_ARCH_LEVELS = (-70.0, 70.0)
+
+
+def slider_shape_basis(num_bands=NUM_TGC_BANDS):
+    """The tilt and arch a slider perturbation is built from, both zero-mean over the bands."""
+    positions = (np.arange(num_bands) - 0.5 * (num_bands - 1)) / (0.5 * (num_bands - 1))
+    tilt = positions
+    arch = positions ** 2
+    arch = arch - arch.mean()
+    return tilt, arch / np.abs(arch).max()
+
+
+def draw_start(rng, optimal_gain_db, optimal_tgc_levels,
+               gain_delta_clicks=FIELDII_GAIN_DELTA_CLICKS,
+               slider_tilt_levels=FIELDII_SLIDER_TILT_LEVELS,
+               slider_arch_levels=FIELDII_SLIDER_ARCH_LEVELS,
+               num_bands=NUM_TGC_BANDS):
+    """A synthetic starting point for a frame that has no operator behind it.
+
+    Returns (gain_db, tgc_levels). The delta is drawn first and the start placed at optimum
+    minus delta, so the label distribution is the one that was chosen rather than whatever a
+    distribution over starting points happens to induce. Clipping the start to the slider range
+    can shorten a delta on frames whose optimum already sits near an end, which is not a defect
+    - a slider that is already at 255 cannot be started above it either.
+    """
+    tilt_basis, arch_basis = slider_shape_basis(num_bands)
+    delta_gain_clicks = rng.uniform(*gain_delta_clicks)
+    delta_levels = (rng.uniform(*slider_tilt_levels) * tilt_basis
+                    + rng.uniform(*slider_arch_levels) * arch_basis)
+
+    start_gain_db = float(optimal_gain_db) - delta_gain_clicks * GAIN_DB_PER_LEVEL
+    start_levels = np.clip(np.asarray(optimal_tgc_levels, dtype=np.float64) - delta_levels,
+                           TGC_MIN_LEVEL, TGC_MAX_LEVEL)
+    return start_gain_db, start_levels
+
+
 def _direction(delta, deadband, names):
     """Form B on one axis: below, at, or above the optimum, with the band in the middle."""
     if abs(float(delta)) <= float(deadband):
@@ -144,18 +212,40 @@ def label_frame(db_image, valid_mask, dr_ui, reference_db, current, target_gray,
                 source, frame_id, group_id, imaging_mode, depth_mm,
                 frequency_mhz=None, focus_mm=None, split=None,
                 label_uncertainty=0.0, void_mask=None, calibration_borrowed=False,
-                notes=None, **solver_kwargs):
+                notes=None, rng=None, **solver_kwargs):
     """Solve one frame and express the answer as a label.
+
+    current is the setting the frame sits at. Pass None for a frame that has no operator behind
+    it - a starting point is then drawn from draw_start() using rng, after the optimum is known,
+    so the delta lands in the range the console's own frames turned out to need. Passing None
+    without an rng is an error rather than a silent default, because an unseeded label set
+    cannot be reproduced.
 
     label_uncertainty widens the equivalence band by the simulator's own residual, so a console
     frame's "correct" covers everything the rebuild cannot tell apart from the optimum. On a
     Field II frame it is zero and the band narrows to the objective's response to the 0.22 dB
     that repeat captures of one scene already disagree by.
     """
+    drawn = current is None
+    if drawn and rng is None:
+        raise ValueError("current=None needs an rng so the drawn start is reproducible")
+    solver_current = current if current is not None else (
+        0.0, np.full(NUM_TGC_BANDS, TGC_CENTER_LEVEL, dtype=np.float64), float(dr_ui))
+
     result = BS.solve_backend(
-        db_image, valid_mask, dr_ui=dr_ui, reference_db=reference_db, current=current,
+        db_image, valid_mask, dr_ui=dr_ui, reference_db=reference_db, current=solver_current,
         void_mask=void_mask, target_gray=target_gray,
         j_uncertainty=float(label_uncertainty), **solver_kwargs)
+
+    if drawn:
+        start_gain_db, start_levels = draw_start(rng, result["gain_db"], result["tgc_levels"])
+        current = (start_gain_db, start_levels, float(dr_ui))
+        # The optimum is a property of the scene and does not move with the starting point, so
+        # only the deltas are restated here.
+        result["delta_gain_levels"] = ((result["gain_db"] - start_gain_db)
+                                       / GAIN_DB_PER_LEVEL)
+        result["delta_tgc_levels"] = (result["tgc_levels"].astype(np.float64)
+                                      - start_levels)
 
     from hisense_backend_sim import dr_ui_to_window_db
     sweep = BS.GainSweep(db_image, result["tgc_levels"], valid_mask,

@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """Generate back-end labels for both data sources into one file with one schema."""
-import argparse, io, json, os, sys, time
+import argparse, io, json, os, sys, time, zlib
 sys.path.insert(0, "bmode_opt")
 import numpy as np
 import hisense_backend_sim as S
@@ -122,7 +122,13 @@ def label_console(cal_by_group, targets, limit=None):
     return rows
 
 
-def label_fieldii(target_gray, limit=None):
+def label_fieldii(target_gray, limit=None, seed=20260909):
+    """Field II frames, each with a drawn starting point.
+
+    Console frames arrive with a starting point already - the operator's. These do not, so one
+    is drawn per frame, seeded on the frame's own name so the label set is reproducible and a
+    frame keeps its start no matter what order the run happens to visit it in.
+    """
     rows = []
     paths = find_shards()
     if limit:
@@ -132,17 +138,19 @@ def label_fieldii(target_gray, limit=None):
         vm = T.fieldii_tissue_mask(shard)
         if vm.sum() < 1000:
             continue
+        rng = np.random.RandomState(
+            (seed + zlib.crc32(shard.name.encode("utf-8"))) % (2 ** 32))
         rows.append(LB.label_frame(
             shard.db_image, vm, dr_ui=shard.dynamic_range_level,
             reference_db=shard.tissue_median_db,
-            current=(0.0, np.asarray(shard.tgc_levels, dtype=np.float64),
-                     float(shard.dynamic_range_level)),
+            current=None, rng=rng,
             target_gray=target_gray, source="fieldii", frame_id=shard.name,
             group_id="seed%s/%s" % (shard.seed, shard.phantom_type),
             imaging_mode="general", depth_mm=shard.geometry.depth_mm,
             frequency_mhz=shard.frequency_mhz, focus_mm=shard.focus_mm,
             split=shard.split, label_uncertainty=0.0,
-            notes=["render is ground truth; no screenshot to match"]).as_dict())
+            notes=["render is ground truth; no screenshot to match",
+                   "starting point drawn, not an operator's"]).as_dict())
     return rows
 
 
