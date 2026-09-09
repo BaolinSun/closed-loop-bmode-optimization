@@ -19,8 +19,16 @@ CONSOLE_SESSIONS = ["20260814", "20260819", "20260831", "20260901", "20260901_E2
 
 def load_calibration():
     data = json.load(io.open(CAL_PATH, encoding="utf-8"))
-    out = {}
+    out, skipped = {}, []
     for g in data["groups"]:
+        # A group whose frames are mostly black cannot pin the mapping, and the fit runs off
+        # along the counts/pivot ridge instead of failing visibly. Labels built on it would be
+        # confident nonsense, so it is left out and named.
+        if not g.get("calibratable", True):
+            skipped.append("%s/%s (usable %.0f%%)"
+                           % (g["session"], g["image_mode_name"],
+                              100 * g.get("usable_fraction", float("nan"))))
+            continue
         out[(g["session"], g["image_mode"])] = {
             "cal": CAL.GroupCalibration(g["counts_per_db"], g["pivot_db"],
                                         g["screenshot_gray_error"], 0,
@@ -37,6 +45,9 @@ def load_calibration():
         donors = [v["floor"] for k, v in out.items()
                   if k[1] == key[1] and v["floor"] is not None]
         entry["floor"] = float(np.median(donors)) if donors else None
+    if skipped:
+        print("skipping %d group(s) as not calibratable: %s"
+              % (len(skipped), ", ".join(skipped)))
     return out
 
 
