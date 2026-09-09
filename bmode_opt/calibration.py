@@ -119,6 +119,14 @@ USABLE_GRAY = (10, 245)
 # group's display depths and gains is plenty, and it keeps a full sweep affordable.
 DEFAULT_FIT_FRAMES = 12
 
+# Below this fraction of unclipped pixels a group is reported as not calibratable. 20260828/GEN
+# was acquired in general mode at gain 75, where the others use 167 or 169, so it sits about
+# 18 dB dark: three of its five frames are 90% black and only 9 to 40% of any frame is usable.
+# Fitted anyway it returned counts_per_db 1634 against 508 to 514 for every other general
+# session, with 11.6 gray of band error - the fit wandering, not a measurement. Every other
+# group runs 62 to 97% usable, so the gap is wide and this threshold sits inside it.
+MIN_USABLE_FRACTION = 0.40
+
 
 @dataclass
 class GroupCalibration:
@@ -131,6 +139,10 @@ class GroupCalibration:
     depth_axis_mm: np.ndarray = field(default=None)
     depth_response_db: np.ndarray = field(default=None)
     graymap_lut: np.ndarray = field(default=None)
+    # Fraction of the fit frames' pixels that are neither crushed nor saturated. A group whose
+    # frames are mostly black carries almost no information about the mapping, and the fit then
+    # runs off along the counts/pivot ridge rather than failing visibly.
+    usable_fraction: float = float("nan")
 
     def db_image(self, capture):
         """The capture's BC0 in dB under this group's calibration."""
@@ -293,6 +305,10 @@ def fit_group(captures, counts_range=(300.0, 1600.0), pivot_range=(5.0, 50.0),
     if palette is None:
         palette = DP.session_palette(captures)[0]
     summaries = [band_summary(c, palette=palette) for c in frames]
+
+    usable = float(np.mean([
+        np.mean((s["actual"] > USABLE_GRAY[0]) & (s["actual"] < USABLE_GRAY[1]))
+        for s in summaries]))
     axis_mm = np.linspace(0.0, max(s["depth_mm"] for s in summaries), int(num_axis_points))
     response = np.zeros_like(axis_mm)
     best = None
@@ -317,7 +333,8 @@ def fit_group(captures, counts_range=(300.0, 1600.0), pivot_range=(5.0, 50.0),
     return GroupCalibration(
         counts_per_db=best[1], pivot_db=best[2],
         gray_error=group_cost(summaries, best[1], best[2], axis_mm, response),
-        num_fit_frames=len(frames), depth_axis_mm=axis_mm, depth_response_db=response)
+        num_fit_frames=len(frames), depth_axis_mm=axis_mm, depth_response_db=response,
+        usable_fraction=usable)
 
 
 def depth_response_for(capture, calibration):

@@ -78,8 +78,9 @@ def main():
     print("palette: %d group(s), %d frame(s) rejected as unreadable\n"
           % (len(palettes), rejected_total))
 
-    print("%-30s %-9s %6s %11s %10s %11s %13s" % (
-        "session", "mode", "frames", "counts/dB", "pivot_dB", "band error", "per-pixel err"))
+    print("%-30s %-9s %6s %11s %10s %11s %13s %7s %6s" % (
+        "session", "mode", "frames", "counts/dB", "pivot_dB", "band error", "per-pixel err",
+        "usable", "ok"))
     calibrations, swept = {}, {}
     for key in sorted(groups):
         captures = groups[key]
@@ -96,9 +97,11 @@ def main():
         errors = [per_pixel_error(c, calibration.counts_per_db, calibration.pivot_db,
                                   CAL.depth_response_for(c, calibration), palette)
                   for c in check]
-        print("%-30s %-9s %6d %11.1f %10.2f %11.2f %13.1f" % (
+        print("%-30s %-9s %6d %11.1f %10.2f %11.2f %13.1f %6.0f%% %6s" % (
             key[0][:28], MODE_NAME[key[1]], len(captures), calibration.counts_per_db,
-            calibration.pivot_db, calibration.gray_error, float(np.mean(errors))))
+            calibration.pivot_db, calibration.gray_error, float(np.mean(errors)),
+            100 * calibration.usable_fraction,
+            "yes" if calibration.usable_fraction >= CAL.MIN_USABLE_FRACTION else "NO"))
 
     print("\nnoise floors and brightness targets")
     print("%-30s %-9s %12s %12s %14s" % (
@@ -184,6 +187,8 @@ def main():
             "counts_per_db": round(calibration.counts_per_db, 2),
             "pivot_db": round(calibration.pivot_db, 3),
             "screenshot_gray_error": round(calibration.gray_error, 3),
+            "usable_fraction": round(float(calibration.usable_fraction), 3),
+            "calibratable": bool(calibration.usable_fraction >= CAL.MIN_USABLE_FRACTION),
             "noise_floor_db": (None if floors.get(key) is None
                                else round(floors[key], 3)),
             "noise_floor_measured": floors.get(key) is not None,
