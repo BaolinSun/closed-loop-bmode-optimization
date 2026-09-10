@@ -58,6 +58,8 @@ figure, and identifies the cause: shallow frames whose deepest rows are still ti
 averaged in. The deep-frame value is the one to use.
 """
 
+import collections
+
 import numpy as np
 
 from hisense_loader import get_leaf
@@ -193,7 +195,28 @@ def console_tissue_mask(db_image, floor_db, margin_db=DEFAULT_TISSUE_MARGIN_DB):
 BRIGHTNESS_SCALE_GRAY = 25.0
 
 
-def measure_accepted_brightness(captures, render_fn, tissue_mask_fn):
+def modal_setting_captures(captures):
+    """The frames sitting at the group's most repeated back-end setting.
+
+    In a session that swept the back end, most frames sit at settings nobody would work at, and
+    a median over all of them is not where the operator left the knobs. 20260910 holds five
+    distinct settings in six frames and reads 84 gray that way, against 28 to 37 for every
+    harmonic session that did not sweep. The modal setting is the one the operator kept
+    returning to - every harmonic group's is gain 75 with flat sliders at dynamic range 67, and
+    every fundamental group's is gain 167 or 169 at the same - so it is the working point.
+    """
+    counts = collections.Counter(
+        (int(c.gain_level), int(np.asarray(c.tgc_levels).round().mean()),
+         int(c.dynamic_range_level)) for c in captures)
+    if not counts:
+        return []
+    modal = counts.most_common(1)[0][0]
+    return [c for c in captures
+            if (int(c.gain_level), int(np.asarray(c.tgc_levels).round().mean()),
+                int(c.dynamic_range_level)) == modal]
+
+
+def measure_accepted_brightness(captures, render_fn, tissue_mask_fn, modal_only=True):
     """Where the tissue level sits when a group's frames are rendered at their own settings.
 
     This is the one brightness reference the data actually contains: not a number chosen for
@@ -205,6 +228,8 @@ def measure_accepted_brightness(captures, render_fn, tissue_mask_fn):
     render_fn(capture) returns the frame rendered at its own gain, sliders and dynamic range;
     tissue_mask_fn(capture) returns its tissue mask.
     """
+    if modal_only:
+        captures = modal_setting_captures(captures) or captures
     values = []
     for capture in captures:
         mask = tissue_mask_fn(capture)
