@@ -246,6 +246,19 @@ class Capture:
     tgc_levels: np.ndarray
     gain_level: int
     dynamic_range_level: int
+    # 发射聚焦深度，单位 mm。BFocusArrayPos 有 16 个槽位，前 BFocusNumValue 个有效。
+    # 目前 291 帧全是单焦点，但保留元组，因为多焦点预设会填进更多槽位，而那会
+    # 让「聚焦该往哪调」这个标签的含义完全不同。
+    focus_depths_mm: tuple = ()
+
+    @property
+    def focus_mm(self):
+        """单发射聚焦的深度。多焦点时抛错，而不是悄悄取第一个。"""
+        if len(self.focus_depths_mm) != 1:
+            raise ValueError(
+                f"{self.name} has {len(self.focus_depths_mm)} transmit foci "
+                f"{self.focus_depths_mm}; focus_mm is only defined for one")
+        return self.focus_depths_mm[0]
 
     @property
     def name(self):
@@ -284,6 +297,9 @@ def load_capture(capture_dir):
         tgc_levels=get_tgc_levels(be_params),
         gain_level=leaf_int(be_params, "BUIGainLevel"),
         dynamic_range_level=leaf_int(be_params, "UIDynamicRangeLevel"),
+        focus_depths_mm=tuple(
+            leaf_floats(fe_params, "BFocusArrayPos")
+            [:leaf_int(fe_params, "BFocusNumValue", 1)]),
     )
 
 

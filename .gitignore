@@ -8,3 +8,5 @@ tmp/
 
 # Measurement scripts write their output next to themselves.
 tests/*.txt
+tools_*.txt
+data/scene_families.json
