@@ -112,9 +112,16 @@ class FrameLabel:
     delta_gain_levels: float
     delta_tgc_levels: List[float]
     delta_dr_ui: float
-    # dB per console click at the level this frame sits at. The gain ladder is coarser above
-    # level 127 than below, so a delta in clicks cannot be converted back to dB without it.
+    # The same corrections in dB. A console click is not the same amount of gain in the two
+    # imaging modes - 0.20514 dB in harmonic against 0.28778 in fundamental - so a model
+    # trained on clicks alone would see one visual error map to two different numbers
+    # depending on the mode. dB is the mode-independent quantity; clicks are what the operator
+    # turns. Both are recorded so a consumer can choose, and the two slopes let either be
+    # rebuilt from the other.
+    delta_gain_db: float
+    delta_tgc_db: List[float]
     gain_db_per_level: float
+    tgc_db_per_level: float
 
     # How much of this to believe
     objective: float
@@ -295,7 +302,10 @@ def label_frame(db_image, valid_mask, dr_ui, reference_db, current, target_gray,
         slider_directions=slider_directions,
         dr_direction=DYNAMIC_RANGE_DIRECTIONS[1],
         delta_gain_levels=float(result["delta_gain_levels"]),
+        delta_gain_db=float(result["delta_gain_levels"]) * float(slope),
+        delta_tgc_db=[float(v) * tgc_db_per_level(image_mode) for v in delta_tgc],
         gain_db_per_level=float(slope),
+        tgc_db_per_level=float(tgc_db_per_level(image_mode)),
         delta_tgc_levels=[float(v) for v in delta_tgc],
         delta_dr_ui=0.0,
         objective=result["objective"],

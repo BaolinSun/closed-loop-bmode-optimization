@@ -74,7 +74,8 @@ def main():
                 "delta_gain_levels", "delta_tgc_levels", "delta_dr_ui",
                 "objective", "tolerance", "label_uncertainty", "deadband_gain_levels",
                 "equivalent_count", "dr_determined", "at_gain_edge",
-                "gain_db_per_level"]
+                "gain_db_per_level", "delta_gain_db", "delta_tgc_db",
+                "tgc_db_per_level"]
     missing = {key for r in rows for key in required if key not in r}
     if missing:
         problems.append("missing field(s): %s" % sorted(missing))
@@ -141,6 +142,8 @@ def main():
             continue
         say("  " + percentiles([r["delta_gain_levels"] for r in subset],
                                "%s d(gain), clicks" % source))
+        say("  " + percentiles([r["delta_gain_db"] for r in subset],
+                               "%s d(gain), dB" % source))
         slider = [v for r in subset for v in r["delta_tgc_levels"]]
         say("  " + percentiles(slider, "%s d(slider), levels" % source))
         say("  " + percentiles([r["deadband_gain_levels"] for r in subset],
