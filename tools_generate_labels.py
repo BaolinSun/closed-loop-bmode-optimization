@@ -13,7 +13,7 @@ from hisense_loader import DEFAULT_DATA_DIR, find_captures, get_leaf, load_captu
 CAL_PATH = "bmode_opt/console_calibration.json"
 CONSOLE_SESSIONS = ["20260814", "20260819", "20260831", "20260901", "20260901_E2",
                     "20260901_E3", "20260903", "20260903_GEN",
-                    "20260903_replication_check", "20260904", "20260904_DR", "20260909_GEN",
+                    "20260903_replication_check", "20260904", "20260904_DR", "20260909_GEN", "20260910",
                     "20260828/GEN", "20260828/THI"]
 
 
@@ -65,7 +65,7 @@ def console_targets(cal_by_group):
         r = T.measure_accepted_brightness(
             caps,
             lambda c: S.render(c.bc0, tgc_levels=c.tgc_levels,
-                               gain_db=S.gain_level_to_db(c.gain_level),
+                               gain_db=S.capture_gain_db(c),
                                dynamic_range_db=S.dr_ui_to_window_db(c.dynamic_range_level),
                                depth_response_db=CAL.depth_response_for(c, cal),
                                reference_db=cal.pivot_db, counts_per_db=cal.counts_per_db),
@@ -111,14 +111,14 @@ def label_console(cal_by_group, targets, limit=None):
                 focus = None
             rows.append(LB.label_frame(
                 db, vm, dr_ui=cap.dynamic_range_level, reference_db=cal.pivot_db,
-                current=(S.gain_level_to_db(cap.gain_level),
+                current=(S.capture_gain_db(cap),
                          np.asarray(cap.tgc_levels, dtype=np.float64),
                          float(cap.dynamic_range_level)),
                 target_gray=targets[key], source="console", frame_id=cap.name,
                 group_id="%s/%d" % key, imaging_mode=T.IMAGE_MODE_NAMES[key[1]],
                 depth_mm=cap.geometry.depth_mm, frequency_mhz=freq,
                 focus_mm=focus, split=None,
-                gain_level=cap.gain_level,
+                image_mode=key[1],
                 label_uncertainty=entry["uncertainty"],
                 calibration_borrowed=not entry["floor_measured"],
                 notes=notes).as_dict())
@@ -151,7 +151,7 @@ def label_fieldii(target_gray, limit=None, seed=20260909):
             group_id="seed%s/%s" % (shard.seed, shard.phantom_type),
             imaging_mode="fundamental", depth_mm=shard.geometry.depth_mm,
             frequency_mhz=shard.frequency_mhz, focus_mm=shard.focus_mm,
-            split=shard.split, label_uncertainty=0.0,
+            split=shard.split, label_uncertainty=0.0, image_mode=0,
             notes=["render is ground truth; no screenshot to match",
                    "starting point drawn, not an operator's"]).as_dict())
     return rows

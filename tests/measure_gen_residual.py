@@ -67,7 +67,7 @@ def main():
             actual = DP.capture_display_gray(capture, palette=palette)[0]
             predicted = S.render(
                 capture.bc0, tgc_levels=capture.tgc_levels,
-                gain_db=S.gain_level_to_db(capture.gain_level),
+                gain_db=S.capture_gain_db(capture),
                 dynamic_range_db=S.capture_window_db(capture),
                 depth_response_db=CAL.depth_response_for(capture, calibration),
                 reference_db=calibration.pivot_db,

@@ -55,9 +55,11 @@ import numpy as np
 
 from hisense_backend_sim import (
     CALIBRATION_GAIN_LEVEL,
+    DEFAULT_IMAGE_MODE,
     GAIN_DB_PER_LEVEL,
     gain_db_per_level,
     gain_db_to_levels,
+    tgc_db_per_level,
     DEFAULT_DB_PER_LEVEL,
     TGC_CENTER_LEVEL,
     TGC_MAX_LEVEL,
@@ -172,7 +174,7 @@ def slider_shape_basis(num_bands=NUM_TGC_BANDS):
 
 
 def draw_start(rng, optimal_gain_db, optimal_tgc_levels,
-               at_level=CALIBRATION_GAIN_LEVEL,
+               image_mode=DEFAULT_IMAGE_MODE,
                gain_delta_clicks=FIELDII_GAIN_DELTA_CLICKS,
                slider_tilt_levels=FIELDII_SLIDER_TILT_LEVELS,
                slider_arch_levels=FIELDII_SLIDER_ARCH_LEVELS,
@@ -190,7 +192,7 @@ def draw_start(rng, optimal_gain_db, optimal_tgc_levels,
     delta_levels = (rng.uniform(*slider_tilt_levels) * tilt_basis
                     + rng.uniform(*slider_arch_levels) * arch_basis)
 
-    start_gain_db = float(optimal_gain_db) - delta_gain_clicks * gain_db_per_level(at_level)
+    start_gain_db = float(optimal_gain_db) - delta_gain_clicks * gain_db_per_level(image_mode)
     start_levels = np.clip(np.asarray(optimal_tgc_levels, dtype=np.float64) - delta_levels,
                            TGC_MIN_LEVEL, TGC_MAX_LEVEL)
     return start_gain_db, start_levels
@@ -204,7 +206,7 @@ def _direction(delta, deadband, names):
 
 
 def gain_deadband_levels(sweep, gain_db, window_db, reference_db, tolerance,
-                         limit_db=8.0, step_db=0.05, at_level=CALIBRATION_GAIN_LEVEL):
+                         limit_db=8.0, step_db=0.05, image_mode=DEFAULT_IMAGE_MODE):
     """How far gain can move before the objective moves by more than the tolerance.
 
     Expressed in console clicks, because that is the unit the label is emitted in and the unit
@@ -216,15 +218,15 @@ def gain_deadband_levels(sweep, gain_db, window_db, reference_db, tolerance,
         moved = max(abs(sweep.evaluate(gain_db + offset, window_db, reference_db) - base),
                     abs(sweep.evaluate(gain_db - offset, window_db, reference_db) - base))
         if moved >= float(tolerance):
-            return float(offset / gain_db_per_level(at_level))
-    return float(limit_db / gain_db_per_level(at_level))
+            return float(offset / gain_db_per_level(image_mode))
+    return float(limit_db / gain_db_per_level(image_mode))
 
 
 def label_frame(db_image, valid_mask, dr_ui, reference_db, current, target_gray,
                 source, frame_id, group_id, imaging_mode, depth_mm,
                 frequency_mhz=None, focus_mm=None, split=None,
                 label_uncertainty=0.0, void_mask=None, calibration_borrowed=False,
-                notes=None, rng=None, gain_level=None, **solver_kwargs):
+                notes=None, rng=None, image_mode=DEFAULT_IMAGE_MODE, **solver_kwargs):
     """Solve one frame and express the answer as a label.
 
     current is the setting the frame sits at. Pass None for a frame that has no operator behind
@@ -246,13 +248,13 @@ def label_frame(db_image, valid_mask, dr_ui, reference_db, current, target_gray,
 
     result = BS.solve_backend(
         db_image, valid_mask, dr_ui=dr_ui, reference_db=reference_db, current=solver_current,
-        void_mask=void_mask, target_gray=target_gray, gain_level=gain_level,
+        void_mask=void_mask, target_gray=target_gray, image_mode=image_mode,
         j_uncertainty=float(label_uncertainty), **solver_kwargs)
-    at_level = CALIBRATION_GAIN_LEVEL if gain_level is None else gain_level
+    slope = gain_db_per_level(image_mode)
 
     if drawn:
         start_gain_db, start_levels = draw_start(rng, result["gain_db"],
-                                                 result["tgc_levels"], at_level)
+                                                 result["tgc_levels"], image_mode)
         # Round the start to settable levels before taking the difference. The label records
         # the setting a machine would actually be at, so a consumer recomputing the delta from
         # the recorded fields must land on the recorded delta rather than up to a level away.
@@ -261,7 +263,7 @@ def label_frame(db_image, valid_mask, dr_ui, reference_db, current, target_gray,
         # The optimum is a property of the scene and does not move with the starting point, so
         # only the deltas are restated here.
         result["delta_gain_levels"] = gain_db_to_levels(
-            result["gain_db"] - start_gain_db, at_level)
+            result["gain_db"] - start_gain_db, image_mode)
         result["delta_tgc_levels"] = (result["tgc_levels"].astype(np.float64)
                                       - start_levels)
 
@@ -270,10 +272,10 @@ def label_frame(db_image, valid_mask, dr_ui, reference_db, current, target_gray,
                          void_mask if void_mask is not None else ~np.asarray(valid_mask, bool),
                          target_gray=target_gray)
     deadband = gain_deadband_levels(sweep, result["gain_db"], dr_ui_to_window_db(dr_ui),
-                                    reference_db, result["tolerance"], at_level=at_level)
+                                    reference_db, result["tolerance"], image_mode=image_mode)
 
     delta_tgc = np.asarray(result["delta_tgc_levels"], dtype=np.float64)
-    slider_deadband = deadband * gain_db_per_level(at_level) / DEFAULT_DB_PER_LEVEL
+    slider_deadband = deadband * slope / tgc_db_per_level(image_mode)
     slider_directions = {
         name: _direction(delta_tgc[lo:hi].mean(), slider_deadband, SLIDER_DIRECTIONS)
         for name, (lo, hi) in SLIDER_GROUPS.items()
@@ -293,7 +295,7 @@ def label_frame(db_image, valid_mask, dr_ui, reference_db, current, target_gray,
         slider_directions=slider_directions,
         dr_direction=DYNAMIC_RANGE_DIRECTIONS[1],
         delta_gain_levels=float(result["delta_gain_levels"]),
-        gain_db_per_level=float(gain_db_per_level(at_level)),
+        gain_db_per_level=float(slope),
         delta_tgc_levels=[float(v) for v in delta_tgc],
         delta_dr_ui=0.0,
         objective=result["objective"],

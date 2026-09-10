@@ -104,6 +104,8 @@ from hisense_backend_sim import (
     CALIBRATION_GAIN_LEVEL,
     DEFAULT_DB_PER_LEVEL,
     gain_db_to_levels,
+    DEFAULT_IMAGE_MODE,
+    tgc_db_per_level,
     DEFAULT_PIVOT_DB,
     GAIN_DB_PER_LEVEL,
     GRAY_MAX,
@@ -431,7 +433,7 @@ class GainSweep:
 
 def action_distance(gain_db, tgc_levels, dr_ui, reference,
                     db_per_level=DEFAULT_DB_PER_LEVEL, dr_step=3.5,
-                    at_level=CALIBRATION_GAIN_LEVEL):
+                    image_mode=DEFAULT_IMAGE_MODE):
     """How far an action is from a reference one, counted in console clicks.
 
     Gain is converted at its own dB per level, the sliders at theirs, and dynamic range at the
@@ -439,7 +441,7 @@ def action_distance(gain_db, tgc_levels, dr_ui, reference,
     a number of detents the operator would have to turn.
     """
     gain_ref, tgc_ref, dr_ref = reference
-    gain_clicks = abs(gain_db_to_levels(float(gain_db) - float(gain_ref), at_level))
+    gain_clicks = abs(gain_db_to_levels(float(gain_db) - float(gain_ref), image_mode))
     tgc_clicks = float(np.mean(np.abs(np.asarray(tgc_levels, dtype=np.float64)
                                       - np.asarray(tgc_ref, dtype=np.float64))))
     dr_clicks = abs(float(dr_ui) - float(dr_ref)) / float(dr_step)
@@ -466,14 +468,14 @@ def solve_backend(
     gain_db_grid=None,
     shape_scales=DEFAULT_SHAPE_SCALES,
     num_bands=NUM_TGC_BANDS,
-    db_per_level=DEFAULT_DB_PER_LEVEL,
+    db_per_level=None,
     smoothness=DEFAULT_SMOOTHNESS,
     deadband_db=DEFAULT_DEADBAND_DB,
     j_uncertainty=0.0,
     weights=None,
     graymap_lut=None,
     target_gray=None,
-    gain_level=None,
+    image_mode=DEFAULT_IMAGE_MODE,
     fast=True,
 ):
     """Best gain and TGC for one pre-display dB image, as a unique canonical action.
@@ -488,6 +490,8 @@ def solve_backend(
     The answer depends only on the image, not on where the knobs currently sit. current is used
     solely to express the answer as a delta.
     """
+    if db_per_level is None:
+        db_per_level = tgc_db_per_level(image_mode)
     db_image = np.asarray(db_image, dtype=np.float64)
     valid_mask = np.asarray(valid_mask, dtype=bool)
     if void_mask is None:
@@ -605,9 +609,8 @@ def solve_backend(
         "at_gain_edge": bool(at_gain_edge),
         "shape_fit_rms_db": shape_info["fit_rms_db"],
         "shape_usable_rows": shape_info["usable_rows"],
-        "delta_gain_levels": gain_db_to_levels(
-            float(gain_db) - float(current[0]),
-            CALIBRATION_GAIN_LEVEL if gain_level is None else gain_level),
+        "delta_gain_levels": gain_db_to_levels(float(gain_db) - float(current[0]),
+                                              image_mode),
         "delta_tgc_levels": levels.astype(np.float64) - np.asarray(current[1], dtype=np.float64),
         "delta_dr_ui": 0.0,
     }

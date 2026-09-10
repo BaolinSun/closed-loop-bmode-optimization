@@ -62,10 +62,10 @@ UNCLIPPED_GRAY = (15, 240)
 # 场景静止、只扫后端的场次。前三个是谐波（增益 59-125），最后一个是基波
 # （增益 129-229）。两段增益区间不重叠，这正是 GAIN_DB_PER_LEVEL 必须分段、
 # 而分段的成因（档位区间还是成像模式）又分不开的原因。
-SESSIONS = ["20260819", "20260901_E3", "20260904_DR", "20260909_GEN"]
+SESSIONS = [("20260819", 1), ("20260901_E3", 1), ("20260904_DR", 1),
+            ("20260910", 1), ("20260909_GEN", 0)]
 
-# 增益阶梯换斜率的档位。谐波数据止于 125，基波数据始于 129，界在其间。
-GAIN_LADDER_BOUNDARY = 127.0
+MODE_NAMES = {0: "fundamental", 1: "harmonic"}
 
 
 def summarise(capture, palette):
@@ -88,17 +88,8 @@ def summarise(capture, palette):
         "depth_mm": float(capture.geometry.depth_mm),
         "dr_ui": float(capture.dynamic_range_level),
         "frequency_mhz": CAL.capture_frequency(capture),
+        "image_mode": S.capture_image_mode(capture),
     }
-
-
-def split_gain(a_level, b_level, boundary=GAIN_LADDER_BOUNDARY):
-    """把一次增益改变拆成界下与界上两段，各自带符号。"""
-    low = min(a_level, b_level)
-    high = max(a_level, b_level)
-    below = max(0.0, min(high, boundary) - min(low, boundary))
-    above = max(0.0, max(high, boundary) - max(low, boundary))
-    sign = 1.0 if b_level >= a_level else -1.0
-    return sign * below, sign * above
 
 
 def pair_rows(a, b):
@@ -112,10 +103,12 @@ def pair_rows(a, b):
                 - a["gray"][usable] / 255.0 * a["window_db"])
     delta_tgc = b["tgc_at_band"][usable] - a["tgc_at_band"][usable]
     delta_gain = np.full(delta_db.shape, b["gain_level"] - a["gain_level"])
-    below, above = split_gain(a["gain_level"], b["gain_level"])
+    harmonic = np.full(delta_db.shape, 1.0 if a["image_mode"] == 1 else 0.0)
+    # Columns 3-6 are the per-mode design: slider and gain, once for harmonic and once for
+    # fundamental, so one least squares can fit both modes at the same time.
     return np.column_stack([delta_db, delta_tgc, delta_gain,
-                            np.full(delta_db.shape, below),
-                            np.full(delta_db.shape, above)])
+                            delta_tgc * harmonic, delta_tgc * (1 - harmonic),
+                            delta_gain * harmonic, delta_gain * (1 - harmonic)])
 
 
 def is_flat(summary):
@@ -123,20 +116,20 @@ def is_flat(summary):
     return summary["tgc_span"] <= 10.0
 
 
-def solve(rows, label, emit, split=False):
-    """One gain slope, or one either side of the boundary."""
+def solve(rows, label, emit, per_mode=False):
+    """One slider and one gain slope, or one of each per imaging mode."""
     if not rows:
         return None
     stack = np.vstack(rows)
-    columns = [1, 3, 4] if split else [1, 2]
+    columns = [3, 4, 5, 6] if per_mode else [1, 2]
     solution, *_ = np.linalg.lstsq(stack[:, columns], stack[:, 0], rcond=None)
     residual = stack[:, 0] - stack[:, columns] @ solution
-    if split:
-        emit(u"  %-34s slider %.5f  gain<=%d %.5f  gain>%d %.5f  residual sd %7.3f dB  (%d)"
-             % (label, solution[0], GAIN_LADDER_BOUNDARY, solution[1],
-                GAIN_LADDER_BOUNDARY, solution[2], residual.std(), stack.shape[0]))
+    if per_mode:
+        emit(u"  %-30s slider h %.5f f %.5f   gain h %.5f f %.5f   residual %6.3f dB  (%d)"
+             % (label, solution[0], solution[1], solution[2], solution[3],
+                residual.std(), stack.shape[0]))
     else:
-        emit(u"  %-34s slider %.5f  gain %.5f  residual sd %7.3f dB  (%d readings)"
+        emit(u"  %-30s slider %.5f  gain %.5f  residual sd %7.3f dB  (%d readings)"
              % (label, solution[0], solution[1], residual.std(), stack.shape[0]))
     return solution
 
@@ -146,12 +139,14 @@ def main():
     emit = lines.append
     every, clean = [], []
 
-    for session in SESSIONS:
+    for session, mode in SESSIONS:
         captures = [load_capture(p) for p in find_captures(DEFAULT_DATA_DIR / session)]
+        captures = [c for c in captures if S.capture_image_mode(c) == mode]
         palette = DP.session_palette(captures)[0]
         summaries = [summarise(c, palette) for c in captures]
         emit(u"")
-        emit(u"=========== %s (%d frames) ===========" % (session, len(summaries)))
+        emit(u"=========== %s, %s (%d frames) ==========="
+             % (session, MODE_NAMES[mode], len(summaries)))
         ramped = [s for s in summaries if not is_flat(s)]
         if ramped:
             emit(u"  %d frame(s) carry a ramped slider curve, span %s levels"
@@ -199,16 +194,15 @@ def main():
 
     emit(u"")
     emit(u"=========== all sessions together ===========")
-    emit(u"  one gain slope over the whole ladder:")
+    emit(u"  both modes sharing one slider and one gain:")
     solve(every, u"all pairs", emit)
     solve(clean, u"flat frames, one knob only", emit)
-    emit(u"  gain slope split at level %d:" % GAIN_LADDER_BOUNDARY)
-    solve(every, u"all pairs", emit, split=True)
-    solve(clean, u"flat frames, one knob only", emit, split=True)
-    emit(u"  current constants                  slider %.5f  gain<=%d %.5f  gain>%d %.5f"
-         % (S.DEFAULT_DB_PER_LEVEL, GAIN_LADDER_BOUNDARY,
-            S.GAIN_DB_PER_LEVEL_TABLE[0][2], GAIN_LADDER_BOUNDARY,
-            S.GAIN_DB_PER_LEVEL_TABLE[1][2]))
+    emit(u"  slider and gain per imaging mode:")
+    solve(every, u"all pairs", emit, per_mode=True)
+    solve(clean, u"flat frames, one knob only", emit, per_mode=True)
+    emit(u"  current constants               slider h %.5f f %.5f   gain h %.5f f %.5f"
+         % (S.TGC_DB_PER_LEVEL_BY_MODE[1], S.TGC_DB_PER_LEVEL_BY_MODE[0],
+            S.GAIN_DB_PER_LEVEL_BY_MODE[1], S.GAIN_DB_PER_LEVEL_BY_MODE[0]))
 
     if clean:
         stack = np.vstack(clean)

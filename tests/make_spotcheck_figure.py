@@ -107,7 +107,7 @@ def main():
 
         as_acquired = S.render(
             db_image=db, tgc_levels=capture.tgc_levels,
-            gain_db=S.gain_level_to_db(capture.gain_level),
+            gain_db=S.capture_gain_db(capture),
             dynamic_range_db=S.dr_ui_to_window_db(capture.dynamic_range_level),
             reference_db=calibration.pivot_db, depth_response_db=None,
             out_shape=actual_gray.shape)
@@ -117,7 +117,7 @@ def main():
             db, mask, dr_ui=capture.dynamic_range_level,
             reference_db=calibration.pivot_db, target_gray=entry["target"],
             j_uncertainty=entry["uncertainty"],
-            current=(S.gain_level_to_db(capture.gain_level),
+            current=(S.capture_gain_db(capture),
                      np.asarray(capture.tgc_levels, dtype=np.float64),
                      float(capture.dynamic_range_level)))
         proposed = S.render(

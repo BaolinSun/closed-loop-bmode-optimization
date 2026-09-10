@@ -26,7 +26,7 @@ from hisense_loader import DEFAULT_DATA_DIR, find_captures, load_capture
 
 SESSIONS = ["20260814", "20260819", "20260831", "20260901", "20260901_E2",
             "20260901_E3", "20260903", "20260903_GEN",
-            "20260903_replication_check", "20260904", "20260904_DR", "20260909_GEN",
+            "20260903_replication_check", "20260904", "20260904_DR", "20260909_GEN", "20260910",
             "20260828/GEN", "20260828/THI"]
 MODE_NAME = {0: "fundamental", 1: "harmonic"}
 
@@ -50,7 +50,7 @@ def per_pixel_error(capture, counts_per_db, pivot_db, depth_response_db,
     actual = DP.capture_display_gray(capture, palette=palette)[0]
     predicted = S.render(
         capture.bc0, tgc_levels=capture.tgc_levels,
-        gain_db=S.gain_level_to_db(capture.gain_level),
+        gain_db=S.capture_gain_db(capture),
         dynamic_range_db=S.capture_window_db(capture),
         depth_response_db=depth_response_db, reference_db=pivot_db,
         counts_per_db=counts_per_db, out_shape=actual.shape).astype(np.float64)
@@ -124,7 +124,7 @@ def main():
         result = T.measure_accepted_brightness(
             captures,
             lambda c: S.render(c.bc0, tgc_levels=c.tgc_levels,
-                               gain_db=S.gain_level_to_db(c.gain_level),
+                               gain_db=S.capture_gain_db(c),
                                dynamic_range_db=S.capture_window_db(c),
                                depth_response_db=CAL.depth_response_for(c, calibration),
                                reference_db=calibration.pivot_db,
@@ -147,7 +147,7 @@ def main():
                     continue
                 rebuild = S.render(
                     db_image=db, tgc_levels=capture.tgc_levels,
-                    gain_db=S.gain_level_to_db(capture.gain_level),
+                    gain_db=S.capture_gain_db(capture),
                     dynamic_range_db=S.capture_window_db(capture),
                     reference_db=calibration.pivot_db, depth_response_db=None,
                     out_shape=actual.shape)

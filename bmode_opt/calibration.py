@@ -100,6 +100,8 @@ from hisense_backend_sim import (
     DEFAULT_PIVOT_DB,
     bc0_to_db,
     capture_window_db,
+    capture_db_per_level,
+    capture_gain_db,
     gain_level_to_db,
     gray_to_db,
     is_flat_tgc,
@@ -188,7 +190,7 @@ def screenshot_gray_error(capture, counts_per_db, pivot_db, depth_response_db=No
     predicted = render(
         capture.bc0,
         tgc_levels=capture.tgc_levels,
-        gain_db=gain_level_to_db(capture.gain_level, calibration_gain_level),
+        gain_db=capture_gain_db(capture, calibration_gain_level),
         dynamic_range_db=capture_window_db(capture),
         depth_response_db=depth_response_db,
         reference_db=pivot_db,
@@ -219,8 +221,7 @@ def capture_frequency(capture):
         return None
 
 
-def band_summary(capture, num_bands=FIT_BANDS, db_per_level=DEFAULT_DB_PER_LEVEL,
-                 palette=None):
+def band_summary(capture, num_bands=FIT_BANDS, db_per_level=None, palette=None):
     """Everything about one frame the fit needs, reduced to a few dozen numbers.
 
     Scan conversion is bilinear and the counts-to-dB step is a division, so they commute, and a
@@ -241,8 +242,10 @@ def band_summary(capture, num_bands=FIT_BANDS, db_per_level=DEFAULT_DB_PER_LEVEL
         "actual": np.array([np.median(actual[edges[k]:edges[k + 1]]) for k in range(num_bands)]),
         "counts": np.array([np.median(counts[edges[k]:edges[k + 1]]) for k in range(num_bands)]),
         "centres_mm": centres,
-        "offset_db": float(tgc_level_to_db(capture.tgc_levels[0], db_per_level))
-                     + gain_level_to_db(capture.gain_level),
+        "offset_db": float(tgc_level_to_db(
+            capture.tgc_levels[0],
+            capture_db_per_level(capture) if db_per_level is None else db_per_level))
+                     + capture_gain_db(capture),
         "window_db": capture_window_db(capture),
         "depth_mm": float(capture.geometry.depth_mm),
         "frequency_mhz": capture_frequency(capture),
@@ -432,7 +435,7 @@ def fit_graymap(captures, calibration, limit=None, min_samples=300, num_levels=2
         predicted = render(
             capture.bc0,
             tgc_levels=capture.tgc_levels,
-            gain_db=gain_level_to_db(capture.gain_level),
+            gain_db=capture_gain_db(capture),
             dynamic_range_db=capture_window_db(capture),
             depth_response_db=depth_response_for(capture, calibration),
             reference_db=calibration.pivot_db,

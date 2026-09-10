@@ -32,7 +32,7 @@ def db_of(cap, key):
 def render_own(cap, key):
     cal = cals[key]
     return S.render(cap.bc0, tgc_levels=cap.tgc_levels,
-                    gain_db=S.gain_level_to_db(cap.gain_level),
+                    gain_db=S.capture_gain_db(cap),
                     dynamic_range_db=S.dr_ui_to_window_db(cap.dynamic_range_level),
                     depth_response_db=CAL.depth_response_for(cap, cal),
                     reference_db=cal.pivot_db, counts_per_db=cal.counts_per_db)
@@ -106,7 +106,7 @@ for key in sorted(groups):
         r = BS.solve_backend(
             d, vm, dr_ui=c.dynamic_range_level, reference_db=cal.pivot_db,
             target_gray=targets[key],
-            current=(S.gain_level_to_db(c.gain_level),
+            current=(S.capture_gain_db(c),
                      np.asarray(c.tgc_levels, dtype=np.float64),
                      float(c.dynamic_range_level)))
         n += 1; n_edge += r["at_gain_edge"]

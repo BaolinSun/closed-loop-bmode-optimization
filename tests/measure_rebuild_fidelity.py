@@ -27,7 +27,7 @@ for sess, mode in PICKS:
         shot = crop_capture_image(cap)[0]
         db = S.bc0_to_db(cap.bc0, cal.counts_per_db) + CAL.depth_response_for(cap, cal)[:, None]
         rebuilt = S.render(db_image=db, tgc_levels=cap.tgc_levels,
-                           gain_db=S.gain_level_to_db(cap.gain_level),
+                           gain_db=S.capture_gain_db(cap),
                            dynamic_range_db=S.dr_ui_to_window_db(cap.dynamic_range_level),
                            reference_db=cal.pivot_db, depth_response_db=None,
                            out_shape=shot.shape).astype(np.float64)

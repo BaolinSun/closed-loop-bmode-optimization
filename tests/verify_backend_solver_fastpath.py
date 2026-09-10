@@ -101,7 +101,7 @@ for key in sorted(groups):
         vm = T.console_tissue_mask(d, f["floor_db"])
         r = BS.solve_backend(
             d, vm, dr_ui=c.dynamic_range_level, reference_db=float(np.median(d[vm])),
-            current=(S.gain_level_to_db(c.gain_level),
+            current=(S.capture_gain_db(c),
                      np.asarray(c.tgc_levels, dtype=np.float64),
                      float(c.dynamic_range_level)))
         gray = S.render(db_image=d, tgc_levels=r["tgc_levels"], gain_db=r["gain_db"],

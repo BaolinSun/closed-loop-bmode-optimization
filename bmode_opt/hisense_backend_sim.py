@@ -87,7 +87,9 @@ TGC_CENTER_LEVEL = 127
 # 762.5 came from a fit that treated the console's dynamic-range number as dB, so it is not
 # comparable. Both constants are session defaults; calibration.fit_group() refits them per
 # session and imaging mode.
-DEFAULT_DB_PER_LEVEL = 0.07940
+# Harmonic. The per-mode table is TGC_DB_PER_LEVEL_BY_MODE, defined below with the
+# evidence; this name is the default for callers that do not know their frame's mode.
+DEFAULT_DB_PER_LEVEL = 0.07810
 DEFAULT_COUNTS_PER_DB = 877.3
 # The display-dB level that lands on GRAY_PIVOT, at the calibration gain (BUIGainLevel 75).
 # Refitted after the anchor fix; the old 84.58 was a top-of-window value under the
@@ -138,53 +140,75 @@ DR_WINDOW_INTERCEPT = 35.09
 # The console's own limit, which is also the span the four calibration points cover.
 DR_UI_RANGE = (30.0, 400.0)
 
-# --- Gain ------------------------------------------------------------------------
-# BUIGainLevel steps, in dB. Not one number: the console's gain ladder is coarser above the
-# middle of its range than below it. Measured by tests/measure_actuator_steps.py, which
-# subtracts pairs of frames of one static scene differing in a single knob, so the reading
-# needs no calibration at all. Fitting all four swept sessions together, 4473 band readings:
+# --- Gain and TGC, per imaging mode ------------------------------------------------
+# Both actuators step differently in the two transmit modes. Measured by
+# tests/measure_actuator_steps.py, which subtracts pairs of frames of one static scene
+# differing in a single knob, so the reading needs no calibration at all. Fitting all five
+# swept sessions together, 4875 band readings:
 #
-#     model                              residual sd
-#     one constant over the whole range     1.316 dB
-#     split at level 127                    0.508 dB
+#     model                             residual sd
+#     nothing per mode                     1.433 dB
+#     slider per mode, shared gain         1.423 dB
+#     gain per mode, shared slider         0.519 dB
+#     both per mode                        0.490 dB
 #
-# and 0.508 is what each session's own fit gives, so the split accounts for essentially all of
-# the discrepancy. The cross-check frame settles it on its own: gain 129 with sliders at 196,
-# against gain 169 with sliders at 127, measures -6.212 dB. The split constants predict -5.992;
-# a single 0.20004 predicts -2.820.
+# so the gain split is the one that matters and the slider split is a modest extra.
 #
-#     gain level    dB per level    measured on
-#     0 to 127        0.20359       20260819, 20260901_E3, 20260904_DR (all harmonic)
-#     127 to 255      0.28675       20260909_GEN (fundamental)
+#                      slider dB/level    gain dB/level
+#     harmonic            0.07810            0.20514
+#     fundamental         0.08226            0.28778
 #
-# WHAT IS NOT SEPARATED. Every harmonic capture in the archive sits between gain 59 and 125,
-# and every usable fundamental one between 129 and 229. They overlap only at level 75, in
-# 20260828/GEN, which is 90% black and holds a single gain level, so it yields no pair. The
-# split above is therefore equally consistent with "the ladder is coarser at high gain" and
-# with "fundamental mode steps differently from harmonic". It is written as a property of the
-# level because a digital gain applied after beamforming has no way to know the transmit mode,
-# but that is reasoning, not measurement. Three harmonic frames at gain 129, 169 and 209 at one
-# probe position would settle it; see the acquisition protocol.
-GAIN_DB_PER_LEVEL_TABLE = ((0.0, 127.0, 0.20359), (127.0, 255.0, 0.28675))
+# WHAT THIS SUPERSEDES. Before 20260910 every harmonic capture sat between gain 59 and 125 and
+# every usable fundamental one between 129 and 229, so the 40% difference was equally
+# consistent with a ladder that coarsens at high gain. E7 settled it by running harmonic up to
+# gain 169 at one probe position: 129 to 149 measured 4.371 dB where a coarsening ladder
+# predicts 5.735 and a mode difference predicts 4.072, and 149 to 169 measured the same 4.371.
+# Harmonic does drift mildly with level - 0.198 below 111 against 0.219 above - but splitting
+# it buys only 0.490 to 0.453 dB of residual and the break point is equally good anywhere from
+# level 95 to 143, so it is not modelled.
+#
+# NOT MEASURED: fundamental below level 127. The only capture there is 20260828/GEN, which is
+# 90% black and yields no pair. No label depends on it - that group is marked not calibratable.
+GAIN_DB_PER_LEVEL_BY_MODE = {0: 0.28778, 1: 0.20514}
+TGC_DB_PER_LEVEL_BY_MODE = {0: 0.08226, 1: 0.07810}
 
-# The slope at the low end, kept for callers that only need an order of magnitude. Anything
-# converting a real dB difference into console clicks should use gain_db_to_levels() with the
-# level it is at, because a click is worth 41% more above 127 than below it.
-GAIN_DB_PER_LEVEL = GAIN_DB_PER_LEVEL_TABLE[0][2]
+# Harmonic, because it is 189 of the archive's 302 console frames and the mode the three
+# earliest swept sessions used. Callers that know their frame's mode should pass it.
+DEFAULT_IMAGE_MODE = 1
 
-
-def gain_db_per_level(level):
-    """Local slope of the gain ladder, in dB per level, at one gain level."""
-    level = float(level)
-    for low, high, slope in GAIN_DB_PER_LEVEL_TABLE:
-        if low <= level < high:
-            return float(slope)
-    return float(GAIN_DB_PER_LEVEL_TABLE[-1][2])
+GAIN_DB_PER_LEVEL = GAIN_DB_PER_LEVEL_BY_MODE[DEFAULT_IMAGE_MODE]
 
 
-def gain_db_to_levels(delta_db, at_level):
-    """Convert a dB difference into console clicks, at the level it is measured from."""
-    return float(delta_db) / gain_db_per_level(at_level)
+def gain_db_per_level(image_mode=DEFAULT_IMAGE_MODE):
+    """dB the console's gain adds per level, in one imaging mode."""
+    return float(GAIN_DB_PER_LEVEL_BY_MODE[int(image_mode)])
+
+
+def tgc_db_per_level(image_mode=DEFAULT_IMAGE_MODE):
+    """dB one TGC slider level adds, in one imaging mode."""
+    return float(TGC_DB_PER_LEVEL_BY_MODE[int(image_mode)])
+
+
+def gain_db_to_levels(delta_db, image_mode=DEFAULT_IMAGE_MODE):
+    """Convert a dB difference into console clicks, in one imaging mode."""
+    return float(delta_db) / gain_db_per_level(image_mode)
+
+
+def capture_image_mode(capture):
+    """BImageMode of a capture: 0 fundamental, 1 harmonic."""
+    from hisense_loader import get_leaf
+    return int(get_leaf(capture.fe_params, "BImageMode"))
+
+
+def capture_gain_db(capture, reference_level=CALIBRATION_GAIN_LEVEL):
+    """The capture's own gain in dB, using its own imaging mode's ladder."""
+    return gain_level_to_db(capture.gain_level, reference_level,
+                            capture_image_mode(capture))
+
+
+def capture_db_per_level(capture):
+    """The slider dB per level for this capture's imaging mode."""
+    return tgc_db_per_level(capture_image_mode(capture))
 
 # --- Where the display window is anchored ----------------------------------------
 # Changing the dynamic range rotates the dB-to-gray mapping about a fixed gray level,
@@ -217,22 +241,10 @@ def capture_window_db(capture):
     return dr_ui_to_window_db(capture.dynamic_range_level)
 
 
-def gain_level_to_db(level, reference_level=CALIBRATION_GAIN_LEVEL):
-    """dB the console's gain adds at one level, relative to another.
-
-    Integrates GAIN_DB_PER_LEVEL_TABLE rather than multiplying by one slope: the ladder is
-    coarser above level 127 than below, so a span that crosses the boundary is not the level
-    difference times any single constant.
-    """
-    level = float(level)
-    reference_level = float(reference_level)
-    sign = 1.0 if level >= reference_level else -1.0
-    low, high = min(level, reference_level), max(level, reference_level)
-    total = 0.0
-    for start, stop, slope in GAIN_DB_PER_LEVEL_TABLE:
-        span = max(0.0, min(high, stop) - max(low, start))
-        total += span * slope
-    return sign * total
+def gain_level_to_db(level, reference_level=CALIBRATION_GAIN_LEVEL,
+                     image_mode=DEFAULT_IMAGE_MODE):
+    """dB the console's gain adds at one level, relative to another, in one imaging mode."""
+    return (float(level) - float(reference_level)) * gain_db_per_level(image_mode)
 
 
 def bc0_to_db(bc0, counts_per_db=DEFAULT_COUNTS_PER_DB):

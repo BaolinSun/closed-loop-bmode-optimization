@@ -36,7 +36,7 @@ for key in sorted(cals):
     shot = crop_capture_image(cap)[0]
     db = S.bc0_to_db(cap.bc0, cal.counts_per_db) + CAL.depth_response_for(cap, cal)[:, None]
     reb = S.render(db_image=db, tgc_levels=cap.tgc_levels,
-                   gain_db=S.gain_level_to_db(cap.gain_level),
+                   gain_db=S.capture_gain_db(cap),
                    dynamic_range_db=S.dr_ui_to_window_db(cap.dynamic_range_level),
                    reference_db=cal.pivot_db, depth_response_db=None,
                    out_shape=shot.shape).astype(np.float64)
@@ -74,7 +74,7 @@ for key in sorted(cals):
         db_s = S.scan_convert_linear(db, shot.shape[0], shot.shape[1])
         vm = T.console_tissue_mask(db_s, floor)
         reb = S.render(db_image=db, tgc_levels=cap.tgc_levels,
-                       gain_db=S.gain_level_to_db(cap.gain_level),
+                       gain_db=S.capture_gain_db(cap),
                        dynamic_range_db=S.dr_ui_to_window_db(cap.dynamic_range_level),
                        reference_db=cal.pivot_db, depth_response_db=None,
                        out_shape=shot.shape)
@@ -107,7 +107,7 @@ db = S.bc0_to_db(cap.bc0, cal.counts_per_db) + CAL.depth_response_for(cap, cal)[
 vm = T.console_tissue_mask(db, floor)
 sweep = BS.GainSweep(db, cap.tgc_levels, vm, ~vm, target_gray=target)
 win = S.dr_ui_to_window_db(cap.dynamic_range_level)
-g0 = S.gain_level_to_db(cap.gain_level)
+g0 = S.capture_gain_db(cap)
 base = sweep.evaluate(g0, win, cal.pivot_db)
 w(u"    增益 ±0.22 dB → J 变化 %.4f / %.4f"
   % (abs(sweep.evaluate(g0 + 0.22, win, cal.pivot_db) - base),

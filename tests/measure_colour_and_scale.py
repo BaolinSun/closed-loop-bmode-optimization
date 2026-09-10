@@ -52,7 +52,7 @@ for key, cap in picked:
     shot = crop_capture_image(cap)[0]
     db = S.bc0_to_db(cap.bc0, cal.counts_per_db) + CAL.depth_response_for(cap, cal)[:, None]
     full = S.render_db(db_image=db, tgc_levels=cap.tgc_levels,
-                       gain_db=S.gain_level_to_db(cap.gain_level))
+                       gain_db=S.capture_gain_db(cap))
     H, W = shot.shape
     base = None; best = None
     for sy in [1.0, 1.005, 1.01, 1.02, 1.03, 0.995, 0.99, 0.98]:
