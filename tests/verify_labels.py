@@ -73,7 +73,8 @@ def main():
                 "gain_direction", "slider_directions", "dr_direction",
                 "delta_gain_levels", "delta_tgc_levels", "delta_dr_ui",
                 "objective", "tolerance", "label_uncertainty", "deadband_gain_levels",
-                "equivalent_count", "dr_determined", "at_gain_edge"]
+                "equivalent_count", "dr_determined", "at_gain_edge",
+                "gain_db_per_level"]
     missing = {key for r in rows for key in required if key not in r}
     if missing:
         problems.append("missing field(s): %s" % sorted(missing))
@@ -170,8 +171,10 @@ def main():
 
     say()
     say("=========== arithmetic and derived fields ===========")
+    # The ladder is piecewise, so each row carries the slope it was converted with.
     worst_gain = max(abs(r["delta_gain_levels"]
-                         - (r["optimal_gain_db"] - r["gain_db"]) / GAIN_DB_PER_LEVEL)
+                         - (r["optimal_gain_db"] - r["gain_db"])
+                         / r.get("gain_db_per_level", GAIN_DB_PER_LEVEL))
                      for r in rows)
     worst_slider = max(
         float(np.abs(np.asarray(r["delta_tgc_levels"])
@@ -179,6 +182,9 @@ def main():
                         - np.asarray(r["tgc_levels"], dtype=np.float64))).max())
         for r in rows)
     say("  max |delta_gain   - (optimal - current)| = %.6f clicks" % worst_gain)
+    slopes = collections.Counter(round(r.get("gain_db_per_level", float("nan")), 5)
+                                 for r in rows)
+    say("  gain dB per click used: %s" % dict(slopes))
     say("  max |delta_slider - (optimal - current)| = %.6f levels" % worst_slider)
     if worst_gain > 1e-6 or worst_slider > 1e-6:
         problems.append("delta fields do not equal optimal minus current")

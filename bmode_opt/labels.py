@@ -110,6 +110,9 @@ class FrameLabel:
     delta_gain_levels: float
     delta_tgc_levels: List[float]
     delta_dr_ui: float
+    # dB per console click at the level this frame sits at. The gain ladder is coarser above
+    # level 127 than below, so a delta in clicks cannot be converted back to dB without it.
+    gain_db_per_level: float
 
     # How much of this to believe
     objective: float
@@ -290,6 +293,7 @@ def label_frame(db_image, valid_mask, dr_ui, reference_db, current, target_gray,
         slider_directions=slider_directions,
         dr_direction=DYNAMIC_RANGE_DIRECTIONS[1],
         delta_gain_levels=float(result["delta_gain_levels"]),
+        gain_db_per_level=float(gain_db_per_level(at_level)),
         delta_tgc_levels=[float(v) for v in delta_tgc],
         delta_dr_ui=0.0,
         objective=result["objective"],

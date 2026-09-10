@@ -131,6 +131,12 @@ DEFAULT_DR_UI_CANDIDATES = (30, 45, 67, 100, 150, 220, 300, 400)
 # frames; that limit is about predicting real screenshots and does not bound this search.
 DEFAULT_GAIN_DB_GRID = np.arange(-8.0, 24.01, 0.5)
 
+# Half-width of the adaptive gain search, in dB, either side of the gain that puts the tissue
+# median on the brightness target. Sixteen dB is generous: over the whole archive the optimum
+# sits within 9 dB of that centre.
+DEFAULT_GAIN_SEARCH_HALF_WIDTH_DB = 16.0
+DEFAULT_GAIN_STEP_DB = 0.5
+
 # Weight on the second difference of the eight slider dB values, relative to the weighted
 # least-squares fit of the depth trend. Chosen so a smooth attenuation curve is followed
 # closely while a single-band spike is not; see the sensitivity report in the verification.
@@ -360,6 +366,22 @@ class GainSweep:
         """The dB value that renders to a given (possibly fractional) gray level."""
         return float(reference_db) - float(gain_db) + (level - GRAY_PIVOT) * window_db / GRAY_MAX
 
+    def centring_gain_db(self, target_gray, window_db, reference_db):
+        """The gain that puts this shape's tissue median exactly on target_gray.
+
+        The search is centred here rather than on a fixed span of absolute dB, because
+        reference_db is a per-group pivot and the two imaging modes sit 20 dB apart in it -
+        fundamental pivots land near 45 and harmonic near 30. A fixed window that suits one
+        clips the other: with the grid pinned at -8..+24 dB, 53 of 280 console frames came back
+        sitting exactly on the ceiling, every one of them fundamental.
+        """
+        if self.tissue_median_pair is None:
+            return 0.0
+        low, high = self.tissue_median_pair
+        median_db = 0.5 * (low + high)
+        return float((float(target_gray) - GRAY_PIVOT) * window_db / GRAY_MAX
+                     + float(reference_db) - median_db)
+
     def evaluate(self, gain_db, window_db, reference_db, return_terms=False):
         """Objective for one gain, identical to rendering at that gain and scoring it."""
         window_db = max(1.0, float(window_db))
@@ -441,7 +463,7 @@ def solve_backend(
     current=None,
     void_mask=None,
     tissue_weight=None,
-    gain_db_grid=DEFAULT_GAIN_DB_GRID,
+    gain_db_grid=None,
     shape_scales=DEFAULT_SHAPE_SCALES,
     num_bands=NUM_TGC_BANDS,
     db_per_level=DEFAULT_DB_PER_LEVEL,
@@ -517,6 +539,18 @@ def solve_backend(
         shaped = apply_tgc(db_image, levels, db_per_level)
         return OBJ.backend_objective(gray, shaped, valid_mask, void_mask, weights=weights,
                                      num_bands=num_bands, target_gray=target_gray)
+
+    if gain_db_grid is None:
+        # Centre the search where the tissue median lands on the target, so the span does not
+        # have to cover the gap between the two modes' pivot conventions.
+        if target_gray is not None and fast:
+            centres = [sweeps[scale].centring_gain_db(target_gray, window_db, reference_db)
+                       for scale, _, _ in candidates]
+            centre = float(np.median(centres))
+        else:
+            centre = 8.0
+        half = DEFAULT_GAIN_SEARCH_HALF_WIDTH_DB
+        gain_db_grid = np.arange(centre - half, centre + half + 1e-9, DEFAULT_GAIN_STEP_DB)
 
     evaluations = []
     for scale, levels, gain_offset in candidates:
