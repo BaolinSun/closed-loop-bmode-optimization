@@ -1,62 +1,57 @@
 # -*- coding: utf-8 -*-
 """读取 Field II 噪声试跑的结果，算出正式配置该填的 electronic_noise_db。
 
-    这个脚本解决什么
+    2026-09-11 改写：第一版的读数办法是错的
 
-从 configs/full.json 里的 electronic_noise_db 到图像上真正的噪声底，中间隔着
-一整条换算链。链上除了一个量，其余都已经能精确算出来：
+第一版从图像最深处读噪声底，再按孔径模型反推。试跑证明那样读不到噪声：在 -48 dB
+这个电平下最深处仍然是组织信号，读出来的「噪声底」其实是信号，于是算出的斜率是
++4.03 dB/MHz，把「相对基准抹平频率依赖」这个**正确**的判断误判成不成立。
 
-    图像噪声底(dB) = R + N配置 + 3.18 - 10*log10(接收阵元数)
+现在改用**与无噪声孪生帧在线性域相减**。噪声与信号非相干叠加：
 
-  N配置   就是 electronic_noise_db 填的数
-  3.18 dB 射频转包络的固定换算。带通高斯噪声的解析包络服从瑞利分布，
-          中位数是射频标准差的 sqrt(2*ln2)=1.177 倍，20*log10(1.177)=1.41；
-          再加上 fieldii_beamform_line 用归一化汉宁权重带来的 sqrt(3/2)，
-          合计 3.18 dB
-  阵元数  波束合成对噪声的抑制。信号相干相加、噪声非相干相加，而权重和为 1
-          （fieldii_beamform_line.m 第 47 行 weights/sum(weights)），所以
-          信号幅度不变、噪声降 10*log10(N)。接收孔径按 f-number 1.5 随深度
-          张开，阵元数 = 深度/(1.5*阵元间距)，下限 8 上限 128
-  R       参考采集的通道射频均方根，相对数据集显示参考值，单位 dB。
-          **唯一测不出只能跑出来的量**，因为它取决于 Field II 内部怎么缩放
-          激励与散射幅度，而 HDF5 里只存了包络，没存射频
+    包络_有噪声^2 = 包络_无噪声^2 + 包络_噪声^2
 
-试跑就是为了量 R。R 只是一个纯 dB 平移量，量准一次，正式配置就精确，不用试第二次。
+两边相减就精确解出注入的噪声，不需要孔径模型，也不怕深处还是信号。试跑的种子在
+原数据集里有同设置的孪生帧，两者衰减系数完全相同（0.66841981），可逐像素比。
 
-    为什么试跑要用未修改的代码
+    第一版那条换算链为什么算不对
 
-原代码里 noise_rms = 该线自己的射频均方根 * 10^(N/20)。对**参考采集**
-（4.0 MHz、聚焦 10 mm）而言，"该线自己的均方根"正好就是要找的参考均方根，
-所以在 4.0 MHz 那一帧上读出的就是 R 本身。
+原本以为 图像噪声底 = R + N配置 + 3.18 - 10*log10(接收阵元数)，按孔径模型那几项
+合计 -17.5 dB。实测是 +13.4 dB，差 31 dB。原因是 signal_rms 取的是**通道射频**，
+而每个阵元收到的是整个被照射区域的回波；波束合成只挑出焦线上那一份，抑制掉的
+离轴杂波正好是这 31 dB。这条链路只能实测，不能算。
 
-顺带，另外三个频率给出一次直接验证：若四个频率的「浅层组织减噪声底」几乎不变，
-就证实了「相对基准抹掉频率依赖」这个判断——那是要求改代码的全部理由。
+好在实测结果非常好用：在参考采集自己那一帧上，
 
-用法：python tests/measure_noise_pilot.py --pilot-dir <试跑输出目录>
+    包络噪声底 = electronic_noise_db + 0.4 dB
+
+也就是**代码改成固定参考之后，配置里填的数几乎就是图像上的噪声底**。
+
+    这个脚本报告什么
+
+一、【注入的噪声到底多大】线性域相减，逐频率解出。
+二、【相对基准是否抹平了频率依赖】噪声底随频率的斜率与信号随频率的斜率若相等，
+   就说明噪声完全跟着信号走，组织与噪声之比不随频率变化——那是要求改
+   fieldii_simulate_line_chunk.m 的全部理由。
+三、【正式配置填多少】把目标包络噪声底区间平移过去。
+
+用法：
+    python tests/measure_noise_pilot.py --pilot-dir <试跑输出目录>
 """
 
 import argparse
 import io
 import os
 import sys
+from pathlib import Path
 
 sys.path.insert(0, "bmode_opt")
 import numpy as np
 
-from fieldii_loader import load_shard
+from fieldii_loader import DEFAULT_FIELDII_DIR, HDF5_SUBDIR, load_shard
 
-# 试跑配置里填的值。configs/noise_pilot.json 把区间两端都设成这个数，
-# 所以采样结果必然是它，不受随机数影响。
+# 试跑配置里填的值。configs/noise_pilot.json 把区间两端都设成这个数。
 PILOT_NOISE_DB = -48.0
-
-# 探头与波束合成参数，取自 configs/full.json 的 probe 与 beamforming 两段。
-PITCH_MM = 0.3
-RX_F_NUMBER = 1.5
-MIN_RX_ELEMENTS = 8
-MAX_RX_ELEMENTS = 128
-
-# 射频转包络加上归一化汉宁权重的固定换算，见模块开头。
-ENVELOPE_OFFSET_DB = 3.18
 
 # 浅层组织电平取这一段，浅到任何频率下都一定还有信号。
 TISSUE_DEPTH_MM = (10.0, 20.0)
@@ -65,32 +60,40 @@ TISSUE_DEPTH_MM = (10.0, 20.0)
 # 落在这个区间内，整条频率阶梯才都会在某些场景下成为正确答案。
 TARGET_FLOOR_DB = (-95.0, -60.0)
 
-# 折算 N配置 时用的参考深度。取 30 mm，那是显示深度阶梯的中段。
-REFERENCE_DEPTH_MM = 30.0
+# 线性域相减后，正残差少于这么多像素就认为噪声没露头，该帧不参与。
+MIN_POSITIVE_PIXELS = 1000
 
 
-def rx_elements(depth_mm):
-    """某深度上的接收阵元数。孔径按 f-number 张开，两端截断。"""
-    count = np.asarray(depth_mm, dtype=np.float64) / (RX_F_NUMBER * PITCH_MM)
-    return np.clip(count, MIN_RX_ELEMENTS, MAX_RX_ELEMENTS)
+def recover_noise_db(clean_shard, noisy_shard):
+    """线性域相减，解出注入噪声的包络均方根，单位 dB。"""
+    clean = 10.0 ** (clean_shard.db_image / 20.0)
+    noisy = 10.0 ** (noisy_shard.db_image / 20.0)
+    residual = noisy ** 2 - clean ** 2
+    residual = residual[residual > 0]
+    if residual.size < MIN_POSITIVE_PIXELS:
+        return None
+    return 20.0 * np.log10(float(np.sqrt(np.mean(residual))))
 
 
-def beamforming_suppression_db(depth_mm):
-    """波束合成把噪声压低多少 dB。"""
-    return 10.0 * np.log10(rx_elements(depth_mm))
+def envelope_rms_db(shard):
+    envelope = 10.0 ** (shard.db_image / 20.0)
+    return 20.0 * np.log10(float(np.sqrt(np.mean(envelope ** 2))))
 
 
-def depth_axis(geometry):
-    return (geometry.min_depth_mm
-            + (np.arange(geometry.num_points) + 0.5) * geometry.mm_per_point)
+def tissue_db(shard):
+    geometry = shard.geometry
+    depth = (geometry.min_depth_mm
+             + (np.arange(geometry.num_points) + 0.5) * geometry.mm_per_point)
+    band = (depth >= TISSUE_DEPTH_MM[0]) & (depth <= TISSUE_DEPTH_MM[1])
+    return float(np.median(shard.db_image[band, :]))
 
 
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--pilot-dir", required=True,
-                        help="试跑输出的 hdf5 目录，例如 "
-                             "D:/MyProjects/matlab/fieldii-dataset-generation/"
-                             "data/noise_pilot/hdf5")
+                        help="试跑输出的 hdf5 目录")
+    parser.add_argument("--noiseless-dir", default=str(DEFAULT_FIELDII_DIR / HDF5_SUBDIR),
+                        help="原无噪声数据集的 hdf5 目录，用来找孪生帧")
     parser.add_argument("--noise-db", type=float, default=PILOT_NOISE_DB,
                         help="试跑配置里填的 electronic_noise_db")
     args = parser.parse_args()
@@ -98,102 +101,92 @@ def main():
     lines = []
     emit = lines.append
 
-    from pathlib import Path
     paths = sorted(Path(args.pilot_dir).glob("*.h5"))
     if not paths:
         raise SystemExit("no shards under %s" % args.pilot_dir)
-    shards = [load_shard(p) for p in paths]
-    shards.sort(key=lambda s: s.frequency_mhz)
+    noiseless_root = Path(args.noiseless_dir)
 
     emit(u"=========== pilot shards ===========")
-    for shard in shards:
-        emit(u"  %-50s %g MHz  focus %g mm  depth %g mm"
-             % (shard.name[:50], shard.frequency_mhz, shard.focus_mm,
-                shard.geometry.depth_mm))
+    rows = []
+    for path in paths:
+        twin = noiseless_root / path.name
+        noisy = load_shard(path)
+        if not twin.exists():
+            emit(u"  %-46s NO NOISELESS TWIN, skipped" % path.stem[:46])
+            continue
+        clean = load_shard(twin)
+        noise_db = recover_noise_db(clean, noisy)
+        rows.append({"freq": round(noisy.frequency_mhz, 2),
+                     "noise_db": noise_db,
+                     "rms_db": envelope_rms_db(clean),
+                     "tissue_db": tissue_db(clean)})
+        emit(u"  %-46s %g MHz  focus %g mm  depth %g mm"
+             % (path.stem[:46], noisy.frequency_mhz, noisy.focus_mm,
+                noisy.geometry.depth_mm))
     emit(u"  electronic_noise_db used in the pilot: %g" % args.noise_db)
+    rows = [r for r in rows if r["noise_db"] is not None]
+    if not rows:
+        raise SystemExit("no shard had a recoverable noise residual")
+    rows.sort(key=lambda r: r["freq"])
 
     emit(u"")
-    emit(u"=========== 1. is the noise floor where the model says ===========")
-    emit(u"  The floor is read off the deepest eighth of each image, then corrected by")
-    emit(u"  the beamforming suppression that depth carries. If the corrected profile is")
-    emit(u"  flat with depth, the aperture model is right and R can be trusted.")
+    emit(u"=========== 1. how big the injected noise actually is ===========")
+    emit(u"  Recovered by subtracting the noiseless twin in the linear domain, so this is")
+    emit(u"  exact rather than read off a region that may still hold signal.")
     emit(u"")
-    emit(u"%-8s %12s %12s %12s %12s"
-         % (u"freq", u"raw floor", u"rx elements", u"corrected", u"flatness"))
-    corrected_by_frequency = {}
-    for shard in shards:
-        depth = depth_axis(shard.geometry)
-        tail = depth >= shard.geometry.depth_mm - 0.25 * (
-            shard.geometry.depth_mm - shard.geometry.min_depth_mm)
-        rows = np.median(shard.db_image[tail, :], axis=1)
-        corrected = rows + beamforming_suppression_db(depth[tail])
-        corrected_by_frequency[round(shard.frequency_mhz, 2)] = float(np.median(corrected))
-        emit(u"%-8g %12.2f %12.1f %12.2f %12.2f"
-             % (shard.frequency_mhz, float(np.median(rows)),
-                float(np.median(rx_elements(depth[tail]))),
-                float(np.median(corrected)), float(np.std(corrected))))
-    emit(u"  flatness is the spread of the corrected profile; a couple of dB is fine,")
-    emit(u"  ten or more means the deep part is still signal rather than noise.")
+    emit(u"%-8s %14s %14s %14s"
+         % (u"freq", u"noise env dB", u"image rms dB", u"noise - rms"))
+    for row in rows:
+        emit(u"%-8g %14.2f %14.2f %14.2f"
+             % (row["freq"], row["noise_db"], row["rms_db"],
+                row["noise_db"] - row["rms_db"]))
 
     emit(u"")
     emit(u"=========== 2. does the relative reference flatten frequency ===========")
-    emit(u"  Shallow tissue minus noise floor, per frequency. The prediction from the")
-    emit(u"  noiseless data was about -1.1 dB per MHz with the code as it stands, against")
-    emit(u"  -8.6 with an absolute reference and -8.24 measured on the console.")
+    frequencies = [r["freq"] for r in rows]
+    noise_slope = float(np.polyfit(frequencies, [r["noise_db"] for r in rows], 1)[0])
+    signal_slope = float(np.polyfit(frequencies, [r["rms_db"] for r in rows], 1)[0])
+    drift = (max(r["noise_db"] - r["rms_db"] for r in rows)
+             - min(r["noise_db"] - r["rms_db"] for r in rows))
+    emit(u"  noise floor slope  %7.2f dB per MHz" % noise_slope)
+    emit(u"  signal level slope %7.2f dB per MHz" % signal_slope)
+    emit(u"  the two differ by  %7.2f dB per MHz" % abs(noise_slope - signal_slope))
+    emit(u"  noise-minus-signal drifts %.2f dB over the whole ladder" % drift)
     emit(u"")
-    emit(u"%-8s %14s %12s %10s" % (u"freq", u"tissue 10-20mm", u"floor", u"gap"))
-    frequencies, gaps = [], []
-    for shard in shards:
-        depth = depth_axis(shard.geometry)
-        band = (depth >= TISSUE_DEPTH_MM[0]) & (depth <= TISSUE_DEPTH_MM[1])
-        tissue = float(np.median(shard.db_image[band, :]))
-        tail = depth >= shard.geometry.depth_mm - 0.25 * (
-            shard.geometry.depth_mm - shard.geometry.min_depth_mm)
-        floor = float(np.median(shard.db_image[tail, :]))
-        frequencies.append(shard.frequency_mhz)
-        gaps.append(tissue - floor)
-        emit(u"%-8g %14.2f %12.2f %10.2f" % (shard.frequency_mhz, tissue, floor,
-                                             tissue - floor))
-    if len(frequencies) > 1:
-        slope = float(np.polyfit(frequencies, gaps, 1)[0])
-        emit(u"")
-        emit(u"  measured slope %.2f dB per MHz" % slope)
-        if abs(slope) < 3.0:
-            emit(u"  CONFIRMED: the relative reference does flatten the frequency")
-            emit(u"  dependence. fieldii_simulate_line_chunk.m line 89 must be changed to")
-            emit(u"  a fixed per-phantom reference before the full run.")
-        else:
-            emit(u"  NOT CONFIRMED: the slope is steeper than predicted. Do not change the")
-            emit(u"  code on the strength of this analysis; re-examine first.")
+    if abs(noise_slope - signal_slope) < 1.0:
+        emit(u"  CONFIRMED. The floor tracks the signal almost exactly, so the tissue to")
+        emit(u"  noise ratio barely moves with frequency. fieldii_simulate_line_chunk.m")
+        emit(u"  line 89 must take a fixed per-phantom reference instead of each line's")
+        emit(u"  own root mean square, before the full run.")
+    else:
+        emit(u"  NOT CONFIRMED. The floor does not simply track the signal; re-examine")
+        emit(u"  before changing the generator.")
 
     emit(u"")
-    emit(u"=========== 3. R, and what to put in the config ===========")
-    reference = min(corrected_by_frequency)
-    r_value = (corrected_by_frequency[reference] - args.noise_db - ENVELOPE_OFFSET_DB)
-    emit(u"  The reference acquisition is the lowest frequency, %g MHz, because that is" % reference)
+    emit(u"=========== 3. what to put in the config ===========")
+    reference = rows[0]
+    offset = reference["noise_db"] - args.noise_db
+    emit(u"  The reference acquisition is the lowest frequency, %g MHz, because that is"
+         % reference["freq"])
     emit(u"  the first one the generator's loop reaches and therefore the one a fixed")
     emit(u"  per-phantom reference would be taken from.")
     emit(u"")
-    emit(u"  corrected floor at %g MHz        %8.2f dB" % (reference, corrected_by_frequency[reference]))
-    emit(u"  minus electronic_noise_db        %8.2f" % args.noise_db)
-    emit(u"  minus envelope offset            %8.2f" % ENVELOPE_OFFSET_DB)
-    emit(u"  R                                %8.2f dB" % r_value)
-    emit(u"  (the estimate from the noiseless data was about -15.9 dB)")
-
-    suppression = beamforming_suppression_db(REFERENCE_DEPTH_MM)
-    low = TARGET_FLOOR_DB[0] - r_value - ENVELOPE_OFFSET_DB + suppression
-    high = TARGET_FLOOR_DB[1] - r_value - ENVELOPE_OFFSET_DB + suppression
+    emit(u"  electronic_noise_db in the pilot   %8.2f dB" % args.noise_db)
+    emit(u"  envelope noise floor it produced   %8.2f dB" % reference["noise_db"])
+    emit(u"  offset between the two             %8.2f dB" % offset)
     emit(u"")
-    emit(u"  target image noise floor         %g to %g dB" % TARGET_FLOOR_DB)
-    emit(u"  at the %g mm reference depth the beamformer suppresses %.2f dB"
-         % (REFERENCE_DEPTH_MM, suppression))
+    emit(u"  Once the generator uses that one reference for every frequency, the offset")
+    emit(u"  above is all that separates the config number from the image noise floor.")
+    emit(u"")
+    emit(u"  target envelope noise floor        %g to %g dB" % TARGET_FLOOR_DB)
     emit(u"")
     emit(u"  PUT THIS IN configs/full.json:")
     emit(u"")
     emit(u'      "noise": {')
     emit(u'        "enabled": true,')
     emit(u'        "reference": "per_phantom",')
-    emit(u'        "electronic_noise_db": [%.1f, %.1f]' % (low, high))
+    emit(u'        "electronic_noise_db": [%.1f, %.1f]'
+         % (TARGET_FLOOR_DB[0] - offset, TARGET_FLOOR_DB[1] - offset))
     emit(u'      }')
 
     text = "\n".join(lines)
