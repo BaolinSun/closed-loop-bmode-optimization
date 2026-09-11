@@ -43,7 +43,11 @@ TARGET_WINDOW_MM = (3.0, 3.0)
 def structure_extent_mm(truth_mask, geometry, point_targets_mm=None):
     """本帧视野里最深的结构在哪个深度，单位 mm。没有结构返回 None。
 
-    Field II 的 truth_mask：0 是背景组织，1 是无回声囊肿，2 是高回声夹杂。
+    Field II 的 truth_mask：0 是背景组织，1 以上是**囊肿的编号**，全都是无回声的。
+    早先我把值 2 读成「高回声夹杂」，那是错的——当时看的是 30 mm 裁剪帧，34 mm
+    处那个囊肿只露出 99 个像素的顶部薄片，被部分容积效应抬到 -29.6 dB，所以不像
+    完整囊肿的 -45.4 dB。囊肿个数逐体模随机（1 到 3 个），所以编号上限会变。
+
     点靶体模的 truth_mask 全是 0，靶点位置另由 point_targets_mm 给出。
     均匀体模两者皆无——那种场景**定不了深度**，因为每个深度看到的都一样，
     这是事实而不是缺陷，标签必须留空。
