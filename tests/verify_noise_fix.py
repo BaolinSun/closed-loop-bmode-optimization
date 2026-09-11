@@ -1,29 +1,37 @@
 # -*- coding: utf-8 -*-
-"""检查噪声参考基准的改动是否生效——正式跑一周之前的最后一道关。
+"""检查噪声改用固定参考之后是否生效，并量出配置该填多少。
 
-    改了什么
+    2026-09-11 改写：第一版的测法把结论搞反了
 
-fieldii_simulate_line_chunk.m 里噪声幅度的参考，从「每条线自己的射频均方根」
-改成「每个体模算一次的固定值」（fieldii_noise_reference_rms）。真实接收机的底噪
-是机器的固有性质，与发射频率无关；原来的写法让噪声跟着信号走，组织与噪声之比
-几乎不随频率变化，频率标签因此定不下来。
+第一版对**全图**求 sqrt(mean(包络_有噪声^2 - 包络_无噪声^2))。问题是绝大多数像素
+上噪声远低于信号，那里的残差没有意义，混进平均里只会得到一个跟着信号走的数。
+于是它报告「底噪仍随频率变化 14.36 dB，改动没生效」——而实际上改动是生效的。
 
-    要验证的三件事
+正确的测法是**逐深度带**，并且只取噪声真的抬高了图像的那些带：
 
-一、【噪声底与频率无关】四个频率上recover出的噪声电平必须基本相同。改之前实测是
-   -47.61 / -56.89 / -68.62 / -78.37，跟着信号掉了 30.8 dB；改之后应当持平。
+    抬高量 = 有噪声电平 - 无噪声电平
+    底噪   = 无噪声电平 + 10*log10(10^(抬高量/10) - 1)
 
-二、【电平落在预期位置】试跑配置填 -78.0，参考采集上量到的偏移是 +0.39 dB，
-   所以四个频率都应当落在 -77.6 dB 附近。
+包络存成 float32，平方域的相对精度约 -66 dB，所以抬高量低到 0.005 dB 仍然是真实
+信号。低于这个值的带就是量不出来，必须报「--」而不是硬给一个数。
 
-三、【信噪比随频率下降】组织电平减噪声底的斜率应当接近无噪声数据预测的
-   -8.6 dB/MHz，与实机实测的 -8.24 同量级。这是这次重仿真要买的东西。
+用这个办法重看 pilot2（N = -78）：
 
-噪声与信号非相干叠加，所以逐像素在线性域上与无噪声孪生帧相减，精确解出噪声，
-不依赖任何模型。
+    6.5 MHz @ 50-60 mm   -115.21
+    8.0 MHz @ 40-50 mm   -113.84
+    8.0 MHz @ 50-60 mm   -114.71     离散 1.36 dB
+
+两个频率给出同一个底噪，改动确实生效。4 和 5 MHz 量不到，是因为那里噪声比信号
+低 60 多 dB——电平设得太低，不是改动失败。
+
+    这个脚本报告什么
+
+一、【逐带的底噪】以及哪些带量得出、哪些量不出。
+二、【底噪是否与频率无关】能量出的频率之间必须一致。这是改动是否生效的判据。
+三、【偏移与正式配置】偏移 = 底噪 - N配置，是一个纯 dB 平移量。
 
 用法：
-    python tests/verify_noise_fix.py --pilot-dir <noise_pilot2 的 hdf5 目录>
+    python tests/verify_noise_fix.py --pilot-dir <hdf5 目录> --noise-db <配置里填的 N>
 """
 
 import argparse
@@ -37,38 +45,31 @@ import numpy as np
 
 from fieldii_loader import DEFAULT_FIELDII_DIR, HDF5_SUBDIR, load_shard
 
-# 试跑配置里填的值，configs/noise_pilot2.json 两端都是它。
-EXPECTED_CONFIG_DB = -78.0
-# 参考采集上实测的偏移，来自第一次试跑。
-CONFIG_TO_FLOOR_OFFSET_DB = 0.39
+# 抬高量低于此值就认为量不出来。float32 在平方域的相对精度约 -66 dB，对应
+# 约 1e-6 dB 的抬高，所以 0.005 dB 留了很大余量。
+MIN_LIFT_DB = 0.005
 
-# 四个频率之间噪声底的允许离散。不同频率的接收带宽不同，几 dB 的差异是正常的；
-# 改之前那 30.8 dB 的落差则完全不是。
+# 能量出底噪的频率之间，允许的离散。
 MAX_FLOOR_SPREAD_DB = 4.0
-# 噪声底与预期位置的允许偏差。
-MAX_FLOOR_ERROR_DB = 3.0
-# 信噪比随频率下降的斜率，至少要有这么陡才算买到了频率依赖。
-MIN_GAP_SLOPE_DB_PER_MHZ = 4.0
 
-TISSUE_DEPTH_MM = (10.0, 20.0)
+# 至少要有这么多个频率量得出底噪，频率无关性才算被检验过。
+MIN_FREQUENCIES = 2
 
+# 正式配置要命中的图像噪声底区间，来自 tests/measure_noise_reference_choice.py。
+TARGET_FLOOR_DB = (-95.0, -60.0)
 
-def recover_noise_db(clean, noisy):
-    a = 10.0 ** (clean.db_image / 20.0)
-    b = 10.0 ** (noisy.db_image / 20.0)
-    residual = b ** 2 - a ** 2
-    residual = residual[residual > 0]
-    if residual.size < 1000:
-        return None
-    return 20.0 * np.log10(float(np.sqrt(np.mean(residual))))
+BANDS_MM = [(10, 20), (20, 30), (30, 40), (40, 50), (50, 60)]
 
 
-def tissue_db(shard):
+def band_levels(shard, low_mm, high_mm):
     geometry = shard.geometry
     depth = (geometry.min_depth_mm
              + (np.arange(geometry.num_points) + 0.5) * geometry.mm_per_point)
-    band = (depth >= TISSUE_DEPTH_MM[0]) & (depth <= TISSUE_DEPTH_MM[1])
-    return float(np.median(shard.db_image[band, :]))
+    mask = (depth >= low_mm) & (depth < high_mm)
+    if mask.sum() < 10:
+        return None
+    envelope = 10.0 ** (shard.db_image[mask, :] / 20.0)
+    return 20.0 * np.log10(float(np.sqrt(np.mean(envelope ** 2))))
 
 
 def main():
@@ -76,72 +77,101 @@ def main():
     parser.add_argument("--pilot-dir", required=True)
     parser.add_argument("--noiseless-dir",
                         default=str(DEFAULT_FIELDII_DIR / HDF5_SUBDIR))
-    parser.add_argument("--config-db", type=float, default=EXPECTED_CONFIG_DB)
+    parser.add_argument("--noise-db", type=float, required=True,
+                        help="试跑配置里填的 electronic_noise_db")
     args = parser.parse_args()
 
     lines = []
     emit = lines.append
     failures = []
-
     noiseless_root = Path(args.noiseless_dir)
-    rows = []
+
+    emit(u"=========== 1. noise floor, band by band ===========")
+    emit(u"  floor = clean + 10*log10(10^(lift/10) - 1). A band whose lift is under")
+    emit(u"  %.3f dB carries no measurable noise and is reported as --, not guessed."
+         % MIN_LIFT_DB)
+    emit(u"")
+    emit(u"%-8s %10s %12s %10s %12s"
+         % (u"freq", u"band mm", u"clean", u"lift dB", u"floor dB"))
+
+    per_frequency = {}
     for path in sorted(Path(args.pilot_dir).glob("*.h5")):
         twin = noiseless_root / path.name
         if not twin.exists():
             failures.append("no noiseless twin for %s" % path.name)
             continue
         clean, noisy = load_shard(twin), load_shard(path)
-        noise = recover_noise_db(clean, noisy)
-        if noise is None:
-            failures.append("noise not recoverable at %g MHz" % noisy.frequency_mhz)
-            continue
-        rows.append({"freq": round(noisy.frequency_mhz, 2), "floor": noise,
-                     "tissue": tissue_db(clean)})
-    rows.sort(key=lambda r: r["freq"])
-    if not rows:
-        raise SystemExit("nothing to check")
-
-    expected = args.config_db + CONFIG_TO_FLOOR_OFFSET_DB
-
-    emit(u"=========== 1. is the noise floor now independent of frequency ===========")
-    emit(u"  Before the change the floor tracked the signal and fell 30.8 dB across the")
-    emit(u"  ladder. It should now sit still.")
-    emit(u"")
-    emit(u"%-8s %14s %14s %14s"
-         % (u"freq", u"noise floor", u"expected", u"error"))
-    for row in rows:
-        emit(u"%-8g %14.2f %14.2f %14.2f"
-             % (row["freq"], row["floor"], expected, row["floor"] - expected))
-    spread = max(r["floor"] for r in rows) - min(r["floor"] for r in rows)
-    worst = max(abs(r["floor"] - expected) for r in rows)
-    emit(u"")
-    emit(u"  spread across frequency %6.2f dB  (limit %.1f)" % (spread, MAX_FLOOR_SPREAD_DB))
-    emit(u"  worst error vs expected %6.2f dB  (limit %.1f)" % (worst, MAX_FLOOR_ERROR_DB))
-    if spread > MAX_FLOOR_SPREAD_DB:
-        failures.append("floor still varies %.2f dB with frequency; the fixed "
-                        "reference did not take effect" % spread)
-    if worst > MAX_FLOOR_ERROR_DB:
-        failures.append("floor is %.2f dB from where the config says it should be"
-                        % worst)
+        frequency = round(noisy.frequency_mhz, 2)
+        for low, high in BANDS_MM:
+            clean_db = band_levels(clean, low, high)
+            noisy_db = band_levels(noisy, low, high)
+            if clean_db is None or noisy_db is None:
+                continue
+            lift = noisy_db - clean_db
+            if lift < MIN_LIFT_DB:
+                emit(u"%-8g %10s %12.2f %10.4f %12s"
+                     % (frequency, u"%d-%d" % (low, high), clean_db, lift, u"--"))
+                continue
+            floor = clean_db + 10.0 * np.log10(10.0 ** (lift / 10.0) - 1.0)
+            per_frequency.setdefault(frequency, []).append(floor)
+            emit(u"%-8g %10s %12.2f %10.4f %12.2f"
+                 % (frequency, u"%d-%d" % (low, high), clean_db, lift, floor))
 
     emit(u"")
-    emit(u"=========== 2. does the tissue to noise gap now fall with frequency ===========")
-    emit(u"  This is what the whole re-simulation is for. The noiseless data predicts")
-    emit(u"  about -8.6 dB per MHz; the console measures -8.24.")
+    emit(u"=========== 2. is the floor independent of frequency ===========")
+    emit(u"  Before the change the floor tracked the signal: -47.6 at 4 MHz down to")
+    emit(u"  -78.4 at 8 MHz, a 30.8 dB slide. With a fixed per-phantom reference the")
+    emit(u"  frequencies that can be measured must agree.")
     emit(u"")
-    emit(u"%-8s %14s %14s %10s" % (u"freq", u"tissue 10-20mm", u"noise floor", u"gap"))
-    for row in rows:
-        emit(u"%-8g %14.2f %14.2f %10.2f"
-             % (row["freq"], row["tissue"], row["floor"], row["tissue"] - row["floor"]))
-    frequencies = [r["freq"] for r in rows]
-    gaps = [r["tissue"] - r["floor"] for r in rows]
-    slope = float(np.polyfit(frequencies, gaps, 1)[0]) if len(rows) > 1 else 0.0
+    if not per_frequency:
+        failures.append("no band anywhere carried measurable noise; raise "
+                        "electronic_noise_db and run the pilot again")
+        emit(u"  nothing measurable")
+    else:
+        emit(u"%-8s %8s %12s %12s" % (u"freq", u"bands", u"median floor", u"spread"))
+        medians = {}
+        for frequency in sorted(per_frequency):
+            values = np.array(per_frequency[frequency])
+            medians[frequency] = float(np.median(values))
+            emit(u"%-8g %8d %12.2f %12.2f"
+                 % (frequency, values.size, medians[frequency],
+                    values.max() - values.min()))
+        emit(u"")
+        if len(medians) < MIN_FREQUENCIES:
+            failures.append(
+                "only %d frequency carried measurable noise, so frequency "
+                "independence was not tested. Raise electronic_noise_db so the "
+                "floor comes up near the deep tissue level at 4 MHz." % len(medians))
+        else:
+            spread = max(medians.values()) - min(medians.values())
+            emit(u"  spread across %d frequencies: %.2f dB  (limit %.1f)"
+                 % (len(medians), spread, MAX_FLOOR_SPREAD_DB))
+            if spread > MAX_FLOOR_SPREAD_DB:
+                failures.append("floor still varies %.2f dB with frequency; the "
+                                "fixed reference did not take effect" % spread)
+
     emit(u"")
-    emit(u"  gap slope %6.2f dB per MHz  (needs to be steeper than -%.1f)"
-         % (slope, MIN_GAP_SLOPE_DB_PER_MHZ))
-    if slope > -MIN_GAP_SLOPE_DB_PER_MHZ:
-        failures.append("gap slope is only %.2f dB per MHz; the frequency dependence "
-                        "the re-simulation is meant to buy is not there" % slope)
+    emit(u"=========== 3. offset, and what to put in the config ===========")
+    if per_frequency:
+        everything = np.array([v for values in per_frequency.values() for v in values])
+        floor = float(np.median(everything))
+        offset = floor - args.noise_db
+        emit(u"  electronic_noise_db used   %8.2f dB" % args.noise_db)
+        emit(u"  measured floor (median)    %8.2f dB" % floor)
+        emit(u"  offset                     %8.2f dB" % offset)
+        emit(u"")
+        emit(u"  target floor range         %g to %g dB" % TARGET_FLOOR_DB)
+        emit(u"")
+        if failures:
+            emit(u"  Checks failed, so this number is not safe to use yet.")
+        else:
+            emit(u"  PUT THIS IN configs/full.json:")
+            emit(u"")
+            emit(u'      "noise": {')
+            emit(u'        "enabled": true,')
+            emit(u'        "electronic_noise_db": [%.1f, %.1f]'
+                 % (TARGET_FLOOR_DB[0] - offset, TARGET_FLOOR_DB[1] - offset))
+            emit(u'      }')
 
     emit(u"")
     emit(u"=========== result ===========")
