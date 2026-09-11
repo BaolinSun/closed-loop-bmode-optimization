@@ -152,12 +152,33 @@ def main():
 
     emit(u"")
     emit(u"=========== 3. offset, and what to put in the config ===========")
+    emit(u"  Calibrated on the DEEPEST usable band, not the median over all bands.")
+    emit(u"")
+    emit(u"  The floor is not flat with depth: pilot3 measured -0.19 dB per mm, about")
+    emit(u"  5.7 dB over the image, because the receive aperture grows with depth and")
+    emit(u"  suppresses incoherent noise harder. The console is flat by comparison")
+    emit(u"  (-0.02 dB per mm over 20 mm, measured on E8), presumably because it applies")
+    emit(u"  a depth-dependent gain before BC0 that lifts signal and noise together.")
+    emit(u"")
+    emit(u"  Penetration is decided deep in the image, and the target range came from a")
+    emit(u"  sweep with a FLAT injected floor, so the deep floor is what has to land in")
+    emit(u"  that range. Using the median instead would leave the deep floor about")
+    emit(u"  1.7 dB too quiet.")
+    emit(u"")
     if per_frequency:
-        everything = np.array([v for values in per_frequency.values() for v in values])
-        floor = float(np.median(everything))
+        deepest = {}
+        for frequency, values in per_frequency.items():
+            deepest[frequency] = values[-1]     # bands are appended shallow to deep
+        emit(u"%-10s %14s" % (u"freq", u"deep floor"))
+        for frequency in sorted(deepest):
+            emit(u"%-10g %14.2f" % (frequency, deepest[frequency]))
+        deep_spread = max(deepest.values()) - min(deepest.values())
+        emit(u"  spread across frequencies at the deepest band: %.2f dB" % deep_spread)
+        emit(u"")
+        floor = float(np.median(list(deepest.values())))
         offset = floor - args.noise_db
         emit(u"  electronic_noise_db used   %8.2f dB" % args.noise_db)
-        emit(u"  measured floor (median)    %8.2f dB" % floor)
+        emit(u"  deep floor it produced     %8.2f dB" % floor)
         emit(u"  offset                     %8.2f dB" % offset)
         emit(u"")
         emit(u"  target floor range         %g to %g dB" % TARGET_FLOOR_DB)
