@@ -146,3 +146,70 @@ def penetration_depth_mm(db_image, geometry, noise_floor_db, margin_db=3.0):
     if good.size == 0:
         return float(geometry.min_depth_mm)
     return float(geometry.min_depth_mm + (good[-1] + 0.5) * geometry.mm_per_point)
+
+
+# ---------------------------------------------------------------------------
+# 侧向散斑宽度：聚焦的判据。估计器与 tests/measure_e9.py 完全相同，E9 在实机上验证过
+# ——最优聚焦落在深度带中心 ±2.5 mm 内的有 28/32，档间差异是帧间离散的 39 到 1231 倍。
+# 挪到这里是因为 tools_generate_console_labels.py 要用它，正式工具不应从 tests/ 导入。
+
+SPECKLE_BAND_MM = 5.0
+SPECKLE_CORRELATION_LEVEL = 0.5
+SPECKLE_CLIP_FACTOR = 4.0
+# 组织要高出噪声底这么多才算可用。比穿透判据的 3 dB 严得多：自相关宽度比电平更早
+# 被噪声污染，噪声横向不相关，掺进来会把宽度压窄，看着像「分辨率极好」。
+SPECKLE_MARGIN_DB = 12.0
+# 宽度窄到线间距的这个倍数以下判为噪声。这个阈值按实机 0.1488 mm/线定；Field II
+# 线距 0.225 mm，聚焦良好的波束本身就会窄于它，届时必须放宽，见 2026-09-13 分析。
+SPECKLE_NOISE_WIDTH_LINES = 1.5
+
+
+def lateral_speckle_width_mm(envelope, mm_per_line):
+    """一个深度带的散斑侧向自相关宽度，单位 mm。越小越锐。"""
+    block = np.asarray(envelope, dtype=np.float64)
+    if block.shape[0] < 4 or block.shape[1] < 16:
+        return float("nan")
+    median = np.median(block, axis=1, keepdims=True)
+    block = np.minimum(block, SPECKLE_CLIP_FACTOR * np.maximum(median, 1e-12))
+    block = block - block.mean(axis=1, keepdims=True)
+    lines = block.shape[1]
+    spectrum = np.fft.rfft(block, n=2 * lines, axis=1)
+    correlation = np.fft.irfft(spectrum * np.conj(spectrum), axis=1)[:, :lines]
+    good = correlation[:, 0] > 0
+    if good.sum() < 4:
+        return float("nan")
+    correlation = (correlation[good] / correlation[good, :1]).mean(axis=0)
+    below = np.where(correlation < SPECKLE_CORRELATION_LEVEL)[0]
+    if below.size == 0:
+        return float("nan")
+    index = below[0]
+    if index == 0:
+        return 0.0
+    high, low = correlation[index - 1], correlation[index]
+    return float(((index - 1) + (high - SPECKLE_CORRELATION_LEVEL) / (high - low))
+                 * mm_per_line)
+
+
+def band_speckle_widths(db_image, geometry, noise_floor_db):
+    """一帧逐深度带的侧向宽度 {带中心 mm: 宽度 mm}。噪声带与被下边缘截断的带不报。"""
+    db_image = np.asarray(db_image, dtype=np.float64)
+    depth = (geometry.min_depth_mm
+             + (np.arange(geometry.num_points) + 0.5) * geometry.mm_per_point)
+    envelope = 10.0 ** (db_image / 20.0)
+    out = {}
+    for low in np.arange(geometry.min_depth_mm, geometry.depth_mm, SPECKLE_BAND_MM):
+        high = low + SPECKLE_BAND_MM
+        if high > geometry.depth_mm:
+            break
+        mask = (depth >= low) & (depth < high)
+        if mask.sum() < 8:
+            continue
+        if np.median(db_image[mask, :]) < noise_floor_db + SPECKLE_MARGIN_DB:
+            continue
+        width = lateral_speckle_width_mm(envelope[mask, :], geometry.mm_per_line)
+        if not np.isfinite(width):
+            continue
+        if width < SPECKLE_NOISE_WIDTH_LINES * geometry.mm_per_line:
+            continue
+        out[round(float(low + SPECKLE_BAND_MM / 2.0), 2)] = width
+    return out

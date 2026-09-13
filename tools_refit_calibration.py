@@ -27,7 +27,10 @@ from hisense_loader import DEFAULT_DATA_DIR, find_captures, load_capture
 SESSIONS = ["20260814", "20260819", "20260831", "20260901", "20260901_E2",
             "20260901_E3", "20260903", "20260903_GEN",
             "20260903_replication_check", "20260904", "20260904_DR", "20260909_GEN", "20260910",
-            "20260828/GEN", "20260828/THI"]
+            "20260828/GEN", "20260828/THI",
+            # E8（噪声底随频率）与 E9（聚焦覆盖）。前端标签要用它们，所以必须有自己的
+            # 标定：counts_per_db 在已有谐波场次之间差 44%，不能借用。
+            "20260911_E8_GEN", "20260911_E8_THI", "20260911_E9_GEN", "20260911_E9_THI"]
 MODE_NAME = {0: "fundamental", 1: "harmonic"}
 
 
