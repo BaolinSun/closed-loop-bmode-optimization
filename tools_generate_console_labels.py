@@ -23,23 +23,33 @@
 
 每根轴的判据都是测出来的，不是假设的：
 
-  发射频率  在穿透仍能覆盖当前显示深度的频率里，挑最高的那个（分辨率最好）。
-            E8 实测穿透随频率大幅缩短（基波 5.0 -> 11.4 MHz：69.5 -> 41.4 mm），
-            所以这条约束真的会咬合。浅层信噪比间隔不能用——基波的间隔在整条阶梯上
-            只变 -0.4 dB/MHz，主机在接收链里按频率做了补偿，但那不改变衰减斜率。
+  发射频率  图像最底部 2 mm 仍高出底噪 FREQUENCY_MARGIN_DB 的频率里，按实机点靶
+            分辨率表挑最锐的一档；标签同时给出可接受集合。详见 optimum_frequency。
+            （2026-09-14 前是「穿透 3 dB 覆盖得住的最高频」，三处问题见那里。）
 
   发射聚焦  比较集内各聚焦档的侧向散斑宽度，逐深度带归一化后取平均，最小者胜。
             E9 实测最优聚焦精确跟随深度带（28/32 落在 ±2.5 mm 内），所以对整幅可用
             图像求平均，胜出的是聚焦在可用深度中段的那一档。
 
-  显示深度  取景：图像要装得下有信号的区域，又不要在穿透以下浪费大片噪声。
-            这是【体模上】的判据。体模没有「感兴趣的解剖结构」，操作者在均匀组织上
-            的做法就是把深度拉到图像变成噪声的地方为止。到人体数据上应当换成按解剖
+  显示深度  主机深度阶梯上最深的一档，要求图像底部仍高出底噪 FREQUENCY_MARGIN_DB——
+            与频率用同一个门槛，否则两根轴互相推（见 optimum_depth）。
+            这是【体模上】的判据。体模没有「感兴趣的解剖结构」，取景就是把深度拉到
+            信号仍可用的最深处为止。到人体数据上应当换成按解剖
             取景，标签字段不变——这与后端两个数据源「标签种类相同、生成算法可以不同」
             的约定一致。
 
 逐轴可选：一帧所在的族若没有扫过某根轴，那根轴的标签留空（*_determined=False），
 而不是填一个默认值。
+
+    三根轴的求解顺序：聚焦 -> 频率 -> 深度
+
+三根轴都通过穿透互相影响：聚焦浅了深部变暗、穿透变短（20260901_E2 谐波 5.7 MHz、显示
+41.9 mm：聚焦 10 mm 穿透 28.6 mm，聚焦 20 mm 覆盖整幅），频率决定穿透，深度又按穿透
+取景。各自在「另外两根保持当前值」下求最优，会把聚焦太浅的帧标成「频率降低」。
+
+所以按顺序求：先定聚焦；频率在【最优聚焦】的比较集里求；深度在【最优频率、最优聚焦】
+的比较集里求。族里没有采到那个组合时，退回当前设置的比较集，并在 *_conditioned_on
+里写明，下游据此判断这个标签是否已经考虑了前一根轴的调整。
 
     底噪按计数借用，不按 dB 借用
 
@@ -66,6 +76,7 @@ import numpy as np
 import front_end as FE
 import hisense_backend_sim as S
 import labels as LB
+import point_targets as PT
 import scene_family as SF
 import tissue as T
 import tools_generate_labels as TG
@@ -74,9 +85,34 @@ from hisense_loader import DEFAULT_DATA_DIR, find_captures, load_capture
 OUT_PATH = "data/labels_console.jsonl"
 CAL_PATH = "bmode_opt/console_calibration.json"
 
-# 穿透仍覆盖到显示深度往上这么多毫米以内，就算「装得下整幅图」。图像最底几行有边缘
-# 效应，要求逐行覆盖到最后一行会把本该算覆盖的帧判成不覆盖。
-COVER_TOLERANCE_MM = 1.0
+# ---- 频率与深度共用的判据（2026-09-14 改）----
+#
+# 图像最底部 2 mm 的行中位数要高出底噪这么多，才算这个频率「覆盖得住」这幅图，
+# 也才算这个显示深度「可用」。旧判据是穿透 3 dB：高出底噪 3 dB 意味着组织回波功率
+# 约等于噪声功率，信噪比约 0 dB，图像上勉强能和噪声分开，而且 41.9 mm 显示时基波 10/11.4 MHz
+# 与谐波 5.3/5.7 MHz 的底部正好只高出 2.6-4.1 dB，三个基波族因 0.3-0.8 dB 的读数差
+# 给出 8.0/10/11.4 三个答案（tests/measure_frequency_label_margin.py）。6 dB 时组织功率
+# 约为噪声的 3 倍（信噪比约 4.8 dB），三个族一致落在 8.0 MHz 附近。
+FREQUENCY_MARGIN_DB = 6.0
+# 门槛上下各这么多 dB 以内算「贴门槛」：同一频率、同一显示深度在不同场景族间，最弱
+# 底部读数相差约 1 dB（8.0 MHz：6.0/6.4/7.2 dB；谐波 5.7 MHz：2.6-3.3 dB）。门槛取
+# MARGIN-BORDER、MARGIN、MARGIN+BORDER 三个值各选一次，选出的频率都进可接受集合。
+FREQUENCY_BORDER_DB = 1.0
+# 只看最底部，不看整幅图最弱处。第一版取「5 mm 以下最弱的 2 mm」，结果谐波 25.1 mm
+# 显示时 5.7 MHz 只高出底噪 1.3 dB——最弱处全落在 6 mm：谐波信号要传播一段距离才建立
+# 起来，近场本来就暗，而且 4.4/5.3/5.7 MHz 暗、4.7/5.0 MHz 亮，与穿透无关。
+BOTTOM_WINDOW_MM = 2.0
+# 分辨率分数相差不到这个比例算并列，一并进可接受集合。同一设置的重复帧之间分数最多
+# 相差 2.5%（谐波 20260903 41.9 mm 5.0 MHz，15 帧；基波 1.4%、0.8%）。
+RESOLUTION_TIE = 0.03
+# 扫过的频率在宽松门槛（MARGIN-BORDER）下也都覆盖不了：这时真正该调的是深度，频率
+# 标签只是兜底，训练时降权。数值是建议值，下游可以改。
+#
+# 必须用宽松门槛判「无解」。第一版用 MARGIN 本身，谐波 41.9 mm 显示时最低几档底部正好
+# 5.7-7.5 dB，四个族判「无解」、三个族判「有解」，只是把 3 dB 门槛上的抖动搬到了 6 dB。
+INFEASIBLE_WEIGHT = 0.25
+# {(模式代码, 显示深度): {频率: 分辨率分数}}，main() 里由 point_targets 填入。
+RESOLUTION = {}
 
 DEPTH_DIRECTIONS = ("shallow", "correct", "deep")
 FREQUENCY_DIRECTIONS = ("low", "correct", "high")
@@ -157,17 +193,38 @@ def floors_in_counts(cal_by_group):
 
 
 def measure_frame(capture, calibration, floor_db):
-    """前端判据需要的逐帧量：穿透深度，以及逐深度带的侧向散斑宽度。
+    """前端判据需要的逐帧量：逐行高出底噪多少（频率与深度用），以及逐深度带的侧向散斑宽度。
 
     都在未加深度响应的 BC0 dB 上算：底噪就是在那上面量的，两者必须同一刻度；侧向
     宽度则与逐行增益无关。
     """
     db = S.bc0_to_db(capture.bc0, calibration.counts_per_db)
     return {
-        "penetration_mm": FE.penetration_depth_mm(db, capture.geometry, floor_db),
+        "row_excess_db": row_excess_db(db, floor_db),
+        "mm_per_point": float(capture.geometry.mm_per_point),
+        "min_depth_mm": float(capture.geometry.min_depth_mm),
         "widths": FE.band_speckle_widths(db, capture.geometry, floor_db),
         "display_depth_mm": float(capture.geometry.depth_mm),
     }
+
+
+def row_excess_db(db, floor_db):
+    """逐行：行中位数高出底噪多少 dB。excess_at 在任意深度处取最底 BOTTOM_WINDOW_MM 的平均。
+
+    频率判据在显示深度处读它，深度判据在各个阶梯深度处读它。两根轴读的是同一个量，
+    这是二者一致的前提。
+    """
+    return np.median(np.asarray(db, dtype=np.float64), axis=1) - floor_db
+
+
+def excess_at(measure, depth_mm):
+    """一帧在 depth_mm 处的底部余量：以该深度为图像底部时，最底 BOTTOM_WINDOW_MM 的平均。"""
+    rows = measure["row_excess_db"]
+    spacing = measure["mm_per_point"]
+    end = int(np.floor((depth_mm - measure["min_depth_mm"]) / spacing + 1e-6))
+    end = min(max(end, 1), rows.size)
+    window = max(1, int(round(BOTTOM_WINDOW_MM / spacing)))
+    return float(rows[max(0, end - window):end].mean())
 
 
 def comparison_sets(family, axis):
@@ -181,60 +238,186 @@ def comparison_sets(family, axis):
             if len({s[index] for _, s in v}) >= 2}
 
 
+def resolution_for(mode, depth):
+    """该模式、该显示深度下的分辨率分数：[(权重, {频率: 分数}, 来源显示深度)]。
+
+    分辨率表只在 25.1 / 41.9 / 67.0 mm 三档显示深度实测过。其余深度在相邻两档之间按
+    显示深度线性插值；两端以外用最近一档。插值是假设——基波的轴向台阶在 25.1 与 41.9
+    之间何处出现并没有测过——所以调用方把两张相邻表各自选出的档也放进可接受集合。
+    """
+    measured = sorted(d for m, d in RESOLUTION if m == mode)
+    if not measured:
+        return []
+    for d in measured:
+        if abs(depth - d) < 0.05:
+            return [(1.0, RESOLUTION[(mode, d)], d)]
+    if depth < measured[0]:
+        return [(1.0, RESOLUTION[(mode, measured[0])], measured[0])]
+    if depth > measured[-1]:
+        return [(1.0, RESOLUTION[(mode, measured[-1])], measured[-1])]
+    for lo, hi in zip(measured, measured[1:]):
+        if lo < depth < hi:
+            w = (depth - lo) / (hi - lo)
+            return [(1.0 - w, RESOLUTION[(mode, lo)], lo), (w, RESOLUTION[(mode, hi)], hi)]
+    return []
+
+
+def sharpest(candidates, tables):
+    """候选频率里分数（按权重合成）最低的一档，以及各候选的分数。分辨率表里没有的频率不参与。"""
+    scored = {}
+    for f in candidates:
+        if tables and all(f in table for _, table, _ in tables):
+            scored[f] = sum(w * table[f] for w, table, _ in tables)
+    if not scored:
+        return None, {}
+    return min(scored, key=scored.get), scored
+
+
 def optimum_frequency(members, measured):
-    """穿透仍覆盖显示深度的最高频率。一个都覆盖不了就取穿透最深的最低频率。"""
+    """图像底部仍高出底噪 FREQUENCY_MARGIN_DB 的频率里，分辨率分数最低的一档。
+
+    2026-09-14 前的规则是「穿透 3 dB 覆盖得住的最高频」，有三处问题：
+      一、默认频率越高越锐。点靶显示基波显示深度 >=41.9 mm 时 10/11.4 MHz 反而比
+          8.0 MHz 粗 26-44%。改为查实机分辨率表（point_targets.resolution_table）。
+      二、3 dB 门槛太松且贴着读数抖动（见 FREQUENCY_MARGIN_DB 的注释）。改为 6 dB，
+          并把门槛上下 1 dB 内会改变答案的档都列进可接受集合。
+      三、谁都覆盖不了时悄悄取最低频。那时该调的是深度，改为标 infeasible 并降权。
+          只有宽松门槛下也覆盖不了才算；正常门槛不行、宽松门槛行的，按宽松门槛选并
+          标 borderline，同时把最低频放进可接受集合。
+
+    返回 (最优, 主机频率阶梯, 在边界上, 依据, 附加字段)。附加字段：
+      frequency_acceptable_mhz  可接受集合：三个门槛各自选出的档，加上与最优分数并列
+                                （RESOLUTION_TIE 以内）且在宽松门槛下覆盖得住的档，加上
+                                插值时相邻两张分辨率表各自选出的档。训练时当前频率落在
+                                集合内即视为正确。
+      frequency_label_kind      measured / infeasible
+      frequency_confidence      firm（集合只有最优一档）/ borderline
+      frequency_loss_weight     measured 为 1，infeasible 为 INFEASIBLE_WEIGHT
+      frequency_swept_mhz       比较集实际扫过的频率
+    """
     mode = members[0][1][0]
+    depth = members[0][1][AXIS_INDEX["depth_mm"]]
     by_value = collections.defaultdict(list)
     for name, setting in members:
-        by_value[setting[AXIS_INDEX["frequency_mhz"]]].append(measured[name])
-    values = sorted(by_value)
-    depth = members[0][1][AXIS_INDEX["depth_mm"]]
-    covers = [v for v in values
-              if np.mean([m["penetration_mm"] for m in by_value[v]])
-              >= depth - COVER_TOLERANCE_MM]
-    if covers:
-        best = max(covers)
-        # 选中的是扫过的最高档，而主机上还有更高的档没扫：那一档也许同样覆盖得住。
-        at_edge = best == values[-1] and beyond(mode, "frequency_mhz", best, +1)
-        return best, values, at_edge, "covers the %.1f mm image" % depth
-    at_edge = beyond(mode, "frequency_mhz", values[0], -1)
-    return values[0], values, at_edge, "no swept frequency covers the %.1f mm image" % depth
+        by_value[setting[AXIS_INDEX["frequency_mhz"]]].append(
+            excess_at(measured[name], measured[name]["display_depth_mm"]))
+    swept = sorted(by_value)
+    excess = {f: float(np.mean(v)) for f, v in by_value.items()}
+    ladder = CONSOLE_LADDERS.get((mode, "frequency_mhz")) or swept
+    tables = resolution_for(mode, depth)
+
+    def feasible(threshold):
+        return [f for f in swept if excess[f] >= threshold]
+
+    lenient = feasible(FREQUENCY_MARGIN_DB - FREQUENCY_BORDER_DB)
+    nominal = feasible(FREQUENCY_MARGIN_DB)
+    strict = feasible(FREQUENCY_MARGIN_DB + FREQUENCY_BORDER_DB)
+    excess_text = u" ".join(u"%g:%.1f" % (f, excess[f]) for f in swept)
+    table_text = u"/".join(u"%g" % d for _, _, d in tables) or u"none"
+
+    if not lenient:
+        best = swept[0]
+        acceptable = {best}
+        extra = {"frequency_label_kind": "infeasible",
+                 "frequency_loss_weight": INFEASIBLE_WEIGHT}
+        at_edge = best != ladder[0]
+        basis = (u"no swept frequency keeps %.0f dB over the floor at the bottom of the %.1f mm "
+                 u"image (bottom excess dB %s)"
+                 % (FREQUENCY_MARGIN_DB - FREQUENCY_BORDER_DB, depth, excess_text))
+    else:
+        # 正常门槛下没有覆盖得住、宽松门槛下有的，按宽松门槛选；这时按正常门槛本该
+        # 是「无解取最低频」，所以最低频也放进可接受集合。
+        chosen = nominal or lenient
+        best, scored = sharpest(chosen, tables)
+        if best is None:
+            return None, ladder, False, u"no resolution table for this mode", {}
+        acceptable = {best}
+        for group in (strict, lenient):
+            pick, _ = sharpest(group, tables)
+            if pick is not None:
+                acceptable.add(pick)
+        _, lenient_scores = sharpest(lenient, tables)
+        acceptable.update(f for f, s in lenient_scores.items()
+                          if s <= scored[best] * (1.0 + RESOLUTION_TIE))
+        if len(tables) == 2:
+            for _, table, d in tables:
+                pick, _ = sharpest(chosen, [(1.0, table, d)])
+                if pick is not None:
+                    acceptable.add(pick)
+        if not nominal:
+            acceptable.add(swept[0])
+        extra = {"frequency_label_kind": "measured", "frequency_loss_weight": 1.0}
+        # 选中的是扫过的最高档而主机上还有更高的档没扫：那一档也许同样覆盖得住且更锐。
+        at_edge = best == swept[-1] and best != ladder[-1]
+        basis = (u"sharpest of %s by resolution table %s mm%s (bottom excess dB %s)"
+                 % (u"/".join(u"%g" % f for f in chosen), table_text,
+                    u"" if nominal else u", only under the lenient %.0f dB margin"
+                    % (FREQUENCY_MARGIN_DB - FREQUENCY_BORDER_DB), excess_text))
+    extra.update({
+        "frequency_acceptable_mhz": sorted(float(f) for f in acceptable),
+        "frequency_confidence": "firm" if acceptable == {best} else "borderline",
+        "frequency_swept_mhz": [float(f) for f in swept],
+    })
+    return best, ladder, at_edge, basis, extra
 
 
 def optimum_depth(members, measured):
-    """取景：显示深度要装得下穿透深度并留出余量，又不要在噪声里浪费。
+    """主机深度阶梯上最深的一档，要求以它为图像底部时底部余量仍 >= FREQUENCY_MARGIN_DB。
 
-    【在主机的完整深度阶梯上求，不只在扫过的深度里求。】这是深度与另外两根轴的
-    关键区别：深度的判据只需要穿透深度，而穿透是一次物理测量，与扫了哪些深度无关。
-    频率与聚焦做不到——没扫到的档位根本没有测量值。
+    比较集里频率、聚焦固定，只有显示深度变。每个阶梯深度 v 用显示深度 >= v 的帧读
+    「以 v 为底」的底部余量（excess_at），从浅往深，第一次跌破门槛的前一档就是最优。
 
-    第一版只在扫过的深度里选，出了两类假答案。E9 只扫了 25.1/41.9/58.6 mm，谐波
-    5 MHz 穿透约 46 mm、想要约 51 mm，只能在 41.9（截断）与 58.6（浪费）之间挑，
-    选了 58.6——而主机上明明有 50.2。E8 只扫了 67/75.4 mm，于是任何频率都选 67。
-    at_edge 抓得住「超出两端」，抓不住「跳过了中间一档」。
+    【为什么与频率用同一个门槛】2026-09-14 之前深度按「穿透（高出底噪 3 dB）+ 5 mm
+    余量」取景，即图像底部故意放在噪声里。而频率要求底部高出底噪 6 dB。于是按深度
+    标签取景后的任何一幅图，频率标签都说「降频」；降频穿透变深，深度标签又说「加深」，
+    一路推到最低频、最深、频率无解。tests/verify_frontend_chain.py 在旧标签上看到
+    58 次「走一步后还要再走」，典型的是谐波 (25.1 mm, 5.7 MHz) -> (50.2 mm, 5.7 MHz)
+    -> (50.2 mm, 4.4 MHz)。同一门槛下，按深度标签取景后当前频率一定覆盖得住；频率若再
+    换到更锐的档，那一档也覆盖得住当前深度，深度只会不变或加深，所以沿标签走必然停下。
+    不同起点可能停在不同的点（高频浅取景、低频深取景），那是体模上无从裁决的取舍。
 
-    穿透要从【显示深度大于穿透】的帧上才量得到——浅的帧整幅都覆盖，读出来只是显示
-    深度本身。取未被整幅覆盖的帧里读数最深的那个。若每一帧都被整幅覆盖，只知道穿透
-    至少有扫过的最深那么深，这时按下界求，并标记在边界上。
+    【在主机的完整深度阶梯上求】只要某帧显示深度够深，就能读出任一更浅阶梯处的余量，
+    与扫了哪些深度无关。比最深的帧还深的阶梯读不到：若读到的每一档都覆盖得住，只知道
+    最优至少这么深，标记在边界上。
+
+    返回的依据里写了「usable to X mm」：最深那帧上余量仍 >= 门槛的最深处，只作报告。
     """
     mode = members[0][1][0]
     swept = sorted({s[AXIS_INDEX["depth_mm"]] for _, s in members})
     ladder = CONSOLE_LADDERS.get((mode, "depth_mm")) or swept
-    readings = [measured[name]["penetration_mm"] for name, setting in members
-                if measured[name]["penetration_mm"]
-                < setting[AXIS_INDEX["depth_mm"]] - COVER_TOLERANCE_MM]
-    if readings:
-        penetration, bound = float(max(readings)), False
-    else:
-        penetration, bound = float(swept[-1]), True
+    frames = [measured[name] for name, _ in members]
+    evaluated = []
+    for value in ladder:
+        covering = [m for m in frames if m["display_depth_mm"] >= value - 0.05]
+        if not covering:
+            break
+        evaluated.append((value, float(np.mean([excess_at(m, value) for m in covering]))))
+    usable = []
+    for value, excess in evaluated:
+        if excess < FREQUENCY_MARGIN_DB:
+            break
+        usable.append(value)
 
-    costs = [FE.framing_cost(v, penetration) for v in ladder]
-    best = ladder[int(np.argmin(costs))]
-    wanted = penetration + FE.FRAMING_MARGIN_MM
-    # 不确定有两种来源：穿透只知道下界，真实值可能更深；或者想要的深度超出主机阶梯两端。
-    at_edge = bound or wanted > ladder[-1] or wanted < ladder[0]
-    basis = ("penetration at least %.1f mm (every swept frame fully covered)" % penetration
-             if bound else "penetration %.1f mm" % penetration)
+    deepest = max(frames, key=lambda m: m["display_depth_mm"])
+    rows = deepest["row_excess_db"]
+    window = max(1, int(round(BOTTOM_WINDOW_MM / deepest["mm_per_point"])))
+    smooth = np.convolve(rows, np.ones(window) / window, mode="valid")
+    good = np.where(smooth >= FREQUENCY_MARGIN_DB)[0]
+    usable_mm = (deepest["min_depth_mm"] + (good[-1] + window) * deepest["mm_per_point"]
+                 if good.size else float("nan"))
+    ladder_text = u" ".join(u"%g:%.1f" % (v, e) for v, e in evaluated)
+
+    if not usable:
+        best, at_edge = ladder[0], True
+        basis = u"even %g mm leaves under %.0f dB at the bottom (excess dB %s)" % (
+            ladder[0], FREQUENCY_MARGIN_DB, ladder_text)
+    elif len(usable) == len(evaluated) and evaluated[-1][0] < ladder[-1]:
+        best, at_edge = usable[-1], True
+        basis = (u"usable at least to %.1f mm (every readable ladder depth keeps %.0f dB; "
+                 u"excess dB %s)" % (evaluated[-1][0], FREQUENCY_MARGIN_DB, ladder_text))
+    else:
+        best, at_edge = usable[-1], False
+        basis = u"usable to %.1f mm (excess dB %s)" % (usable_mm, ladder_text)
     return best, ladder, at_edge, basis
 
 
@@ -296,9 +479,16 @@ SOLVERS = {"depth_mm": (optimum_depth, DEPTH_DIRECTIONS),
            "focus_mm": (optimum_focus, FOCUS_DIRECTIONS)}
 
 
+def solve_axis(axis, members, measured):
+    """统一返回 (最优, 阶梯, 在边界上, 依据, 附加字段)。"""
+    result = SOLVERS[axis][0](members, measured)
+    return tuple(result) if len(result) == 5 else tuple(result) + ({},)
+
+
 def frontend_labels(family, measured):
-    """一个族里每帧的前端标签字段。"""
+    """一个族里每帧的前端标签字段。按 聚焦 -> 频率 -> 深度 的顺序求，见模块文档字符串。"""
     fields = collections.defaultdict(dict)
+    setting_of = dict(zip(family.frame_names, family.settings))
     for name in family.frame_names:
         for axis in AXIS_INDEX:
             stem = axis.split("_")[0]
@@ -306,32 +496,99 @@ def frontend_labels(family, measured):
                                  "delta_%s" % axis: None, "delta_%s_steps" % stem: None,
                                  "%s_determined" % stem: False, "%s_at_edge" % stem: False,
                                  "%s_basis" % stem: None})
+        fields[name].update({"frequency_acceptable_mhz": None, "frequency_label_kind": None,
+                             "frequency_confidence": None, "frequency_loss_weight": None,
+                             "frequency_swept_mhz": None, "frequency_conditioned_on": None,
+                             "depth_conditioned_on": None})
         fields[name]["family_id"] = family.family_id
         fields[name]["family_unbracketed"] = name in family.unbracketed
         fields[name]["family_anchor_starved"] = family.anchor_starved
 
-    for axis, (solve, names) in SOLVERS.items():
+    def write(name, axis, result):
+        best, ladder, at_edge, basis, extra = result
         stem = axis.split("_")[0]
-        index = AXIS_INDEX[axis]
-        for members in comparison_sets(family, axis).values():
-            if any(name not in measured for name, _ in members):
-                continue
-            best, ladder, at_edge, basis = solve(members, measured)
-            if best is None:
-                continue
-            for name, setting in members:
-                current = setting[index]
-                steps = ladder.index(best) - ladder.index(current)
-                fields[name].update({
-                    "optimal_%s" % axis: float(best),
-                    "%s_direction" % stem: LB._direction(steps, 0.5, names),
-                    "delta_%s" % axis: float(best - current),
-                    "delta_%s_steps" % stem: int(steps),
-                    "%s_determined" % stem: True,
-                    "%s_at_edge" % stem: bool(at_edge),
-                    "%s_basis" % stem: basis,
-                    "%s_ladder" % stem: [float(v) for v in ladder],
-                })
+        current = setting_of[name][AXIS_INDEX[axis]]
+        steps = ladder.index(best) - ladder.index(current)
+        fields[name].update({
+            "optimal_%s" % axis: float(best),
+            "%s_direction" % stem: LB._direction(steps, 0.5, SOLVERS[axis][1]),
+            "delta_%s" % axis: float(best - current),
+            "delta_%s_steps" % stem: int(steps),
+            "%s_determined" % stem: True,
+            "%s_at_edge" % stem: bool(at_edge),
+            "%s_basis" % stem: basis,
+            "%s_ladder" % stem: [float(v) for v in ladder],
+        })
+        fields[name].update(extra)
+
+    def solved(axis, sets, key, cache):
+        if key not in sets:
+            return None
+        if key not in cache:
+            members = sets[key]
+            if any(n not in measured for n, _ in members):
+                cache[key] = None
+            else:
+                result = solve_axis(axis, members, measured)
+                cache[key] = None if result[0] is None else result
+        return cache[key]
+
+    # 1. 聚焦：在当前深度、当前频率下求。比较集的键是 (模式, 深度, 频率)。
+    optimal_focus = {}
+    cache = {}
+    focus_sets = comparison_sets(family, "focus_mm")
+    for name, setting in setting_of.items():
+        result = solved("focus_mm", focus_sets, (setting[0], setting[1], setting[2]), cache)
+        if result is not None:
+            write(name, "focus_mm", result)
+            optimal_focus[name] = result[0]
+
+    # 2. 频率：优先在最优聚焦的比较集里求，没采到就退回当前聚焦。键是 (模式, 深度, 聚焦)。
+    optimal_frequency = {}
+    cache = {}
+    frequency_sets = comparison_sets(family, "frequency_mhz")
+    for name, setting in setting_of.items():
+        mode, depth, _, focus = setting
+        if name not in optimal_focus:
+            tries = [((mode, depth, focus), "current focus (focus not swept)")]
+        elif optimal_focus[name] == focus:
+            tries = [((mode, depth, focus), "current focus (already optimal)")]
+        else:
+            tries = [((mode, depth, optimal_focus[name]), "optimal focus"),
+                     ((mode, depth, focus), "current focus (no frames at optimal focus)")]
+        for key, how in tries:
+            result = solved("frequency_mhz", frequency_sets, key, cache)
+            if result is not None:
+                write(name, "frequency_mhz", result)
+                fields[name]["frequency_conditioned_on"] = how
+                optimal_frequency[name] = result[0]
+                break
+
+    # 3. 深度：优先在最优频率、最优聚焦的比较集里求，逐步退回当前值。键是 (模式, 频率, 聚焦)。
+    cache = {}
+    depth_sets = comparison_sets(family, "depth_mm")
+    for name, setting in setting_of.items():
+        mode, _, frequency, focus = setting
+        f_opt = optimal_frequency.get(name, frequency)
+        z_opt = optimal_focus.get(name, focus)
+        f_text = ("optimal frequency" if name in optimal_frequency
+                  else "current frequency (frequency not swept)")
+        z_text = "optimal focus" if name in optimal_focus else "current focus (focus not swept)"
+        tries, seen = [], set()
+        # 最优与当前相同时键重复，保留第一个（写「最优」）的说法。
+        for key, how in [((mode, f_opt, z_opt), "%s, %s" % (f_text, z_text)),
+                         ((mode, frequency, z_opt), "current frequency, %s" % z_text),
+                         ((mode, f_opt, focus), "%s, current focus" % f_text),
+                         ((mode, frequency, focus), "current frequency and focus")]:
+            if key not in seen:
+                seen.add(key)
+                tries.append((key, how))
+        for key, how in tries:
+            result = solved("depth_mm", depth_sets, key, cache)
+            if result is not None:
+                write(name, "depth_mm", result)
+                fields[name]["depth_conditioned_on"] = how
+                break
     return fields
 
 
@@ -344,6 +601,14 @@ def main():
     emit = lines.append
 
     CONSOLE_LADDERS.update(console_ladders())
+    tables, pins = PT.resolution_table()
+    RESOLUTION.update(tables)
+    emit(u"=========== console resolution table from point targets (lower = sharper) ===========")
+    for (mode, depth), scores in sorted(tables.items()):
+        emit(u"  %-12s display %5.1f mm  %2d pins   %s" % (
+            T.IMAGE_MODE_NAMES[mode], depth, pins[(mode, depth)],
+            u"  ".join(u"%g:%.3f" % (f, s) for f, s in sorted(scores.items()))))
+    emit(u"")
     cal_by_group = TG.load_calibration()
     changed, mode_counts = floors_in_counts(cal_by_group)
     emit(u"=========== noise floor borrowed in counts, not in dB ===========")
@@ -410,6 +675,15 @@ def main():
         emit(u"  %-10s determined %3d / %d   %s   at edge %d"
              % (stem, len(determined), len(merged),
                 u"  ".join(u"%s %d" % (n, counts.get(n, 0)) for n in names), edge))
+    determined = [r for r in merged if r.get("frequency_determined")]
+    emit(u"  frequency  kind %s   confidence %s"
+         % (dict(collections.Counter(r["frequency_label_kind"] for r in determined)),
+            dict(collections.Counter(r["frequency_confidence"] for r in determined))))
+    emit(u"  frequency  conditioned on %s"
+         % dict(collections.Counter(r["frequency_conditioned_on"] for r in determined)))
+    emit(u"  depth      conditioned on %s"
+         % dict(collections.Counter(r["depth_conditioned_on"] for r in merged
+                                    if r.get("depth_determined"))))
     for axis, key in [("gain", "gain_direction"), ("dynamic range", "dr_direction")]:
         emit(u"  %-10s %s" % (axis, dict(collections.Counter(r[key] for r in merged))))
     emit(u"  %-10s determined %d / %d" % ("dyn range", sum(r["dr_determined"] for r in merged),

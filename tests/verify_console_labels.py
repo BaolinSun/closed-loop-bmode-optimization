@@ -115,15 +115,24 @@ def main():
     for mode in ("fundamental", "harmonic"):
         sets = [r for r in per_set("depth", "depth_mm", ["imaging_mode", "frequency_mhz", "focus_mm"])
                 if r["imaging_mode"] == mode and not r["depth_at_edge"]]
-        pen = [(r["frequency_mhz"], float(re.search(r"penetration ([0-9.]+)", r["depth_basis"]).group(1)))
-               for r in sets if r["depth_basis"] and "penetration " in r["depth_basis"]
-               and "exceeds" not in r["depth_basis"]]
+        # 2026-09-14 起深度判据改为「底部余量 >= 6 dB 的最深阶梯」，依据里记的是可用深度。
+        # 深度按 聚焦 -> 频率 -> 深度 的顺序求，依据来自哪个频率的比较集要看 depth_conditioned_on。
+        def set_frequency(r):
+            return (r["optimal_frequency_mhz"] if r["depth_conditioned_on"].startswith("optimal frequency")
+                    else r["frequency_mhz"])
+        def set_focus(r):
+            return r["optimal_focus_mm"] if "optimal focus" in r["depth_conditioned_on"] else r["focus_mm"]
+        # 只比聚焦 15 mm 的比较集：聚焦深了深部更亮、可用深度更深（谐波 5.0 MHz 的比较集
+        # 大多来自 E9，聚焦 25-30 mm），混在一起比的是聚焦而不是频率。
+        pen = [(set_frequency(r), float(re.search(r"usable to ([0-9.]+) mm", r["depth_basis"]).group(1)))
+               for r in sets if r["depth_basis"] and re.search(r"usable to [0-9.]+ mm", r["depth_basis"])
+               and set_focus(r) == 15.0]
         if len(pen) >= 3:
             rho = spearman([f for f, _ in pen], [p for _, p in pen])
             by = collections.defaultdict(list)
             for f, p_ in pen:
                 by[f].append(p_)
-            emit(u"  penetration vs frequency (non-edge), %-11s sets %3d   rank corr %+.2f  (expect < 0)"
+            emit(u"  usable depth vs frequency (non-edge, focus 15), %-11s sets %3d   rank corr %+.2f  (expect < 0)"
                  % (mode, len(pen), rho))
             emit(u"      " + u"   ".join(u"%g MHz -> %.1f mm" % (f, np.mean(v))
                                          for f, v in sorted(by.items())))
