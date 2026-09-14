@@ -1,0 +1,12 @@
+{
+  "mask_domain_disagreement_quantiles": {
+    "median": 0.06078484195402299,
+    "p90": 0.15870195761494252,
+    "max": 0.34608028017241377
+  },
+  "fundamental_rows": 153,
+  "stored_deadband_not_reproduced": [],
+  "deadband_changed": 61,
+  "gain_direction_changed": [],
+  "slider_direction_changed": []
+}
