@@ -10,3 +10,6 @@ tmp/
 tests/*.txt
 tools_*.txt
 data/scene_families.json
+
+# Training runs (checkpoints, metrics)
+runs/
