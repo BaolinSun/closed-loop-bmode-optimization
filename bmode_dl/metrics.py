@@ -8,6 +8,7 @@
 
 综合分数 score = 平均(增益方向 F1[derived], 三组滑块方向 F1[derived], 深度最优档准确率,
                      频率可接受集合命中率, 聚焦最优档准确率)。动态范围无标签，不计入。
+backend_score = 前两项平均；frontend_score = 后三项平均。
 """
 
 from collections import defaultdict
@@ -222,14 +223,38 @@ def compute_metrics(preds, tg, norm=None):
         m["aux_attenuation_mae"] = float(np.abs(att - tg["attenuation_db_cm_mhz"][a]).mean())
         m["aux_electronic_noise_mae_db"] = float(np.abs(noise - tg["electronic_noise_db"][a]).mean())
 
-    parts = [m.get("gain_dir_f1_derived"), m.get("slider_dir_f1_derived"), m.get("depth_top1"),
-             m.get("frequency_hit"), m.get("focus_top1")]
-    parts = [p for p in parts if p is not None and np.isfinite(p)]
-    m["score"] = float(np.mean(parts)) if parts else float("nan")
+    def mean_of(keys):
+        parts = [m.get(k) for k in keys]
+        parts = [p for p in parts if p is not None and np.isfinite(p)]
+        return float(np.mean(parts)) if parts else float("nan")
+
+    m["score"] = mean_of(BACKEND_SCORE_KEYS + FRONTEND_SCORE_KEYS)
+    m["backend_score"] = mean_of(BACKEND_SCORE_KEYS)
+    m["frontend_score"] = mean_of(FRONTEND_SCORE_KEYS)
     return m
 
 
-MAIN_KEYS = ("score", "gain_mae_db", "gain_within_deadband", "gain_dir_f1_derived", "tgc_mae_db",
+# 分项分数：前端与后端的最佳轮次相差很远（fieldii_v1：前端第 10–40 轮，后端第 120–150 轮），
+# 训练脚本按这两个分数分别保存 best_frontend.pt / best_backend.pt
+BACKEND_SCORE_KEYS = ("gain_dir_f1_derived", "slider_dir_f1_derived")
+FRONTEND_SCORE_KEYS = ("depth_top1", "frequency_hit", "focus_top1")
+
+
+def flatten_metrics(m, prefix=""):
+    """数值指标拍平成一层（列表展开成 _0.._n），写 CSV 用。"""
+    flat = {}
+    for k, v in m.items():
+        if isinstance(v, bool):
+            flat[prefix + k] = int(v)
+        elif isinstance(v, (int, float, np.integer, np.floating)):
+            flat[prefix + k] = float(v) if isinstance(v, (float, np.floating)) else int(v)
+        elif isinstance(v, (list, tuple)) and all(isinstance(x, (int, float)) for x in v):
+            for i, x in enumerate(v):
+                flat["%s%s_%d" % (prefix, k, i)] = x
+    return flat
+
+
+MAIN_KEYS = ("score", "backend_score", "frontend_score", "gain_mae_db", "gain_within_deadband", "gain_dir_f1_derived", "tgc_mae_db",
              "slider_dir_f1_derived", "depth_top1", "depth_within1", "depth_dir_f1_derived",
              "frequency_hit", "frequency_dir_f1_derived", "focus_top1", "focus_within1", "focus_dir_f1_derived")
 

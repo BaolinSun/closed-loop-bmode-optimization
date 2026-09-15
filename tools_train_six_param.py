@@ -2,24 +2,39 @@
 """训练六参数网络 SixParamNet（Field II 带噪数据预训练）。
 
 输入：tools_build_fieldii_training_cache.py 的缓存 + data/labels_fieldii.jsonl。
-输出：runs/<name>/fold_<k>/{best.pt, last.pt, metrics.csv, train_report.txt}，
-      --fold all 时另有 runs/<name>/summary.json 与 summary.txt。
+输出：runs/<name>/fold_<k>/ 下
+          best.pt           综合分数最高的轮次
+          best_backend.pt   后端分数（增益方向 F1、滑块方向 F1）最高的轮次
+          best_frontend.pt  前端分数（深度、频率、聚焦）最高的轮次
+          last.pt           最后一轮
+          metrics.csv       每轮一行，全部数值指标（列按所有轮次的并集写）
+      runs/<name>/train_report.txt；--fold all 时另有 summary.json。
 
     验证方式
 
 当前 1848 行全部是 split=train 的 11 个体模，只能按体模留出做交叉验证（--folds 4 --fold k）。
 标签里出现 split=val 的行时（仿真全部完成、重跑标签后），自动改用 split 字段。
---fold none：全部体模训练固定轮数，没有验证集，产出部署/微调起点用的权重。
+--fold none：全部体模训练，没有验证集。后端取 last.pt；前端在 --frontend-epoch 指定的轮次另存
+frontend.pt（取交叉验证汇总里报告的前端最佳轮次中位数）。
+
+    与 fieldii_v1 相比的三处改动（docs 见训练日志分析）
+
+  1. 后端输出方式默认 optimum：网络预测最优增益 / 最优 TGC，修正量在网络外相减
+     （--backend-output delta 恢复旧方式）。
+  2. 前端与后端分开选检查点；前端头加大丢弃率（--frontend-dropout，默认 0.3）并做标签平滑
+     （--frontend-label-smoothing，默认 0.1）。
+  3. metrics.csv 保留全部验证指标（旧版表头按第 1 轮定下，第 1 轮不验证，非主要指标被丢掉）。
 
     每个 epoch
 
 训练批次一律重抽后端起点（bmode_dl.labels.draw_start）并随机左右翻转；验证在
-"标签记录的起点"上算指标，另报一次固定种子重抽起点的指标。best.pt 按前者的综合分数选。
+"标签记录的起点"上算指标，另报一次固定种子重抽起点的指标。检查点按前者选。
 
 用法（服务器）：
-    python tools_train_six_param.py --fold all --amp --name fieldii_v1
-    python tools_train_six_param.py --fold none --epochs 150 --amp --name fieldii_v1_all
-    python tools_train_six_param.py --fold 0 --input-mode no_image --name ablation_no_image
+    python tools_train_six_param.py --fold all --amp --name fieldii_v2
+    python tools_train_six_param.py --fold none --epochs 150 --frontend-epoch 30 --amp --name fieldii_v2_all
+    python tools_train_six_param.py --fold all --amp --backend-output delta --frontend-dropout 0.1 \
+        --frontend-label-smoothing 0 --name fieldii_v1_repro
 """
 
 import argparse
@@ -37,8 +52,12 @@ import torch
 from bmode_dl.checkpoint import model_from_config, save_checkpoint
 from bmode_dl.dataset import INPUT_MODES, FieldIIData, InputBuilder, make_batch
 from bmode_dl.losses import DEFAULT_WEIGHTS, SixParamLoss
-from bmode_dl.metrics import MAIN_KEYS, compute_metrics, format_metrics, predict
-from bmode_dl.model import count_parameters
+from bmode_dl.metrics import MAIN_KEYS, compute_metrics, flatten_metrics, format_metrics, predict
+from bmode_dl.model import BACKEND_OUTPUTS, count_parameters
+
+BACKEND_KEYS = ("gain_mae_db", "gain_within_deadband", "gain_dir_f1_derived", "tgc_mae_db", "slider_dir_f1_derived")
+FRONTEND_KEYS = ("depth_top1", "depth_within1", "depth_dir_f1_derived", "frequency_hit", "frequency_dir_f1_derived",
+                 "focus_top1", "focus_within1", "focus_dir_f1_derived")
 
 
 def parse_args(argv=None):
@@ -60,7 +79,8 @@ def parse_args(argv=None):
     p.add_argument("--grad-clip", type=float, default=5.0)
     p.add_argument("--amp", action="store_true", help="float16 mixed precision (CUDA only)")
     p.add_argument("--eval-every", type=int, default=2)
-    p.add_argument("--patience", type=int, default=0, help="stop after this many evaluations without improvement (0 = off)")
+    p.add_argument("--patience", type=int, default=0,
+                   help="stop after this many evaluations without improvement of BOTH sub-scores (0 = off)")
     p.add_argument("--input-mode", choices=INPUT_MODES, default="full")
     p.add_argument("--no-noise-floor", action="store_true")
     p.add_argument("--no-transformer", action="store_true")
@@ -69,6 +89,14 @@ def parse_args(argv=None):
     p.add_argument("--d-model", dest="d_model", type=int, default=256)
     p.add_argument("--transformer-layers", dest="transformer_layers", type=int, default=2)
     p.add_argument("--dropout", type=float, default=0.1)
+    p.add_argument("--backend-output", dest="backend_output", choices=BACKEND_OUTPUTS, default="optimum",
+                   help="optimum: predict optimal gain/TGC and subtract the current setting outside the network; "
+                        "delta: predict the correction directly (fieldii_v1)")
+    p.add_argument("--frontend-dropout", dest="frontend_dropout", type=float, default=0.3,
+                   help="dropout inside the depth/frequency/focus heads")
+    p.add_argument("--frontend-label-smoothing", dest="frontend_label_smoothing", type=float, default=0.1)
+    p.add_argument("--frontend-epoch", type=int, default=None,
+                   help="with --fold none: also save frontend.pt at this epoch")
     p.add_argument("--borderline-weight", type=float, default=0.5)
     p.add_argument("--uncertainty-weighting", action="store_true")
     p.add_argument("--loss-weight", action="append", default=[], metavar="TERM=VALUE",
@@ -111,6 +139,25 @@ def parse_loss_weights(items):
     return out
 
 
+def write_csv(path, rows):
+    """每轮重写一次：列取所有轮次的并集，验证轮与非验证轮的列不同也不会丢。"""
+    fixed = ["epoch", "lr", "seconds"]
+    names = sorted(set(k for r in rows for k in r) - set(fixed))
+    names = fixed + [k for k in names if k.startswith("train_")] + [k for k in names if not k.startswith("train_")]
+    with io.open(path, "w", encoding="utf-8", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=names, extrasaction="ignore")
+        writer.writeheader()
+        for r in rows:
+            writer.writerow(r)
+
+
+def format_norm(norm):
+    out = {}
+    for k, v in norm.items():
+        out[k] = [round(float(x), 3) for x in v] if isinstance(v, (list, tuple)) else round(float(v), 4)
+    return json.dumps(out)
+
+
 def train_fold(args, data, fold, out_dir, report):
     os.makedirs(out_dir, exist_ok=True)
     set_seed(args.seed + (0 if fold is None else int(fold)))
@@ -127,17 +174,20 @@ def train_fold(args, data, fold, out_dir, report):
 
     norm = data.normalisation(train_idx, seed=args.seed)
     class_weights = data.class_weights(train_idx, seed=args.seed)
-    report("  norm: %s" % json.dumps({k: round(v, 4) for k, v in norm.items()}))
+    report("  norm: %s" % format_norm(norm))
     report("  class weights: %s" % json.dumps({k: [round(float(x), 3) for x in v] for k, v in class_weights.items()}))
 
     builder = InputBuilder(data.rows_out, data.lines, data.source_rows, norm,
                            use_noise_floor=not args.no_noise_floor).to(device)
     config = vars(args).copy()
-    model = model_from_config(config, data.ladders).to(device)
+    model = model_from_config(config, data.ladders, norm).to(device)
     criterion = SixParamLoss(class_weights, norm, parse_loss_weights(args.loss_weight),
                              borderline_weight=args.borderline_weight,
-                             uncertainty_weighting=args.uncertainty_weighting).to(device)
-    report("  model: input_mode=%s  parameters=%.2f M" % (args.input_mode, count_parameters(model) / 1e6))
+                             uncertainty_weighting=args.uncertainty_weighting,
+                             frontend_label_smoothing=args.frontend_label_smoothing).to(device)
+    report("  model: input_mode=%s  backend_output=%s  frontend_dropout=%.2f  label_smoothing=%.2f  parameters=%.2f M"
+           % (args.input_mode, args.backend_output, args.frontend_dropout, args.frontend_label_smoothing,
+              count_parameters(model) / 1e6))
 
     params = [p for p in list(model.parameters()) + list(criterion.parameters()) if p.requires_grad]
     decay = [p for p in params if p.dim() >= 2]
@@ -160,10 +210,14 @@ def train_fold(args, data, fold, out_dir, report):
     rng = np.random.RandomState(args.seed)
 
     csv_path = os.path.join(out_dir, "metrics.csv")
-    csv_file = io.open(csv_path, "w", encoding="utf-8", newline="")
-    writer = None
+    csv_rows = []
     cache_shape = {"rows": data.rows_out, "lines": data.lines, "source_rows": data.source_rows}
-    best_score, best_epoch, best_metrics, bad_evals = -float("inf"), -1, None, 0
+    extra = {"fold": fold, "val_groups": val_groups, "train_groups": train_groups}
+    best = {name: {"score": -float("inf"), "epoch": -1, "metrics": None}
+            for name in ("score", "backend_score", "frontend_score")}
+    files = {"score": "best.pt", "backend_score": "best_backend.pt", "frontend_score": "best_frontend.pt"}
+    marks = {"score": "*", "backend_score": "B", "frontend_score": "F"}
+    bad_evals = 0
     started = time.time()
 
     for epoch in range(1, args.epochs + 1):
@@ -202,43 +256,70 @@ def train_fold(args, data, fold, out_dir, report):
             metrics = compute_metrics(preds, tg, norm)
             preds_r, tg_r = predict(model, data, builder, val_idx, start="redraw", seed=args.val_redraw_seed, amp=amp)
             metrics_r = compute_metrics(preds_r, tg_r, norm)
-            row.update({"val_" + k: v for k, v in metrics.items() if isinstance(v, (int, float))})
-            row.update({"valredraw_" + k: v for k, v in metrics_r.items() if isinstance(v, (int, float))})
-            line += "  | val %s" % format_metrics(metrics, ("score", "gain_mae_db", "tgc_mae_db", "depth_top1",
-                                                              "frequency_hit", "focus_top1"))
-            if metrics["score"] > best_score:
-                best_score, best_epoch, best_metrics, bad_evals = metrics["score"], epoch, metrics, 0
-                save_checkpoint(os.path.join(out_dir, "best.pt"), model, config, data.ladders, norm, class_weights,
-                                cache_shape, {"epoch": epoch, "fold": fold, "val_groups": val_groups,
-                                              "train_groups": train_groups, "metrics": metrics,
-                                              "metrics_redraw": metrics_r})
-                line += "  *"
-            else:
-                bad_evals += 1
+            row.update(flatten_metrics(metrics, "val_"))
+            row.update(flatten_metrics(metrics_r, "valredraw_"))
+            line += "  | val %s" % format_metrics(metrics, ("score", "backend_score", "frontend_score", "gain_mae_db",
+                                                              "tgc_mae_db", "depth_top1", "frequency_hit", "focus_top1"))
+            improved = ""
+            for name in ("score", "backend_score", "frontend_score"):
+                value = metrics.get(name, float("nan"))
+                if np.isfinite(value) and value > best[name]["score"]:
+                    best[name] = {"score": value, "epoch": epoch, "metrics": metrics}
+                    save_checkpoint(os.path.join(out_dir, files[name]), model, config, data.ladders, norm,
+                                    class_weights, cache_shape,
+                                    dict(extra, epoch=epoch, selected_by=name, metrics=metrics,
+                                         metrics_redraw=metrics_r))
+                    improved += marks[name]
+            if improved:
+                line += "  " + improved
+            # 早停只看两个分项：两个都没提高才算一次
+            bad_evals = 0 if ("B" in improved or "F" in improved) else bad_evals + 1
+        elif len(val_idx) == 0 and args.frontend_epoch and epoch == args.frontend_epoch:
+            save_checkpoint(os.path.join(out_dir, "frontend.pt"), model, config, data.ladders, norm, class_weights,
+                            cache_shape, dict(extra, epoch=epoch, selected_by="frontend_epoch"))
+            line += "  saved frontend.pt"
         report(line)
 
-        if writer is None:
-            fieldnames = sorted(set(row) | {"val_" + k for k in MAIN_KEYS} | {"valredraw_" + k for k in MAIN_KEYS})
-            fieldnames = ["epoch", "lr", "seconds"] + [f for f in fieldnames if f not in ("epoch", "lr", "seconds")]
-            writer = csv.DictWriter(csv_file, fieldnames=fieldnames, extrasaction="ignore")
-            writer.writeheader()
-        writer.writerow(row)
-        csv_file.flush()
+        csv_rows.append(row)
+        write_csv(csv_path, csv_rows)
 
         if args.patience and bad_evals >= args.patience:
-            report("  early stop: %d evaluations without improvement" % bad_evals)
+            report("  early stop: %d evaluations without improvement of either sub-score" % bad_evals)
             break
 
-    csv_file.close()
     save_checkpoint(os.path.join(out_dir, "last.pt"), model, config, data.ladders, norm, class_weights, cache_shape,
-                    {"epoch": epoch, "fold": fold, "val_groups": val_groups, "train_groups": train_groups})
-    if best_metrics is None:
-        report("  no validation set; last.pt is the model")
-    else:
-        report("  best epoch %d: %s" % (best_epoch, format_metrics(best_metrics)))
+                    dict(extra, epoch=epoch, selected_by="last"))
+    if best["score"]["metrics"] is None:
+        report("  no validation set; last.pt is the back-end model%s"
+               % (", frontend.pt the front-end model" if args.frontend_epoch else ""))
+        report("  fold finished in %.0f s" % (time.time() - started))
+        report("")
+        return None
+
+    for name in ("score", "backend_score", "frontend_score"):
+        report("  best %-15s epoch %3d: %s" % (name, best[name]["epoch"], format_metrics(best[name]["metrics"])))
+    # 组合：后端指标取 best_backend 那一轮，前端指标取 best_frontend 那一轮（即 CombinedModel 的单步表现）
+    combined = {k: best["backend_score"]["metrics"].get(k) for k in BACKEND_KEYS + ("backend_score",)}
+    combined.update({k: best["frontend_score"]["metrics"].get(k) for k in FRONTEND_KEYS + ("frontend_score",)})
+    parts = [combined.get("backend_score"), combined.get("frontend_score")]
+    combined["score"] = float(np.mean([p for p in parts if p is not None and np.isfinite(p)]))
+    report("  combined (backend epoch %d + frontend epoch %d): %s"
+           % (best["backend_score"]["epoch"], best["frontend_score"]["epoch"], format_metrics(combined)))
     report("  fold finished in %.0f s" % (time.time() - started))
     report("")
-    return best_metrics
+    return {"best": best["score"]["metrics"], "combined": combined,
+            "epochs": {name: best[name]["epoch"] for name in best}}
+
+
+def summarise(results, keys, section, report):
+    summary = {}
+    for key in keys:
+        values = [r[section][key] for r in results
+                  if isinstance(r[section].get(key), float) and np.isfinite(r[section][key])]
+        if values:
+            summary[key] = {"mean": float(np.mean(values)), "std": float(np.std(values)), "n": len(values)}
+            report("    %-26s %.4f +- %.4f  (n=%d)" % (key, summary[key]["mean"], summary[key]["std"], len(values)))
+    return summary
 
 
 def main(argv=None):
@@ -273,14 +354,21 @@ def main(argv=None):
     valid = {k: v for k, v in results.items() if v}
     if len(valid) > 1:
         report("=========== cross-validation summary (%d folds) ===========" % len(valid))
-        summary = {}
-        for key in MAIN_KEYS:
-            values = [v[key] for v in valid.values() if isinstance(v.get(key), float) and np.isfinite(v[key])]
-            if values:
-                summary[key] = {"mean": float(np.mean(values)), "std": float(np.std(values)), "n": len(values)}
-                report("  %-26s %.4f +- %.4f  (n=%d)" % (key, summary[key]["mean"], summary[key]["std"], len(values)))
+        report("  best.pt (single checkpoint chosen by the overall score)")
+        best_summary = summarise(list(valid.values()), MAIN_KEYS, "best", report)
+        report("  combined (best_backend.pt for gain/TGC + best_frontend.pt for depth/frequency/focus)")
+        combined_summary = summarise(list(valid.values()), MAIN_KEYS, "combined", report)
+        epochs = {name: [v["epochs"][name] for v in valid.values()] for name in ("score", "backend_score",
+                                                                                 "frontend_score")}
+        report("  best epochs per fold: %s" % json.dumps(epochs))
+        report("  suggested --frontend-epoch for --fold none: %d (median of best front-end epochs)"
+               % int(np.median(epochs["frontend_score"])))
+        report("  note: the combined figures pick each epoch on the validation phantoms themselves, so they are "
+               "optimistic in the same way best.pt already was")
         with io.open(os.path.join(run_dir, "summary.json"), "w", encoding="utf-8") as handle:
-            handle.write(json.dumps({"folds": valid, "summary": summary}, indent=2, default=float) + "\n")
+            handle.write(json.dumps({"folds": valid, "summary_best": best_summary,
+                                     "summary_combined": combined_summary, "best_epochs": epochs},
+                                    indent=2, default=float) + "\n")
 
 
 if __name__ == "__main__":

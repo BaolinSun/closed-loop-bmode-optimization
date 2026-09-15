@@ -13,8 +13,8 @@
 设置放在一起才有定义（docs/six_parameter_model_recommendations_20260914.md §6.3）。
 
 输出（全部是 logits 或 dB 数值，解码见 decode_predictions）：
-    gain_delta_db (B,)        gain_dir (B,3)
-    tgc_delta_db (B,8)        slider_dir (B,3,3)       near/mid/far 各 3 类
+    gain_delta_db (B,)        gain_dir (B,3)           gain_optimal_db (B,)   仅 optimum 输出方式
+    tgc_delta_db (B,8)        slider_dir (B,3,3)       tgc_optimal_db (B,8)   near/mid/far 各 3 类
     depth_logits (B,nd)       depth_dir (B,3)
     frequency_logits (B,nf)   frequency_dir (B,3)
     focus_logits (B,nz)       focus_dir (B,3)
@@ -28,6 +28,12 @@ import torch.nn.functional as F
 
 from . import constants as K
 from .dataset import IMAGE_CHANNELS, NUM_SCALARS, PROFILE_CHANNELS, INPUT_MODES
+
+# 后端输出方式：
+#   optimum  网络预测最优增益 / 最优 TGC 曲线（dB，按训练集均值方差标准化），修正量 = 最优 - 当前，
+#            减法在网络外精确完成。fieldii_v1 的日志显示网络自己做减法残留约 0.3 dB，输给只看设置的查表。
+#   delta    网络直接预测修正量（fieldii_v1 及更早的检查点）。
+BACKEND_OUTPUTS = ("optimum", "delta")
 
 
 def _groups(channels):
@@ -146,11 +152,15 @@ class MLP(nn.Module):
 
 class SixParamNet(nn.Module):
     def __init__(self, ladders, input_mode="full", d_model=256, seq_len=32, transformer_layers=2,
-                 use_transformer=True, dropout=0.1):
+                 use_transformer=True, dropout=0.1, backend_output="optimum", backend_norm=None,
+                 frontend_dropout=None):
         super().__init__()
         if input_mode not in INPUT_MODES:
             raise ValueError("input_mode must be one of %s" % (INPUT_MODES,))
+        if backend_output not in BACKEND_OUTPUTS:
+            raise ValueError("backend_output must be one of %s" % (BACKEND_OUTPUTS,))
         self.input_mode = input_mode
+        self.backend_output = backend_output
         self.seq_len = int(seq_len)
         self.num_depth = len(ladders["depth_mm"])
         self.num_frequency = len(ladders["frequency_mhz"])
@@ -188,16 +198,30 @@ class SixParamNet(nn.Module):
                                    nn.Linear(d_model, d_model), nn.GELU())
 
         hidden = d_model // 2
+        front_dropout = dropout if frontend_dropout is None else float(frontend_dropout)
         self.gain_head = MLP(d_model, hidden, 1 + 3, dropout)
         self.tgc_band_head = MLP(d_model + (d_model if self.has_sequence else 0) + 1 + K.NUM_TGC_BANDS,
                                  hidden, 1, dropout)
         self.slider_dir_head = MLP(d_model, hidden, 3 * len(K.SLIDER_GROUPS), dropout)
-        self.depth_head = MLP(d_model, hidden, self.num_depth + 3, dropout)
-        self.frequency_head = MLP(d_model, hidden, self.num_frequency + 3, dropout)
-        self.focus_head = MLP(d_model, hidden, self.num_focus + 3, dropout)
+        self.depth_head = MLP(d_model, hidden, self.num_depth + 3, front_dropout)
+        self.frequency_head = MLP(d_model, hidden, self.num_frequency + 3, front_dropout)
+        self.focus_head = MLP(d_model, hidden, self.num_focus + 3, front_dropout)
         self.dr_head = MLP(d_model, hidden, 1 + 3, dropout)
         self.aux_head = MLP(d_model, hidden, 2, dropout)
         self.register_buffer("band_onehot", torch.eye(K.NUM_TGC_BANDS), persistent=False)
+
+        if backend_output == "optimum":
+            # 最优值 = 训练集均值 + 标准差 * 网络输出；末层置零，起点就是"按训练集均值给建议"
+            norm = backend_norm or {}
+            self.register_buffer("gain_opt_mean", torch.tensor(float(norm.get("opt_gain_mean", 0.0))))
+            self.register_buffer("gain_opt_std", torch.tensor(float(norm.get("opt_gain_std", 1.0))))
+            self.register_buffer("tgc_opt_mean", torch.tensor(
+                norm.get("opt_tgc_db_mean", [0.0] * K.NUM_TGC_BANDS), dtype=torch.float32))
+            self.register_buffer("tgc_opt_std", torch.tensor(
+                norm.get("opt_tgc_db_std", [1.0] * K.NUM_TGC_BANDS), dtype=torch.float32))
+            for head in (self.gain_head, self.tgc_band_head):
+                nn.init.zeros_(head.net[-1].weight)
+                nn.init.zeros_(head.net[-1].bias)
 
     def forward(self, inputs):
         scalars = inputs["scalars"].float()
@@ -230,14 +254,29 @@ class SixParamNet(nn.Module):
 
         out = {}
         gain = self.gain_head(h)
-        out["gain_delta_db"], out["gain_dir"] = gain[:, 0], gain[:, 1:]
+        out["gain_dir"] = gain[:, 1:]
+        if self.backend_output == "optimum":
+            # 当前增益由输入标量还原（gain_db / 10），在网络外做减法
+            out["gain_optimal_db"] = self.gain_opt_mean + self.gain_opt_std * gain[:, 0].float()
+            out["gain_delta_db"] = out["gain_optimal_db"] - scalars[:, 3] * 10.0
+        else:
+            out["gain_delta_db"] = gain[:, 0]
 
         current_tgc = scalars[:, 4:4 + K.NUM_TGC_BANDS]                     # (level-127)/127
         band_in = [h[:, None, :].expand(b, K.NUM_TGC_BANDS, h.shape[1]), current_tgc[:, :, None],
                    self.band_onehot[None, :, :].expand(b, K.NUM_TGC_BANDS, K.NUM_TGC_BANDS)]
         if band_features is not None:
             band_in.insert(1, band_features)
-        out["tgc_delta_db"] = self.tgc_band_head(torch.cat(band_in, dim=2)).squeeze(2)
+        tgc_raw = self.tgc_band_head(torch.cat(band_in, dim=2)).squeeze(2)
+        if self.backend_output == "optimum":
+            mode = scalars[:, 14]
+            slope = torch.where(mode > 0.5, torch.full_like(mode, K.TGC_DB_PER_LEVEL[K.MODE_HARMONIC]),
+                                torch.full_like(mode, K.TGC_DB_PER_LEVEL[K.MODE_FUNDAMENTAL]))
+            current_db = current_tgc * float(K.TGC_CENTER_LEVEL) * slope[:, None]   # (level-127)*dB/级
+            out["tgc_optimal_db"] = self.tgc_opt_mean + self.tgc_opt_std * tgc_raw.float()
+            out["tgc_delta_db"] = out["tgc_optimal_db"] - current_db
+        else:
+            out["tgc_delta_db"] = tgc_raw
         out["slider_dir"] = self.slider_dir_head(h).view(b, len(K.SLIDER_GROUPS), 3)
 
         depth = self.depth_head(h)

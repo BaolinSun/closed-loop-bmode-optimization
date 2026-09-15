@@ -7,11 +7,14 @@
   3. 用 labels_fieldii.jsonl 记录的起点重算 delta 与方向，与记录值一致；重抽起点落在 draw_start 的范围内。
   4. 合成缓存上的端到端冒烟：三种输入模式前向 + 反向、无定出标签时损失为 0、检查点存取、
      训练脚本 1 个 epoch、评估脚本（单步 + 查表基线 + 闭环）。
+  5. 训练日志分析后的三处改动：optimum 后端输出（最优值 - 当前值的算术、零初始化起点、旧检查点仍能载入）、
+     前端标签平滑、前后端分开的检查点与组合模型、metrics.csv 保留全部验证指标。
 
 用法：python tests/verify_six_param_model.py [--labels data/labels_fieldii.jsonl] [--skip-scripts]
 """
 
 import argparse
+import csv
 import io
 import json
 import os
@@ -29,7 +32,8 @@ import torch
 
 import bmode_dl.constants as K
 from bmode_dl import labels as L
-from bmode_dl.checkpoint import load_checkpoint, save_checkpoint, model_from_config
+from bmode_dl.checkpoint import (FRONTEND_OUTPUT_KEYS, CombinedModel, load_checkpoint, model_from_config,
+                                 save_checkpoint)
 from bmode_dl.closed_loop import run_closed_loop
 from bmode_dl.dataset import FieldIIData, InputBuilder, make_batch, read_jsonl
 from bmode_dl.losses import SixParamLoss
@@ -182,6 +186,57 @@ def write_synthetic_cache(rows, out_dir, cache_rows=128, lines=32, seed=0):
                                  "frames": n}) + "\n")
 
 
+def check_backend_output_and_smoothing(data, norm, cw, inputs, tg):
+    """optimum 输出方式的算术、末层零初始化、旧检查点兼容、标签平滑为 0 时与普通交叉熵一致。"""
+    import torch.nn.functional as F
+    from bmode_dl.losses import ladder_losses
+    from bmode_dl.model import masked_logits
+
+    model = model_from_config({"backend_output": "optimum"}, data.ladders, norm).eval()
+    with torch.no_grad():
+        out = model(inputs)
+    current_gain = inputs["scalars"][:, 3] * 10.0
+    current_tgc_db = (inputs["scalars"][:, 4:12] * 127.0) * K.TGC_DB_PER_LEVEL[0]
+    check("optimum output: gain delta == optimum - current",
+          bool(torch.allclose(out["gain_delta_db"], out["gain_optimal_db"] - current_gain, atol=1e-5)))
+    check("optimum output: current gain recovered from scalars",
+          bool(torch.allclose(current_gain, tg["gain_db"], atol=1e-4)),
+          "max diff %.2e dB" % float((current_gain - tg["gain_db"]).abs().max()))
+    check("optimum output: TGC delta == optimum - current",
+          bool(torch.allclose(out["tgc_delta_db"], out["tgc_optimal_db"] - current_tgc_db, atol=1e-4)))
+    check("optimum output: current TGC recovered from scalars",
+          bool(torch.allclose(inputs["scalars"][:, 4:12] * 127.0 + 127.0, tg["tgc_levels"], atol=1e-3)))
+    starts_at_mean = (bool(torch.allclose(out["gain_optimal_db"],
+                                          torch.full_like(out["gain_optimal_db"], norm["opt_gain_mean"]), atol=1e-5))
+                      and bool(torch.allclose(out["tgc_optimal_db"][0], torch.tensor(norm["opt_tgc_db_mean"]),
+                                              atol=1e-4)))
+    check("optimum output starts at the training-set mean (zero-initialised last layer)", starts_at_mean,
+          "opt_gain_mean %.3f dB, opt_gain_std %.3f dB" % (norm["opt_gain_mean"], norm["opt_gain_std"]))
+
+    legacy = model_from_config({}, data.ladders)
+    check("config without backend_output rebuilds the legacy delta model",
+          legacy.backend_output == "delta" and not hasattr(legacy, "gain_opt_mean"))
+
+    logits = torch.randn(6, len(data.ladders["depth_mm"]))
+    ce0, _, _ = ladder_losses(logits, tg["depth_valid"], tg["optimal_depth_idx"], tg["depth_mask"], 0.0)
+    ref = F.cross_entropy(masked_logits(logits, tg["depth_valid"]), tg["optimal_depth_idx"].clamp(min=0),
+                          reduction="none")
+    m = tg["depth_mask"] * (tg["optimal_depth_idx"] >= 0).float()
+    ref = (ref * m).sum() / (m.sum() + 1e-6)
+    check("ladder loss with smoothing 0 == cross entropy", bool(torch.allclose(ce0, ref, atol=1e-5)))
+    ce1, _, _ = ladder_losses(logits, tg["depth_valid"], tg["optimal_depth_idx"], tg["depth_mask"], 0.1)
+    check("ladder loss with smoothing 0.1 is finite and differs", bool(torch.isfinite(ce1)) and float(ce1) != float(ce0))
+
+    old = os.path.join(ROOT, "runs", "fieldii_v1", "fold_0", "best.pt")
+    if os.path.exists(old):
+        try:
+            legacy_model, _, payload = load_checkpoint(old)
+            check("fieldii_v1 checkpoint still loads (strict state dict)", legacy_model.backend_output == "delta",
+                  "epoch %s" % payload.get("epoch"))
+        except Exception as exc:
+            check("fieldii_v1 checkpoint still loads (strict state dict)", False, repr(exc)[:200])
+
+
 def check_smoke(rows, skip_scripts):
     emit("=========== 4. synthetic end-to-end smoke test (CPU) ===========")
     groups = sorted(set(r["group_id"] for r in rows))
@@ -213,9 +268,10 @@ def check_smoke(rows, skip_scripts):
                                                                          tuple(inputs["scalars"].shape)))
         check("inputs finite", all(bool(torch.isfinite(v).all()) for v in inputs.values()))
 
+        new_config = {"input_mode": "full", "backend_output": "optimum", "frontend_dropout": 0.3}
         for mode in ("full", "no_image", "params_only"):
-            model = model_from_config({"input_mode": mode}, data.ladders)
-            criterion = SixParamLoss(cw, norm, uncertainty_weighting=(mode == "full"))
+            model = model_from_config(dict(new_config, input_mode=mode), data.ladders, norm)
+            criterion = SixParamLoss(cw, norm, uncertainty_weighting=(mode == "full"), frontend_label_smoothing=0.1)
             out = model(inputs)
             loss, logs = criterion(out, tg)
             loss.backward()
@@ -231,16 +287,31 @@ def check_smoke(rows, skip_scripts):
                       and shapes["depth_logits"] == (6, nd), str(shapes))
                 check("dynamic range loss is zero without labels", logs["dr_reg"] == 0.0 and logs["dr_dir"] == 0.0)
 
-        model = model_from_config({"input_mode": "full"}, data.ladders)
+        check_backend_output_and_smoothing(data, norm, cw, inputs, tg)
+
+        model = model_from_config(new_config, data.ladders, norm)
+        with torch.no_grad():
+            for head in (model.gain_head, model.tgc_band_head):   # 让保存的权重非平凡
+                head.net[-1].weight.normal_(0, 0.05)
         ckpt = os.path.join(tmp, "ckpt.pt")
-        save_checkpoint(ckpt, model, {"input_mode": "full"}, data.ladders, norm, cw,
+        save_checkpoint(ckpt, model, new_config, data.ladders, norm, cw,
                         {"rows": data.rows_out, "lines": data.lines, "source_rows": data.source_rows},
                         {"val_groups": val_groups})
         model2, builder2, payload = load_checkpoint(ckpt)
         model.eval()
         with torch.no_grad():
-            same = torch.allclose(model(inputs)["gain_delta_db"], model2(inputs)["gain_delta_db"], atol=1e-6)
-        check("checkpoint round trip", bool(same))
+            same = (torch.allclose(model(inputs)["gain_delta_db"], model2(inputs)["gain_delta_db"], atol=1e-5)
+                    and torch.allclose(model(inputs)["tgc_delta_db"], model2(inputs)["tgc_delta_db"], atol=1e-5))
+        check("checkpoint round trip (optimum output, normalisation buffers restored)", bool(same))
+
+        other = model_from_config(dict(new_config, backend_output="delta"), data.ladders, norm).eval()
+        combined = CombinedModel(other, model2).eval()
+        with torch.no_grad():
+            co, fo, bo = combined(inputs), other(inputs), model2(inputs)
+        ok = (all(torch.equal(co[k], fo[k]) for k in FRONTEND_OUTPUT_KEYS)
+              and torch.equal(co["gain_delta_db"], bo["gain_delta_db"])
+              and torch.equal(co["tgc_delta_db"], bo["tgc_delta_db"]))
+        check("combined model: front-end outputs from one network, back-end from the other", bool(ok))
 
         preds, ptg = predict(model2, data, builder2, val_idx, start="label", batch_size=32)
         metrics = compute_metrics(preds, ptg, norm)
@@ -259,13 +330,23 @@ def check_smoke(rows, skip_scripts):
             TT.main(["--cache", cache_dir, "--labels", label_path, "--runs", runs, "--name", "smoke",
                      "--folds", "3", "--fold", "0", "--epochs", "1", "--batch", "16", "--eval-every", "1",
                      "--device", "cpu", "--d-model", "64", "--transformer-layers", "1"])
-            best = os.path.join(runs, "smoke", "fold_0", "best.pt")
-            check("training script wrote best.pt", os.path.exists(best), "%.0f s" % (time.time() - started))
+            fold_dir = os.path.join(runs, "smoke", "fold_0")
+            written = [f for f in ("best.pt", "best_backend.pt", "best_frontend.pt", "last.pt")
+                       if os.path.exists(os.path.join(fold_dir, f))]
+            check("training script wrote best/best_backend/best_frontend/last", len(written) == 4,
+                  "%s, %.0f s" % (written, time.time() - started))
+            with io.open(os.path.join(fold_dir, "metrics.csv"), encoding="utf-8") as handle:
+                header = next(csv.reader(handle))
+            wanted = ["val_aux_attenuation_mae", "val_gain_dir_f1_head", "val_slider_near_dir_f1_derived",
+                      "val_tgc_band_mae_db_0", "val_backend_score", "val_frontend_score", "valredraw_tgc_mae_db"]
+            missing = [w for w in wanted if w not in header]
+            check("metrics.csv keeps every validation metric", not missing,
+                  "%d columns, missing %s" % (len(header), missing))
             TE.main(["--run", os.path.join(runs, "smoke"), "--cache", cache_dir, "--labels", label_path,
                      "--device", "cpu", "--redraw-seeds", "1", "--max-steps", "2"])
-            check("evaluation script wrote reports",
-                  os.path.exists(os.path.join(runs, "smoke", "fold_0", "evaluation_report.txt"))
-                  and os.path.exists(os.path.join(runs, "smoke", "evaluation_summary.txt")))
+            check("evaluation script (combined model) wrote reports",
+                  os.path.exists(os.path.join(fold_dir, "evaluation_report_combined.txt"))
+                  and os.path.exists(os.path.join(runs, "smoke", "evaluation_summary_combined.txt")))
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
     emit("")

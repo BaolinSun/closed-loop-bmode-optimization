@@ -11,6 +11,9 @@
     聚焦    同深度，按该行 focus_ladder 掩膜
     动态范围 回归 + 方向（掩膜 dr_mask，现为 0）
     辅助    衰减、电子噪声回归（标准化后 MSE）
+
+前端三轴可加标签平滑（frontend_label_smoothing）：fieldii_v1 里前端训练损失降到 0.001 量级、验证
+在第 10–40 轮见顶，是在记训练体模。平滑只摊到可选档上。
 """
 
 import torch
@@ -49,20 +52,31 @@ def huber(x, delta=1.0):
     return torch.where(ax < delta, 0.5 * ax * ax / delta, ax - 0.5 * delta)
 
 
-def weighted_ce(logits, target, mask, class_weights):
-    """带类别权重的交叉熵；target 为 -1 的行由 mask 排除。"""
+def weighted_ce(logits, target, mask, class_weights, smoothing=0.0):
+    """带类别权重的交叉熵；target 为 -1 的行由 mask 排除。smoothing 为标签平滑系数。"""
     safe = target.clamp(min=0)
-    nll = F.cross_entropy(logits.float(), safe, reduction="none")
+    nll = F.cross_entropy(logits.float(), safe, reduction="none", label_smoothing=float(smoothing))
     w = mask.float() * (target >= 0).float() * class_weights[safe]
     return masked_mean(nll, w)
 
 
-def ladder_losses(logits, valid, target, mask):
-    """最优档交叉熵 + 期望档距离。"""
+def smoothing_target(valid, smoothing):
+    """标签平滑只摊到可选档上：不可选档（logits 被置为 -1e4）的目标概率为 0。"""
+    valid = (valid > 0).float()
+    return valid / valid.sum(dim=1, keepdim=True).clamp(min=1.0)
+
+
+def ladder_losses(logits, valid, target, mask, smoothing=0.0):
+    """最优档交叉熵（可选档内的标签平滑）+ 期望档距离。"""
     logits = masked_logits(logits, valid)
     safe = target.clamp(min=0)
     m = mask.float() * (target >= 0).float()
-    ce, total = masked_mean(F.cross_entropy(logits, safe, reduction="none"), m)
+    logp = F.log_softmax(logits, dim=1)
+    nll = -logp.gather(1, safe[:, None]).squeeze(1)
+    if smoothing > 0:
+        uniform = smoothing_target(valid, smoothing)
+        nll = (1.0 - smoothing) * nll - smoothing * (uniform * logp).sum(dim=1)
+    ce, total = masked_mean(nll, m)
     prob = logits.softmax(dim=1)
     k = torch.arange(logits.shape[1], device=logits.device, dtype=prob.dtype)
     distance = (prob * (k[None, :] - safe[:, None].to(prob.dtype)).abs()).sum(dim=1)
@@ -72,7 +86,7 @@ def ladder_losses(logits, valid, target, mask):
 
 class SixParamLoss(nn.Module):
     def __init__(self, class_weights, norm, weights=None, borderline_weight=0.5,
-                 uncertainty_weighting=False):
+                 uncertainty_weighting=False, frontend_label_smoothing=0.0):
         super().__init__()
         self.weights = dict(DEFAULT_WEIGHTS)
         if weights:
@@ -81,6 +95,7 @@ class SixParamLoss(nn.Module):
             self.register_buffer("cw_" + key, torch.as_tensor(value, dtype=torch.float32), persistent=False)
         self.norm = dict(norm)
         self.borderline_weight = float(borderline_weight)
+        self.smoothing = float(frontend_label_smoothing)
         self.uncertainty_weighting = bool(uncertainty_weighting)
         if self.uncertainty_weighting:
             self.log_vars = nn.ParameterDict({t: nn.Parameter(torch.zeros(())) for t in TASKS})
@@ -116,23 +131,29 @@ class SixParamLoss(nn.Module):
 
         # 深度
         terms["depth_cls"], terms["depth_ord"], counts["depth"] = ladder_losses(
-            out["depth_logits"], tg["depth_valid"], tg["optimal_depth_idx"], tg["depth_mask"])
-        terms["depth_dir"], _ = weighted_ce(out["depth_dir"], tg["depth_dir"], tg["depth_mask"], self.cw("depth_dir"))
+            out["depth_logits"], tg["depth_valid"], tg["optimal_depth_idx"], tg["depth_mask"], self.smoothing)
+        terms["depth_dir"], _ = weighted_ce(out["depth_dir"], tg["depth_dir"], tg["depth_mask"], self.cw("depth_dir"),
+                                            self.smoothing)
 
         # 频率：可接受集合
         f_logits = masked_logits(out["frequency_logits"], tg["frequency_valid"])
         accept = masked_logits(out["frequency_logits"], tg["frequency_acceptable"])
         nll = torch.logsumexp(f_logits, dim=1) - torch.logsumexp(accept, dim=1)
+        if self.smoothing > 0:
+            logp = F.log_softmax(f_logits, dim=1)
+            uniform = smoothing_target(tg["frequency_valid"], self.smoothing)
+            nll = (1.0 - self.smoothing) * nll - self.smoothing * (uniform * logp).sum(dim=1)
         f_weight = (tg["frequency_mask"] * tg["frequency_weight"]
                     * (1.0 - tg["frequency_borderline"] * (1.0 - self.borderline_weight)))
         terms["frequency_cls"], counts["frequency"] = masked_mean(nll, f_weight)
         terms["frequency_dir"], _ = weighted_ce(out["frequency_dir"], tg["frequency_dir"], tg["frequency_mask"],
-                                                self.cw("frequency_dir"))
+                                                self.cw("frequency_dir"), self.smoothing)
 
         # 聚焦
         terms["focus_cls"], terms["focus_ord"], counts["focus"] = ladder_losses(
-            out["focus_logits"], tg["focus_valid"], tg["optimal_focus_idx"], tg["focus_mask"])
-        terms["focus_dir"], _ = weighted_ce(out["focus_dir"], tg["focus_dir"], tg["focus_mask"], self.cw("focus_dir"))
+            out["focus_logits"], tg["focus_valid"], tg["optimal_focus_idx"], tg["focus_mask"], self.smoothing)
+        terms["focus_dir"], _ = weighted_ce(out["focus_dir"], tg["focus_dir"], tg["focus_mask"], self.cw("focus_dir"),
+                                            self.smoothing)
 
         # 动态范围（目前无定出的标签，两项恒为 0）
         terms["dr_reg"], counts["dynamic_range"] = masked_mean(

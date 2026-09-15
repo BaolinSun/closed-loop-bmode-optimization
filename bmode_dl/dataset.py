@@ -143,9 +143,26 @@ class FieldIIData(object):
         tr = torch.as_tensor(train_idx, device=self.device)
         att = self.t["attenuation_db_cm_mhz"][tr]
         noise = self.t["electronic_noise_db"][tr]
-        return {"db_mean": db_mean, "db_std": db_std,
-                "att_mean": float(att.mean()), "att_std": float(att.std().clamp(min=1e-3)) if len(tr) > 1 else 1.0,
-                "noise_mean": float(noise.mean()), "noise_std": float(noise.std().clamp(min=1e-3)) if len(tr) > 1 else 1.0}
+        # 最优增益（dB，相对 reference_db）与最优 TGC 曲线（各段 (档位-127)*dB/级）的均值方差，
+        # 供 optimum 输出方式标准化；下限避免体模很少时方差过小把输出放大
+        backend = tr[self.t["backend_mask"][tr] > 0]
+        if len(backend) > 1:
+            opt_gain = self.t["optimal_gain_db"][backend]
+            slope = torch.where(self.t["mode"][backend] > 0.5,
+                                torch.full_like(opt_gain, K.TGC_DB_PER_LEVEL[K.MODE_HARMONIC]),
+                                torch.full_like(opt_gain, K.TGC_DB_PER_LEVEL[K.MODE_FUNDAMENTAL]))
+            opt_tgc_db = (self.t["optimal_tgc_levels"][backend] - K.TGC_CENTER_LEVEL) * slope[:, None]
+            opt = {"opt_gain_mean": float(opt_gain.mean()), "opt_gain_std": float(opt_gain.std().clamp(min=0.1)),
+                   "opt_tgc_db_mean": [float(v) for v in opt_tgc_db.mean(dim=0)],
+                   "opt_tgc_db_std": [float(v) for v in opt_tgc_db.std(dim=0).clamp(min=0.5)]}
+        else:
+            opt = {"opt_gain_mean": 0.0, "opt_gain_std": 1.0,
+                   "opt_tgc_db_mean": [0.0] * K.NUM_TGC_BANDS, "opt_tgc_db_std": [1.0] * K.NUM_TGC_BANDS}
+        out = {"db_mean": db_mean, "db_std": db_std,
+               "att_mean": float(att.mean()), "att_std": float(att.std().clamp(min=1e-3)) if len(tr) > 1 else 1.0,
+               "noise_mean": float(noise.mean()), "noise_std": float(noise.std().clamp(min=1e-3)) if len(tr) > 1 else 1.0}
+        out.update(opt)
+        return out
 
     def class_weights(self, train_idx, redraws=16, seed=0, power=0.5):
         """方向类别权重 = (频数的倒数)^power，按训练集归一化；未出现的类别权重 0。

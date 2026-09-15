@@ -74,18 +74,19 @@ python tools_build_fieldii_training_cache.py --workers 8
 # 2. 检查（可选，CPU 上约 1 分钟；需要 bmode_opt 与 data/labels_fieldii.jsonl）
 python tests/verify_six_param_model.py
 
-# 3. 4 折交叉验证
-python tools_train_six_param.py --fold all --amp --name fieldii_v1
+# 3. 4 折交叉验证（默认即第 7 节的改动后配置）
+python tools_train_six_param.py --fold all --amp --name fieldii_v2
 
-# 4. 评估
-python tools_evaluate_six_param.py --run runs/fieldii_v1 --amp
+# 4. 评估（每折默认用 best_frontend.pt + best_backend.pt 组合；--select best 只用 best.pt）
+python tools_evaluate_six_param.py --run runs/fieldii_v2 --amp
 
 # 5. 对照实验
 python tools_train_six_param.py --fold all --amp --input-mode no_image --name fieldii_no_image
 python tools_train_six_param.py --fold all --amp --no-noise-floor --name fieldii_no_floor
 
 # 6. 全部体模训练（做实机微调的起点）
-python tools_train_six_param.py --fold none --epochs 150 --amp --name fieldii_v1_all
+# --frontend-epoch 取第 3 步汇总里报告的前端最佳轮次中位数；后端用 last.pt
+python tools_train_six_param.py --fold none --epochs 150 --frontend-epoch 30 --amp --name fieldii_v2_all
 ```
 
 服务器上要拷贝：`bmode_dl/`、`tools_train_six_param.py`、`tools_evaluate_six_param.py`、`data/labels_fieldii.jsonl`、`data/fieldii_dl_cache/`。第 1、2 步另需 `bmode_opt/` 与 `data/field_ii/full_noise/hdf5/`。
@@ -97,3 +98,15 @@ python tools_train_six_param.py --fold none --epochs 150 --amp --name fieldii_v1
 3. 动态范围头没有监督，输出无意义，直到定出判据。
 4. 增益"正确"只占约 3%；闭环以数值修正量加固定死区作停止判据。
 5. 闭环里的停止死区用固定 0.5 级（实机没有逐帧死区），评判用各分片标签自己的死区。
+
+## 7. 修改记录：fieldii_v1 训练日志分析之后（2026-09-15）
+
+`runs/fieldii_v1` 的 4 折结果与只看设置的查表基线相比：TGC、频率明显更好；增益反而更差（平均绝对误差 0.39 对 0.22 dB）；深度与查表持平。前端训练损失降到 0.001 量级、验证在第 10–40 轮见顶，后端到第 150 轮仍在变好。据此改了三处，默认值即新配置：
+
+| 改动 | 做法 | 恢复旧行为 |
+|---|---|---|
+| 增益 / TGC 改为预测最优值 | 网络输出最优增益（dB，相对 reference_db）与 8 段最优 TGC（dB），按训练集均值方差标准化，末层置零（起点即训练集均值）；修正量 = 最优 − 当前，在网络外精确相减。损失、指标、闭环不变 | `--backend-output delta` |
+| 前后端分开选检查点 + 前端正则 | 每次验证按综合、后端（增益方向 F1、滑块方向 F1）、前端（深度、频率、聚焦准确率）三个分数分别保存 `best.pt` / `best_backend.pt` / `best_frontend.pt`；评估默认用 `bmode_dl.checkpoint.CombinedModel` 组合两者。前端头丢弃率 0.3、标签平滑 0.1（只摊到可选档）。`--fold none` 时用 `--frontend-epoch` 另存 `frontend.pt` | `--frontend-dropout 0.1 --frontend-label-smoothing 0`；评估 `--select best` |
+| metrics.csv 保留全部指标 | 每轮按所有轮次列的并集重写；列表型指标展开为 `_0.._n` | — |
+
+旧检查点（没有 `backend_output` 字段）仍按 delta 方式载入，`tests/verify_six_param_model.py` 检查 `runs/fieldii_v1/fold_0/best.pt` 严格载入。组合模型的交叉验证数字与 `best.pt` 一样是在验证体模上选轮次，偏乐观。
