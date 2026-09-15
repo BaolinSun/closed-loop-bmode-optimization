@@ -1,0 +1,79 @@
+{
+  "labels_backend.jsonl": {
+    "sources": {
+      "console": {
+        "rows": 286,
+        "groups": 16,
+        "split": {
+          "None": 286
+        },
+        "dr_determined": 0,
+        "frontend_labels": {
+          "depth": 0,
+          "frequency": 0,
+          "focus": 0
+        },
+        "gain_direction": {
+          "correct": 79,
+          "bright": 102,
+          "dark": 105
+        }
+      },
+      "fieldii": {
+        "rows": 4560,
+        "groups": 60,
+        "split": {
+          "test": 912,
+          "train": 2736,
+          "val": 912
+        },
+        "dr_determined": 0,
+        "frontend_labels": {
+          "depth": 0,
+          "frequency": 0,
+          "focus": 0
+        },
+        "gain_direction": {
+          "dark": 2490,
+          "bright": 1938,
+          "correct": 132
+        }
+      }
+    },
+    "sha256": "ca9cacd5aa09bacc13a000486230e56fb7ff3509e869348a9adf5fd9403a541e"
+  },
+  "labels_console.jsonl": {
+    "sources": {
+      "console": {
+        "rows": 422,
+        "groups": 20,
+        "split": {
+          "None": 422
+        },
+        "dr_determined": 0,
+        "frontend_labels": {
+          "depth": 264,
+          "frequency": 242,
+          "focus": 163
+        },
+        "gain_direction": {
+          "correct": 135,
+          "bright": 135,
+          "dark": 152
+        }
+      }
+    },
+    "sha256": "4edb76910ea3ee5a15a93454ec38645188a88dc062713f0f6e3573f0571933b6"
+  },
+  "backend_console_overlap": 286,
+  "fieldii_h5_dirs": {
+    "data\\field_ii\\full\\hdf5": 4560,
+    "data\\field_ii\\full\\phantom": 60
+  },
+  "fieldii_label_missing_shards": [],
+  "h5_noise_and_shape": {
+    "('0', '(128, 1851)')": 4560
+  },
+  "console_captures": 427,
+  "console_backend_condition_groups": 222
+}
