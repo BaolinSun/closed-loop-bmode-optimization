@@ -159,9 +159,13 @@ SPECKLE_CLIP_FACTOR = 4.0
 # 组织要高出噪声底这么多才算可用。比穿透判据的 3 dB 严得多：自相关宽度比电平更早
 # 被噪声污染，噪声横向不相关，掺进来会把宽度压窄，看着像「分辨率极好」。
 SPECKLE_MARGIN_DB = 12.0
-# 宽度窄到线间距的这个倍数以下判为噪声。这个阈值按实机 0.1488 mm/线定；Field II
-# 线距 0.225 mm，聚焦良好的波束本身就会窄于它，届时必须放宽，见 2026-09-13 分析。
+# 宽度窄到线间距的这个倍数以下判为噪声。实机按 0.1488 mm/线定为 1.5。
 SPECKLE_NOISE_WIDTH_LINES = 1.5
+# Field II（0.225 mm/线，无后处理）另用一个值。tests/measure_fieldii_noise_floor.py 于
+# 2026-09-15 实测：纯噪声带宽度 0.50 线（最大 0.54），高出底噪 12 dB 以上的组织带最窄
+# 0.90 线（8 MHz）。取两者之间 0.75。沿用实机的 1.5 会丢掉 24.6% 的真实组织带——聚焦
+# 良好的高频波束正是被丢掉的那部分，聚焦判据会因此偏向散焦的档位。
+FIELDII_SPECKLE_NOISE_WIDTH_LINES = 0.75
 
 
 def lateral_speckle_width_mm(envelope, mm_per_line):
@@ -190,9 +194,16 @@ def lateral_speckle_width_mm(envelope, mm_per_line):
                  * mm_per_line)
 
 
-def band_speckle_widths(db_image, geometry, noise_floor_db):
-    """一帧逐深度带的侧向宽度 {带中心 mm: 宽度 mm}。噪声带与被下边缘截断的带不报。"""
+def band_speckle_widths(db_image, geometry, noise_floor_db,
+                        noise_width_lines=SPECKLE_NOISE_WIDTH_LINES):
+    """一帧逐深度带的侧向宽度 {带中心 mm: 宽度 mm}。噪声带与被下边缘截断的带不报。
+
+    noise_floor_db 可以是标量（实机：接收机底噪不随深度变），也可以是逐行数组（Field II：
+    接收孔径随深度变大，底噪随深度下降，见 fieldii_noise）。
+    """
     db_image = np.asarray(db_image, dtype=np.float64)
+    floor_rows = np.broadcast_to(np.asarray(noise_floor_db, dtype=np.float64),
+                                 (db_image.shape[0],))
     depth = (geometry.min_depth_mm
              + (np.arange(geometry.num_points) + 0.5) * geometry.mm_per_point)
     envelope = 10.0 ** (db_image / 20.0)
@@ -204,12 +215,12 @@ def band_speckle_widths(db_image, geometry, noise_floor_db):
         mask = (depth >= low) & (depth < high)
         if mask.sum() < 8:
             continue
-        if np.median(db_image[mask, :]) < noise_floor_db + SPECKLE_MARGIN_DB:
+        if np.median(db_image[mask, :]) < float(floor_rows[mask].mean()) + SPECKLE_MARGIN_DB:
             continue
         width = lateral_speckle_width_mm(envelope[mask, :], geometry.mm_per_line)
         if not np.isfinite(width):
             continue
-        if width < SPECKLE_NOISE_WIDTH_LINES * geometry.mm_per_line:
+        if width < noise_width_lines * geometry.mm_per_line:
             continue
         out[round(float(low + SPECKLE_BAND_MM / 2.0), 2)] = width
     return out

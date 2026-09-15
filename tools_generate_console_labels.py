@@ -385,6 +385,10 @@ def optimum_depth(members, measured):
     mode = members[0][1][0]
     swept = sorted({s[AXIS_INDEX["depth_mm"]] for _, s in members})
     ladder = CONSOLE_LADDERS.get((mode, "depth_mm")) or swept
+    # 聚焦不能比显示深度深：主机的聚焦阶梯随显示深度移动（25.1 mm 下只到 25 mm），Field II
+    # 也只生成聚焦 <= 深度的组合。比这更浅的深度档对当前聚焦不存在，不能当候选。
+    focus = members[0][1][AXIS_INDEX["focus_mm"]]
+    ladder = [v for v in ladder if v >= focus - 0.05] or ladder
     frames = [measured[name] for name, _ in members]
     evaluated = []
     for value in ladder:

@@ -93,14 +93,21 @@ def capture_image_mode(capture):
     return int(get_leaf(capture.fe_params, "BImageMode"))
 
 
-def fieldii_tissue_mask(capture, exclusion_mm=POINT_TARGET_EXCLUSION_MM):
+def fieldii_tissue_mask(capture, exclusion_mm=POINT_TARGET_EXCLUSION_MM, floor_db=None,
+                        margin_db=DEFAULT_TISSUE_MARGIN_DB):
     """Tissue pixels of a Field II shard, from the phantom's own structure.
 
     Tissue is everything the truth mask marks zero, minus a neighbourhood of each point
-    target. No noise floor enters: the shards are generated with noise_enabled=0, so every
-    row down to the last one carries echo, and thresholding would only remove deep tissue.
+    target. For shards generated with noise (data/field_ii/full_noise) pass floor_db, the
+    per-row floor from fieldii_noise.noise_floor_db: pixels less than margin_db above it are
+    noise, not tissue, exactly as console_tissue_mask treats console frames. Without it the
+    mask counts noise as tissue, and on the 2026-09-13 analysis that moved the gain label on
+    8 MHz shards by up to 8.6 dB. The old noiseless shards need no floor.
     """
     mask = np.asarray(capture.truth_mask, dtype=np.uint8) == 0
+    if floor_db is not None:
+        floor = np.asarray(floor_db, dtype=np.float64).reshape(-1, 1)
+        mask &= np.asarray(capture.db_image, dtype=np.float64) > floor + float(margin_db)
     targets = np.asarray(capture.point_targets_mm, dtype=np.float64)
     if targets.size == 0:
         return mask

@@ -14,7 +14,9 @@
 
 三、【覆盖】每根轴有多少帧定得出、落在哪些场次，以及后端标签因底噪修正变了多少。
 
-用法：python tests/verify_console_labels.py
+用法：python tests/verify_console_labels.py [标签文件]
+      不给参数检查 data/labels_console.jsonl；给 data/labels_fieldii.jsonl 检查 Field II 标签
+      （第 4 节只对实机文件有意义，Field II 文件跳过）。
 """
 
 import collections
@@ -46,8 +48,9 @@ def main():
     lines = []
     emit = lines.append
     failures = []
-    rows = [json.loads(l) for l in io.open(LABELS, encoding="utf-8")]
-    emit(u"%d rows in %s" % (len(rows), LABELS))
+    labels = sys.argv[1] if len(sys.argv) > 1 else LABELS
+    rows = [json.loads(l) for l in io.open(labels, encoding="utf-8")]
+    emit(u"%d rows in %s" % (len(rows), labels))
 
     emit(u"")
     emit(u"=========== 1. arithmetic and logic ===========")
@@ -176,7 +179,7 @@ def main():
                 sum(r["frequency_determined"] for r in rs),
                 sum(r["focus_determined"] for r in rs), len(rs)))
 
-    if os.path.exists(OLD_LABELS):
+    if os.path.exists(OLD_LABELS) and labels == LABELS:
         old = {json.loads(l)["frame_id"]: json.loads(l)
                for l in io.open(OLD_LABELS, encoding="utf-8") if '"console"' in l}
         shared = [r for r in rows if r["frame_id"] in old]
@@ -205,7 +208,9 @@ def main():
         emit(u"  all checks pass")
 
     text = "\n".join(lines)
-    out = os.path.join(os.path.dirname(os.path.abspath(__file__)), "verify_console_labels.txt")
+    out = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                       "verify_console_labels.txt" if labels == LABELS else
+                       "verify_%s.txt" % os.path.splitext(os.path.basename(labels))[0])
     io.open(out, "w", encoding="utf-8").write(text)
     print(text)
     return 1 if failures else 0
