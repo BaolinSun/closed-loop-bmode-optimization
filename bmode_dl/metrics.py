@@ -9,6 +9,19 @@
 综合分数 score = 平均(增益方向 F1[derived], 三组滑块方向 F1[derived], 深度最优档准确率,
                      频率可接受集合命中率, 聚焦最优档准确率)。动态范围无标签，不计入。
 backend_score = 前两项平均；frontend_score = 后三项平均。
+
+    近最优帧（*_near）
+
+fieldii_v2 的闭环停点几乎都落在判据门槛附近：聚焦单步准确率 0.86，而停点上只有 0.50。原因是
+单步指标里多数起点离最优很远、很好判断，闭环停点却总在"再调一档还是就停"的边界上。所以另报一套
+只统计当前设置与最优相差不超过 1 档的帧的指标（*_near），frontend_score_near 用来选前端检查点。
+
+    档位决策方式
+
+argmax    取概率最大的档
+expected  取概率分布的期望档位、再取最近的可选档。分布偏向一侧时期望值会跟着偏，
+          可以看出 fieldii_v2 深度、聚焦系统性偏浅（平均 +0.4 档）是不是纯粹由 argmax 造成的。
+两种都算，指标里以 argmax 为准、expected 的结果以 *_expected 报告。
 """
 
 from collections import defaultdict
@@ -62,6 +75,24 @@ def direction_from_index_np(pred_idx, current_idx):
     return np.where(pred_idx > current_idx, 0, np.where(pred_idx == current_idx, 1, 2))
 
 
+def nearest_valid_index(target, valid):
+    """离 target（可以是小数）最近的可选档下标。target (B,)，valid (B, K)。"""
+    k = torch.arange(valid.shape[1], device=valid.device, dtype=torch.float32)
+    distance = (k[None, :] - target[:, None]).abs()
+    distance = distance.masked_fill(valid <= 0, float("inf"))
+    return distance.argmin(dim=1)
+
+
+def ladder_decision(logits, valid, mode="argmax"):
+    """(预测档下标, 概率)。mode="expected" 时取期望档位再取最近的可选档。"""
+    masked = masked_logits(logits, valid)
+    prob = masked.softmax(dim=1)
+    if mode == "expected":
+        k = torch.arange(prob.shape[1], device=prob.device, dtype=prob.dtype)
+        return nearest_valid_index((prob * k[None, :]).sum(dim=1).float(), valid), prob
+    return masked.argmax(dim=1), prob
+
+
 # ---------------------------------------------------------------------------------------
 #   网络预测
 
@@ -86,21 +117,26 @@ def predict(model, data, builder, idx, start="label", seed=None, batch_size=64, 
 
 
 def decode(out, tg):
-    """网络输出 -> 可执行的建议。tg 只用到可选档位掩膜（推理时按设备的档位表给出）。"""
-    return {
+    """网络输出 -> 可执行的建议。tg 只用到可选档位掩膜（推理时按设备的档位表给出）。
+
+    前端三轴同时给出 argmax 档、期望档（*_idx_expected）与整条概率（*_prob，闭环的滞回要用）。
+    """
+    decoded = {
         "gain_delta_db": out["gain_delta_db"].float(),
         "gain_dir_head": out["gain_dir"].argmax(dim=1),
         "tgc_delta_db": out["tgc_delta_db"].float(),
         "slider_dir_head": out["slider_dir"].argmax(dim=2),
-        "depth_idx": masked_logits(out["depth_logits"], tg["depth_valid"]).argmax(dim=1),
         "depth_dir_head": out["depth_dir"].argmax(dim=1),
-        "frequency_idx": masked_logits(out["frequency_logits"], tg["frequency_valid"]).argmax(dim=1),
         "frequency_dir_head": out["frequency_dir"].argmax(dim=1),
-        "focus_idx": masked_logits(out["focus_logits"], tg["focus_valid"]).argmax(dim=1),
         "focus_dir_head": out["focus_dir"].argmax(dim=1),
         "dr_delta_ui": out["dr_delta_ui"].float(),
         "aux": out["aux"].float(),
     }
+    for axis in ("depth", "frequency", "focus"):
+        logits, valid = out["%s_logits" % axis], tg["%s_valid" % axis]
+        decoded["%s_idx" % axis], decoded["%s_prob" % axis] = ladder_decision(logits, valid, "argmax")
+        decoded["%s_idx_expected" % axis], _ = ladder_decision(logits, valid, "expected")
+    return decoded
 
 
 # ---------------------------------------------------------------------------------------
@@ -204,16 +240,37 @@ def compute_metrics(preds, tg, norm=None):
             continue
         pred = preds["%s_idx" % axis][mask]
         target = tg["optimal_%s_idx" % axis][mask]
+        current = tg["%s_idx" % axis][mask]
         m["%s_top1" % axis] = accuracy(target, pred)
         m["%s_within1" % axis] = float((np.abs(pred - target) <= 1).mean())
-        derived = direction_from_index_np(pred, tg["%s_idx" % axis][mask])
+        m["%s_mean_signed_steps" % axis] = float(np.mean(target - pred))     # 正数 = 网络偏小（偏浅）
+        derived = direction_from_index_np(pred, current)
         m["%s_dir_acc_derived" % axis] = accuracy(tg["%s_dir" % axis][mask], derived)
         m["%s_dir_f1_derived" % axis] = macro_f1(tg["%s_dir" % axis][mask], derived)
         if "%s_dir_head" % axis in preds:
             m["%s_dir_f1_head" % axis] = macro_f1(tg["%s_dir" % axis][mask], preds["%s_dir_head" % axis][mask])
-        if axis == "frequency":
-            accept = tg["frequency_acceptable"][mask]
+        accept = tg["frequency_acceptable"][mask] if axis == "frequency" else None
+        if accept is not None:
             m["frequency_hit"] = float(accept[np.arange(len(pred)), pred].mean())
+
+        # 近最优帧：当前设置与最优相差不超过 1 档，闭环停点就落在这一带
+        near = np.abs(current - target) <= 1
+        m["%s_n_near" % axis] = int(near.sum())
+        if near.any():
+            if accept is not None:
+                m["frequency_hit_near"] = float(accept[near][np.arange(int(near.sum())), pred[near]].mean())
+            else:
+                m["%s_top1_near" % axis] = accuracy(target[near], pred[near])
+            m["%s_mean_signed_steps_near" % axis] = float(np.mean(target[near] - pred[near]))
+
+        # 期望档决策，用来判断偏浅是不是 argmax 造成的
+        if "%s_idx_expected" % axis in preds:
+            expected = preds["%s_idx_expected" % axis][mask]
+            if accept is not None:
+                m["frequency_hit_expected"] = float(accept[np.arange(len(expected)), expected].mean())
+            else:
+                m["%s_top1_expected" % axis] = accuracy(target, expected)
+            m["%s_mean_signed_steps_expected" % axis] = float(np.mean(target - expected))
 
     m["dynamic_range_n"] = int((tg["dr_mask"] > 0).sum())
     if "aux" in preds and norm is not None and (tg["aux_mask"] > 0).any():
@@ -231,6 +288,8 @@ def compute_metrics(preds, tg, norm=None):
     m["score"] = mean_of(BACKEND_SCORE_KEYS + FRONTEND_SCORE_KEYS)
     m["backend_score"] = mean_of(BACKEND_SCORE_KEYS)
     m["frontend_score"] = mean_of(FRONTEND_SCORE_KEYS)
+    m["frontend_score_near"] = mean_of(FRONTEND_SCORE_NEAR_KEYS)
+    m["frontend_score_expected"] = mean_of(FRONTEND_SCORE_EXPECTED_KEYS)
     return m
 
 
@@ -238,6 +297,9 @@ def compute_metrics(preds, tg, norm=None):
 # 训练脚本按这两个分数分别保存 best_frontend.pt / best_backend.pt
 BACKEND_SCORE_KEYS = ("gain_dir_f1_derived", "slider_dir_f1_derived")
 FRONTEND_SCORE_KEYS = ("depth_top1", "frequency_hit", "focus_top1")
+# 近最优帧上的同样三项：闭环停点都在这一带，选前端检查点默认看它
+FRONTEND_SCORE_NEAR_KEYS = ("depth_top1_near", "frequency_hit_near", "focus_top1_near")
+FRONTEND_SCORE_EXPECTED_KEYS = ("depth_top1_expected", "frequency_hit_expected", "focus_top1_expected")
 
 
 def flatten_metrics(m, prefix=""):
@@ -254,9 +316,15 @@ def flatten_metrics(m, prefix=""):
     return flat
 
 
-MAIN_KEYS = ("score", "backend_score", "frontend_score", "gain_mae_db", "gain_within_deadband", "gain_dir_f1_derived", "tgc_mae_db",
-             "slider_dir_f1_derived", "depth_top1", "depth_within1", "depth_dir_f1_derived",
-             "frequency_hit", "frequency_dir_f1_derived", "focus_top1", "focus_within1", "focus_dir_f1_derived")
+MAIN_KEYS = ("score", "backend_score", "frontend_score", "frontend_score_near", "gain_mae_db", "gain_within_deadband", "gain_dir_f1_derived", "tgc_mae_db",
+             "slider_dir_f1_derived", "depth_top1", "depth_top1_near", "depth_within1", "depth_dir_f1_derived",
+             "frequency_hit", "frequency_hit_near", "frequency_dir_f1_derived", "focus_top1", "focus_top1_near",
+             "focus_within1", "focus_dir_f1_derived")
+
+NEAR_KEYS = ("frontend_score_near", "depth_top1_near", "frequency_hit_near", "focus_top1_near",
+             "depth_mean_signed_steps_near", "focus_mean_signed_steps_near")
+EXPECTED_KEYS = ("frontend_score_expected", "depth_top1_expected", "frequency_hit_expected",
+                 "focus_top1_expected", "depth_mean_signed_steps_expected", "focus_mean_signed_steps_expected")
 
 
 def format_metrics(m, keys=MAIN_KEYS):

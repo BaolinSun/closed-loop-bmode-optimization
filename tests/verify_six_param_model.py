@@ -7,13 +7,15 @@
   3. 用 labels_fieldii.jsonl 记录的起点重算 delta 与方向，与记录值一致；重抽起点落在 draw_start 的范围内。
   4. 合成缓存上的端到端冒烟：三种输入模式前向 + 反向、无定出标签时损失为 0、检查点存取、
      训练脚本 1 个 epoch、评估脚本（单步 + 查表基线 + 闭环）。
-  5. 训练日志分析后的三处改动：optimum 后端输出（最优值 - 当前值的算术、零初始化起点、旧检查点仍能载入）、
+  5. fieldii_v1 日志分析后的改动：optimum 后端输出（最优值 - 当前值的算术、零初始化起点、旧检查点仍能载入）、
      前端标签平滑、前后端分开的检查点与组合模型、metrics.csv 保留全部验证指标。
+  6. fieldii_v2 日志分析后的改动：近最优帧指标与期望档决策、闭环的滞回与打转冻结、逐步路径记录。
 
 用法：python tests/verify_six_param_model.py [--labels data/labels_fieldii.jsonl] [--skip-scripts]
 """
 
 import argparse
+import collections
 import csv
 import io
 import json
@@ -37,7 +39,7 @@ from bmode_dl.checkpoint import (FRONTEND_OUTPUT_KEYS, CombinedModel, load_check
 from bmode_dl.closed_loop import run_closed_loop
 from bmode_dl.dataset import FieldIIData, InputBuilder, make_batch, read_jsonl
 from bmode_dl.losses import SixParamLoss
-from bmode_dl.metrics import compute_metrics, predict, settings_lookup_baseline
+from bmode_dl.metrics import compute_metrics, format_metrics, predict, settings_lookup_baseline
 from bmode_dl.model import count_parameters
 from bmode_dl.render import BackendRenderer, row_positions, tgc_interp_matrix
 from bmode_dl.render import band_centres as dl_band_centres
@@ -237,6 +239,140 @@ def check_backend_output_and_smoothing(data, norm, cw, inputs, tg):
             check("fieldii_v1 checkpoint still loads (strict state dict)", False, repr(exc)[:200])
 
 
+class Oscillator(torch.nn.Module):
+    """假模型：深度在最浅两档之间来回要，频率与聚焦保持不变，增益永远说还差 5 dB。
+
+    用来走通闭环的打转分支——真模型在合成缓存上不一定打转。
+    """
+
+    def __init__(self, ladders):
+        super().__init__()
+        self.ladders = ladders
+
+    def _current(self, values, ladder):
+        table = torch.tensor(ladder, dtype=torch.float32)
+        return (values[:, None] - table[None, :]).abs().argmin(dim=1)
+
+    def forward(self, inputs):
+        s = inputs["scalars"].float()
+        b = s.shape[0]
+        depth = self._current(s[:, 0] * 60.0, self.ladders["depth_mm"])
+        frequency = self._current(s[:, 1] * 8.0, self.ladders["frequency_mhz"])
+        focus = self._current(s[:, 2] * 40.0, self.ladders["focus_mm"])
+        wanted_depth = torch.where(depth == 0, torch.ones_like(depth), torch.zeros_like(depth))
+        one_hot = lambda idx, n: torch.nn.functional.one_hot(idx, n).float() * 10.0
+        return {
+            "gain_delta_db": torch.full((b,), 5.0),
+            "gain_dir": torch.zeros(b, 3),
+            "tgc_delta_db": torch.zeros(b, K.NUM_TGC_BANDS),
+            "slider_dir": torch.zeros(b, len(K.SLIDER_GROUPS), 3),
+            "depth_logits": one_hot(wanted_depth, len(self.ladders["depth_mm"])),
+            "depth_dir": torch.zeros(b, 3),
+            "frequency_logits": one_hot(frequency, len(self.ladders["frequency_mhz"])),
+            "frequency_dir": torch.zeros(b, 3),
+            "focus_logits": one_hot(focus, len(self.ladders["focus_mm"])),
+            "focus_dir": torch.zeros(b, 3),
+            "dr_delta_ui": torch.zeros(b),
+            "dr_dir": torch.zeros(b, 3),
+            "aux": torch.zeros(b, 2),
+        }
+
+
+def check_near_metrics_and_hysteresis(data, builder, model, norm, val_idx, preds, tg):
+    """近最优帧指标、期望档决策、闭环滞回与打转冻结、逐步路径。"""
+    metrics = compute_metrics(preds, tg, norm)
+    near_keys = ["frontend_score_near", "depth_top1_near", "frequency_hit_near", "focus_top1_near"]
+    missing = [k for k in near_keys if k not in metrics or not np.isfinite(metrics[k])]
+    check("near-optimum metrics computed", not missing,
+          "n_near depth %s frequency %s focus %s; missing %s"
+          % (metrics.get("depth_n_near"), metrics.get("frequency_n_near"), metrics.get("focus_n_near"), missing))
+    # 近最优帧确实是当前设置与最优相差不超过 1 档的那些帧
+    hand = {}
+    for axis in ("depth", "frequency", "focus"):
+        mask = (tg["%s_mask" % axis] > 0) & (tg["optimal_%s_idx" % axis] >= 0)
+        near = np.abs(tg["%s_idx" % axis][mask] - tg["optimal_%s_idx" % axis][mask]) <= 1
+        hand[axis] = int(near.sum())
+    check("near-optimum frame counts match a hand count",
+          all(metrics["%s_n_near" % a] == hand[a] for a in hand), str(hand))
+    check("expected-step decision reported",
+          all(k in metrics for k in ("depth_top1_expected", "frequency_hit_expected", "focus_top1_expected")))
+    probs_ok = all(np.allclose(preds["%s_prob" % a].sum(axis=1), 1.0, atol=1e-4)
+                   for a in ("depth", "frequency", "focus"))
+    valid_ok = all(float(preds["%s_prob" % a][tg["%s_valid" % a] <= 0].max(initial=0.0)) < 1e-3
+                   for a in ("depth", "frequency", "focus"))
+    check("ladder probabilities sum to 1 and avoid unavailable steps", probs_ok and valid_ok)
+
+    # 滞回：余量给到 1.0 时前端永远不动，轨迹只做后端修正
+    summary, records = run_closed_loop(model, data, builder, val_idx[:24], max_steps=3, batch_size=24,
+                                       frontend_margin=1.0)
+    check("hysteresis of 1.0 stops every front-end change",
+          all(r["frontend_moves"] == 0 for r in records) and summary["oscillated"] == 0.0,
+          "backend moves %s" % sorted(set(r["backend_moves"] for r in records)))
+
+    summary, records = run_closed_loop(model, data, builder, val_idx[:24], max_steps=6, batch_size=24,
+                                       frontend_margin=0.0, freeze_on_revisit=True)
+    path_ok = all(r["path"][0]["action"] == "start" and len(r["path"]) >= 1 for r in records)
+    actions = collections.Counter(p["action"] for r in records for p in r["path"])
+    check("every trajectory records a step-by-step path", path_ok, str(dict(actions)))
+    # 一次前端改动可以同时动两三轴，所以各轴改档次数之和 >= 前端改动次数，每一轴 <= 前端改动次数
+    consistent = [(sum(r["axis_changes"].values()) >= r["frontend_moves"])
+                  and all(v <= r["frontend_moves"] for v in r["axis_changes"].values())
+                  and (r["frontend_moves"] > 0 or sum(r["axis_changes"].values()) == 0)
+                  for r in records]
+    check("axis_changes is consistent with frontend_moves", all(consistent),
+          "axes changed per move %s" % sorted(set(sum(r["axis_changes"].values()) for r in records)))
+    frozen = [r for r in records if r["frozen"]]
+    after_freeze_ok = True
+    for r in frozen:
+        seen_freeze = False
+        for step in r["path"]:
+            if step["action"] == "freeze":
+                seen_freeze = True
+            elif seen_freeze and step["action"] == "frontend":
+                after_freeze_ok = False
+    check("no front-end change after the freeze", after_freeze_ok, "frozen %d / %d trajectories" % (len(frozen), len(records)))
+    check("closed-loop summary reports the new fields",
+          all(k in summary for k in ("frozen_frontend", "final_frontend_all_within1", "final_depth_mean_signed_steps")),
+          format_metrics(summary, ("converged", "oscillated", "frozen_frontend", "final_frontend_all_within1")))
+
+    summary_expected, _ = run_closed_loop(model, data, builder, val_idx[:24], max_steps=3, batch_size=24,
+                                          decision="expected")
+    check("closed loop runs with the expected-step decision", summary_expected["trajectories"] == 24)
+
+    # 真正走一遍打转分支：这个假模型在最浅两档深度之间来回要，并且一直说增益偏暗
+    summary, records = run_closed_loop(Oscillator(data.ladders), data, builder, val_idx[:16], max_steps=6,
+                                       batch_size=16, frontend_margin=0.1, freeze_on_revisit=True)
+    frozen = [r for r in records if r["frozen"]]
+    after_freeze = []
+    for r in records:
+        seen = False
+        for step in r["path"]:
+            seen = seen or step["action"] == "freeze"
+            if seen and step["action"] == "frontend":
+                after_freeze.append(r)
+                break
+    check("an oscillating model is detected and frozen, then only the back end moves",
+          len(frozen) == len(records) and summary["oscillated"] == 1.0 and not after_freeze
+          and all(r["backend_moves"] > 0 for r in records),
+          "frozen %d/%d, oscillated %.2f, backend moves %s"
+          % (len(frozen), len(records), summary["oscillated"],
+             sorted(set(r["backend_moves"] for r in records))))
+    check("oscillating axis is reported", summary.get("oscillating_depth_changes", 0) > 0,
+          "depth %.2f frequency %.2f focus %.2f changes per oscillating trajectory"
+          % (summary.get("oscillating_depth_changes", float("nan")),
+             summary.get("oscillating_frequency_changes", float("nan")),
+             summary.get("oscillating_focus_changes", float("nan"))))
+
+    without = run_closed_loop(Oscillator(data.ladders), data, builder, val_idx[:16], max_steps=6, batch_size=16,
+                              frontend_margin=0.1, freeze_on_revisit=False)[0]
+    # 不冻结时这个假模型每一步都在换前端，一次后端修正也做不了，正是 fieldii_v2 里打转轨迹的样子。
+    # 冻结之后后端反而做了 5 步 +5 dB：这是假模型永远要更多增益的结果，真模型的修正量会收敛。
+    check("without the freeze the same model never reaches a back-end step",
+          without["frozen_frontend"] == 0.0 and without["converged"] == 0.0,
+          "backend steps: frozen %s, not frozen %s"
+          % (sorted(set(r["backend_moves"] for r in records)), without["frontend_moves_hist"]))
+
+
 def check_smoke(rows, skip_scripts):
     emit("=========== 4. synthetic end-to-end smoke test (CPU) ===========")
     groups = sorted(set(r["group_id"] for r in rows))
@@ -320,7 +456,8 @@ def check_smoke(rows, skip_scripts):
         bm = compute_metrics(bp, btg)
         check("settings baseline computed", np.isfinite(bm["score"]), "score %.3f" % bm["score"])
         summary, records = run_closed_loop(model2, data, builder2, val_idx[:40], max_steps=3, batch_size=32)
-        check("closed loop runs", summary["trajectories"] == 40, json.dumps(summary)[:200])
+        check("closed loop runs", summary["trajectories"] == 40, json.dumps(summary)[:160])
+        check_near_metrics_and_hysteresis(data, builder2, model2, norm, val_idx, preds, ptg)
 
         if not skip_scripts:
             import tools_train_six_param as TT
@@ -338,15 +475,25 @@ def check_smoke(rows, skip_scripts):
             with io.open(os.path.join(fold_dir, "metrics.csv"), encoding="utf-8") as handle:
                 header = next(csv.reader(handle))
             wanted = ["val_aux_attenuation_mae", "val_gain_dir_f1_head", "val_slider_near_dir_f1_derived",
-                      "val_tgc_band_mae_db_0", "val_backend_score", "val_frontend_score", "valredraw_tgc_mae_db"]
+                      "val_tgc_band_mae_db_0", "val_backend_score", "val_frontend_score", "valredraw_tgc_mae_db",
+                      "val_frontend_score_near", "val_focus_top1_near", "val_depth_mean_signed_steps",
+                      "val_focus_top1_expected"]
             missing = [w for w in wanted if w not in header]
             check("metrics.csv keeps every validation metric", not missing,
                   "%d columns, missing %s" % (len(header), missing))
             TE.main(["--run", os.path.join(runs, "smoke"), "--cache", cache_dir, "--labels", label_path,
-                     "--device", "cpu", "--redraw-seeds", "1", "--max-steps", "2"])
+                     "--device", "cpu", "--redraw-seeds", "1", "--max-steps", "2", "--frontend-margin", "0.1"])
             check("evaluation script (combined model) wrote reports",
                   os.path.exists(os.path.join(fold_dir, "evaluation_report_combined.txt"))
                   and os.path.exists(os.path.join(runs, "smoke", "evaluation_summary_combined.txt")))
+            payload = torch.load(os.path.join(fold_dir, "best_frontend.pt"), map_location="cpu", weights_only=False)
+            check("best_frontend.pt is selected on the near-optimum score",
+                  payload.get("selected_by") == "frontend_score_near", str(payload.get("selected_by")))
+            with io.open(os.path.join(fold_dir, "closed_loop_trajectories_combined.jsonl"), encoding="utf-8") as h:
+                first = json.loads(h.readline())
+            check("closed-loop trajectories carry the path and the steps to the optimum",
+                  "path" in first and "frontend_steps_to_optimum" in first and "axis_changes" in first,
+                  json.dumps({k: first[k] for k in ("frozen", "axis_changes", "frontend_steps_to_optimum")}))
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
     emit("")

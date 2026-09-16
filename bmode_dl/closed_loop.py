@@ -9,7 +9,16 @@
      后端保持同一绝对曝光（gain_db - reference_db 不变）和同一组滑块值；不做后端修正，下一步重看。
   3. 前端不动：执行后端修正——增益按每级 dB 取整成点击数，滑块取整裁剪到 0..255。
      增益点击为 0 且三组滑块修正都在死区内，则停下。
-  4. 达到 max_steps 仍未停下记为未收敛；前端回到走过的设置记为打转。
+  4. 达到 max_steps 仍未停下记为未收敛。
+
+    fieldii_v2 的结果带来的两处改动
+
+滞回（frontend_margin）  只有新档的概率比当前档高出这个余量才换档。fieldii_v2 里 25% 的轨迹在
+                        两个设置之间来回跳，而打转的轨迹每一步都在换前端、一次后端修正也做不了，
+                        最终增益误差 5-15 dB，把平均值整个拉高。
+打转就冻结前端          回到走过的设置时记为打转，并冻结前端（之后只做后端修正），让轨迹至少把
+                        曝光调好。freeze_on_revisit=False 可恢复旧行为。
+逐步路径                每条轨迹记录走过的设置与每一步做了什么，summarise 据此统计是哪一轴在打转。
 
 停下后用该分片的标签评判：前端三轴的标签方向是否都为"正确"、增益与 TGC 离教师最优还有多少 dB。
 停止用的死区是固定值（stop_deadband_levels，默认 0.5 级，约为训练集死区中位数），因为实机上
@@ -24,6 +33,8 @@ import torch
 from . import constants as K
 from .dataset import make_batch
 from .metrics import decode
+
+AXES = ("depth", "frequency", "focus")
 
 
 def build_grid(data):
@@ -47,11 +58,26 @@ def _resolve_setting(grid, group, depth_idx, frequency_idx, focus_idx):
     return min(candidates, key=lambda k: (abs(k[3] - focus_idx), k[3] > focus_idx))
 
 
+def _wanted_setting(dec, j, here, margin, decision):
+    """三轴各自的建议档，带滞回：新档概率不比当前档高出 margin 就不动。"""
+    wanted = []
+    for a, axis in enumerate(AXES):
+        key = "%s_idx_expected" % axis if decision == "expected" else "%s_idx" % axis
+        candidate = int(dec[key][j])
+        prob = dec["%s_prob" % axis][j]
+        if candidate != here[a] and prob[candidate] - prob[here[a]] < margin:
+            candidate = here[a]
+        wanted.append(candidate)
+    return tuple(wanted)
+
+
 @torch.no_grad()
 def run_closed_loop(model, data, builder, idx, max_steps=8, batch_size=64, amp=False,
-                    stop_deadband_levels=0.5):
+                    stop_deadband_levels=0.5, frontend_margin=0.1, freeze_on_revisit=True,
+                    decision="argmax"):
     model.eval()
     enc = data.encoded
+    ladders = data.ladders
     grid = build_grid(data)
     idx = np.asarray(idx, np.int64)
     n = len(idx)
@@ -60,10 +86,14 @@ def run_closed_loop(model, data, builder, idx, max_steps=8, batch_size=64, amp=F
     levels = enc["tgc_levels"][idx].astype(np.float64)
     done = np.zeros(n, bool)
     oscillated = np.zeros(n, bool)
+    frozen = np.zeros(n, bool)
     steps = np.zeros(n, np.int64)
     frontend_moves = np.zeros(n, np.int64)
     backend_moves = np.zeros(n, np.int64)
-    visited = [{(int(enc["depth_idx"][i]), int(enc["frequency_idx"][i]), int(enc["focus_idx"][i]))} for i in idx]
+    axis_changes = np.zeros((n, len(AXES)), np.int64)
+    here0 = [(int(enc["depth_idx"][i]), int(enc["frequency_idx"][i]), int(enc["focus_idx"][i])) for i in idx]
+    visited = [{h} for h in here0]
+    paths = [[{"step": 0, "action": "start", "setting": list(h)}] for h in here0]
 
     for _ in range(int(max_steps)):
         active = np.flatnonzero(~done)
@@ -88,15 +118,27 @@ def run_closed_loop(model, data, builder, idx, max_steps=8, batch_size=64, amp=F
                 gain_slope = K.GAIN_DB_PER_LEVEL[mode]
                 tgc_slope = K.TGC_DB_PER_LEVEL[mode]
                 here = (int(enc["depth_idx"][row]), int(enc["frequency_idx"][row]), int(enc["focus_idx"][row]))
-                wanted = (int(dec["depth_idx"][j]), int(dec["frequency_idx"][j]), int(dec["focus_idx"][j]))
+                wanted = here if frozen[traj] else _wanted_setting(dec, j, here, frontend_margin, decision)
                 key = _resolve_setting(grid, data.group_ids[row], *wanted) if wanted != here else None
                 if key is not None and key[1:] != here:
-                    cur[traj] = grid[key]
-                    frontend_moves[traj] += 1
                     if key[1:] in visited[traj]:
                         oscillated[traj] = True
-                    visited[traj].add(key[1:])
-                    continue
+                        if freeze_on_revisit:
+                            # 打转：冻结前端，这一步改做后端修正，至少把曝光调对
+                            frozen[traj] = True
+                            paths[traj].append({"step": int(steps[traj]), "action": "freeze",
+                                                "setting": list(here), "wanted": list(key[1:])})
+                            key = None
+                    if key is not None:
+                        cur[traj] = grid[key]
+                        frontend_moves[traj] += 1
+                        for a in range(len(AXES)):
+                            if key[1 + a] != here[a]:
+                                axis_changes[traj, a] += 1
+                        visited[traj].add(key[1:])
+                        paths[traj].append({"step": int(steps[traj]), "action": "frontend",
+                                            "setting": list(key[1:])})
+                        continue
 
                 clicks = np.round(dec["gain_delta_db"][j] / gain_slope)
                 if abs(dec["gain_delta_db"][j] / gain_slope) <= stop_deadband_levels:
@@ -106,18 +148,19 @@ def run_closed_loop(model, data, builder, idx, max_steps=8, batch_size=64, amp=F
                 sliders_ok = all(abs(delta_levels[lo:hi].mean()) <= slider_deadband for _, lo, hi in K.SLIDER_GROUPS)
                 if clicks == 0 and sliders_ok:
                     done[traj] = True
+                    paths[traj].append({"step": int(steps[traj]), "action": "stop", "setting": list(here)})
                     continue
                 gain_rel[traj] += clicks * gain_slope
-                new_levels = levels[traj] if sliders_ok else np.clip(np.round(levels[traj] + delta_levels),
-                                                                    K.TGC_MIN_LEVEL, K.TGC_MAX_LEVEL)
-                levels[traj] = new_levels
+                if not sliders_ok:
+                    levels[traj] = np.clip(np.round(levels[traj] + delta_levels), K.TGC_MIN_LEVEL, K.TGC_MAX_LEVEL)
                 backend_moves[traj] += 1
+                paths[traj].append({"step": int(steps[traj]), "action": "backend", "setting": list(here),
+                                    "gain_clicks": float(clicks)})
 
     # 评判
-    final = cur
     records = []
     for t in range(n):
-        start_row, row = int(idx[t]), int(final[t])
+        start_row, row = int(idx[t]), int(cur[t])
         mode = int(enc["mode"][row])
         gain_slope, tgc_slope = K.GAIN_DB_PER_LEVEL[mode], K.TGC_DB_PER_LEVEL[mode]
         gain_db = gain_rel[t] + enc["reference_db"][row]
@@ -126,17 +169,24 @@ def run_closed_loop(model, data, builder, idx, max_steps=8, batch_size=64, amp=F
         tgc_err = float(np.abs(enc["optimal_tgc_levels"][row] - levels[t]).mean() * tgc_slope)
         start_tgc_err = float(np.abs(enc["optimal_tgc_levels"][start_row] - enc["tgc_levels"][start_row]).mean()
                               * tgc_slope)
-        axes_ok = {}
-        for axis in ("depth", "frequency", "focus"):
+        axes_ok, axes_steps = {}, {}
+        for axis in AXES:
             if enc["%s_mask" % axis][row] > 0:
                 axes_ok[axis] = bool(enc["%s_dir" % axis][row] == 1)
+                # 正数 = 教师要更大（更深 / 更高）
+                axes_steps[axis] = int(enc["optimal_%s_idx" % axis][row] - enc["%s_idx" % axis][row])
+        path = [dict(p, setting_mm=[ladders["depth_mm"][p["setting"][0]], ladders["frequency_mhz"][p["setting"][1]],
+                                    ladders["focus_mm"][p["setting"][2]]]) for p in paths[t]]
         records.append({
             "start_frame": data.frame_ids[start_row], "final_frame": data.frame_ids[row],
-            "converged": bool(done[t]), "oscillated": bool(oscillated[t]), "steps": int(steps[t]),
-            "frontend_moves": int(frontend_moves[t]), "backend_moves": int(backend_moves[t]),
-            "frontend_correct": axes_ok, "gain_error_db": gain_err, "start_gain_error_db": start_gain_err,
+            "converged": bool(done[t]), "oscillated": bool(oscillated[t]), "frozen": bool(frozen[t]),
+            "steps": int(steps[t]), "frontend_moves": int(frontend_moves[t]), "backend_moves": int(backend_moves[t]),
+            "axis_changes": {axis: int(axis_changes[t, a]) for a, axis in enumerate(AXES)},
+            "frontend_correct": axes_ok, "frontend_steps_to_optimum": axes_steps,
+            "gain_error_db": gain_err, "start_gain_error_db": start_gain_err,
             "gain_within_deadband": bool(abs(gain_err) <= enc["deadband_gain_levels"][row] * gain_slope),
             "tgc_mae_db": tgc_err, "start_tgc_mae_db": start_tgc_err,
+            "path": path,
         })
     return summarise(records), records
 
@@ -145,9 +195,11 @@ def summarise(records):
     n = len(records)
     if n == 0:
         return {"trajectories": 0}
+    converged = [r for r in records if r["converged"]]
     out = {"trajectories": n,
            "converged": float(np.mean([r["converged"] for r in records])),
            "oscillated": float(np.mean([r["oscillated"] for r in records])),
+           "frozen_frontend": float(np.mean([r["frozen"] for r in records])),
            "steps_hist": dict(sorted(Counter(r["steps"] for r in records).items())),
            "frontend_moves_hist": dict(sorted(Counter(r["frontend_moves"] for r in records).items())),
            "gain_abs_error_db_start": float(np.mean([abs(r["start_gain_error_db"]) for r in records])),
@@ -155,9 +207,26 @@ def summarise(records):
            "gain_within_deadband_final": float(np.mean([r["gain_within_deadband"] for r in records])),
            "tgc_mae_db_start": float(np.mean([r["start_tgc_mae_db"] for r in records])),
            "tgc_mae_db_final": float(np.mean([r["tgc_mae_db"] for r in records]))}
-    for axis in ("depth", "frequency", "focus"):
+    # 停下的轨迹单独报一次：平均值容易被打转的轨迹（增益误差 5-15 dB）带偏
+    if converged:
+        out["converged_gain_abs_error_db"] = float(np.mean([abs(r["gain_error_db"]) for r in converged]))
+        out["converged_gain_within_deadband"] = float(np.mean([r["gain_within_deadband"] for r in converged]))
+        out["converged_tgc_mae_db"] = float(np.mean([r["tgc_mae_db"] for r in converged]))
+    for axis in AXES:
         vals = [r["frontend_correct"][axis] for r in records if axis in r["frontend_correct"]]
         out["final_%s_correct" % axis] = float(np.mean(vals)) if vals else float("nan")
+        steps_off = [r["frontend_steps_to_optimum"][axis] for r in records if axis in r["frontend_steps_to_optimum"]]
+        if steps_off:
+            # 正数 = 停早了（教师还要往深 / 往高调）
+            out["final_%s_mean_signed_steps" % axis] = float(np.mean(steps_off))
+            out["final_%s_within1" % axis] = float(np.mean([abs(v) <= 1 for v in steps_off]))
+        # 哪一轴在反复改档：打转的轨迹里该轴的平均改档次数
+        oscillating = [r["axis_changes"][axis] for r in records if r["oscillated"]]
+        if oscillating:
+            out["oscillating_%s_changes" % axis] = float(np.mean(oscillating))
     all_ok = [all(r["frontend_correct"].values()) for r in records if r["frontend_correct"]]
     out["final_frontend_all_correct"] = float(np.mean(all_ok)) if all_ok else float("nan")
+    all_near = [all(abs(v) <= 1 for v in r["frontend_steps_to_optimum"].values())
+                for r in records if r["frontend_steps_to_optimum"]]
+    out["final_frontend_all_within1"] = float(np.mean(all_near)) if all_near else float("nan")
     return out

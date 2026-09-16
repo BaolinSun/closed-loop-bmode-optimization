@@ -25,6 +25,12 @@ frontend.pt（取交叉验证汇总里报告的前端最佳轮次中位数）。
      （--frontend-label-smoothing，默认 0.1）。
   3. metrics.csv 保留全部验证指标（旧版表头按第 1 轮定下，第 1 轮不验证，非主要指标被丢掉）。
 
+    fieldii_v2 日志分析后的改动
+
+best_frontend.pt 默认改按 frontend_score_near 选：只统计当前设置与最优相差不超过 1 档的帧。
+fieldii_v2 的闭环停点全在这一带，而整体单步准确率（聚焦 0.86）远高于停点上的准确率（0.50）。
+--frontend-select frontend_score 恢复旧口径。
+
     每个 epoch
 
 训练批次一律重抽后端起点（bmode_dl.labels.draw_start）并随机左右翻转；验证在
@@ -52,12 +58,14 @@ import torch
 from bmode_dl.checkpoint import model_from_config, save_checkpoint
 from bmode_dl.dataset import INPUT_MODES, FieldIIData, InputBuilder, make_batch
 from bmode_dl.losses import DEFAULT_WEIGHTS, SixParamLoss
-from bmode_dl.metrics import MAIN_KEYS, compute_metrics, flatten_metrics, format_metrics, predict
+from bmode_dl.metrics import (MAIN_KEYS, NEAR_KEYS, compute_metrics, flatten_metrics, format_metrics,
+                              predict)
 from bmode_dl.model import BACKEND_OUTPUTS, count_parameters
 
 BACKEND_KEYS = ("gain_mae_db", "gain_within_deadband", "gain_dir_f1_derived", "tgc_mae_db", "slider_dir_f1_derived")
 FRONTEND_KEYS = ("depth_top1", "depth_within1", "depth_dir_f1_derived", "frequency_hit", "frequency_dir_f1_derived",
-                 "focus_top1", "focus_within1", "focus_dir_f1_derived")
+                 "focus_top1", "focus_within1", "focus_dir_f1_derived") + NEAR_KEYS
+FRONTEND_SELECT = ("frontend_score_near", "frontend_score")
 
 
 def parse_args(argv=None):
@@ -95,6 +103,9 @@ def parse_args(argv=None):
     p.add_argument("--frontend-dropout", dest="frontend_dropout", type=float, default=0.3,
                    help="dropout inside the depth/frequency/focus heads")
     p.add_argument("--frontend-label-smoothing", dest="frontend_label_smoothing", type=float, default=0.1)
+    p.add_argument("--frontend-select", choices=FRONTEND_SELECT, default="frontend_score_near",
+                   help="metric that chooses best_frontend.pt: frontend_score_near counts only frames within one "
+                        "ladder step of the optimum, which is where the closed loop actually stops")
     p.add_argument("--frontend-epoch", type=int, default=None,
                    help="with --fold none: also save frontend.pt at this epoch")
     p.add_argument("--borderline-weight", type=float, default=0.5)
@@ -213,10 +224,11 @@ def train_fold(args, data, fold, out_dir, report):
     csv_rows = []
     cache_shape = {"rows": data.rows_out, "lines": data.lines, "source_rows": data.source_rows}
     extra = {"fold": fold, "val_groups": val_groups, "train_groups": train_groups}
-    best = {name: {"score": -float("inf"), "epoch": -1, "metrics": None}
-            for name in ("score", "backend_score", "frontend_score")}
-    files = {"score": "best.pt", "backend_score": "best_backend.pt", "frontend_score": "best_frontend.pt"}
-    marks = {"score": "*", "backend_score": "B", "frontend_score": "F"}
+    front_key = args.frontend_select
+    selection = ("score", "backend_score", front_key)
+    best = {name: {"score": -float("inf"), "epoch": -1, "metrics": None} for name in selection}
+    files = {"score": "best.pt", "backend_score": "best_backend.pt", front_key: "best_frontend.pt"}
+    marks = {"score": "*", "backend_score": "B", front_key: "F"}
     bad_evals = 0
     started = time.time()
 
@@ -258,10 +270,11 @@ def train_fold(args, data, fold, out_dir, report):
             metrics_r = compute_metrics(preds_r, tg_r, norm)
             row.update(flatten_metrics(metrics, "val_"))
             row.update(flatten_metrics(metrics_r, "valredraw_"))
-            line += "  | val %s" % format_metrics(metrics, ("score", "backend_score", "frontend_score", "gain_mae_db",
-                                                              "tgc_mae_db", "depth_top1", "frequency_hit", "focus_top1"))
+            line += "  | val %s" % format_metrics(metrics, ("score", "backend_score", front_key, "gain_mae_db",
+                                                              "tgc_mae_db", "depth_top1", "frequency_hit",
+                                                              "focus_top1"))
             improved = ""
-            for name in ("score", "backend_score", "frontend_score"):
+            for name in selection:
                 value = metrics.get(name, float("nan"))
                 if np.isfinite(value) and value > best[name]["score"]:
                     best[name] = {"score": value, "epoch": epoch, "metrics": metrics}
@@ -296,19 +309,20 @@ def train_fold(args, data, fold, out_dir, report):
         report("")
         return None
 
-    for name in ("score", "backend_score", "frontend_score"):
-        report("  best %-15s epoch %3d: %s" % (name, best[name]["epoch"], format_metrics(best[name]["metrics"])))
+    for name in selection:
+        report("  best %-20s epoch %3d: %s" % (name, best[name]["epoch"], format_metrics(best[name]["metrics"])))
     # 组合：后端指标取 best_backend 那一轮，前端指标取 best_frontend 那一轮（即 CombinedModel 的单步表现）
     combined = {k: best["backend_score"]["metrics"].get(k) for k in BACKEND_KEYS + ("backend_score",)}
-    combined.update({k: best["frontend_score"]["metrics"].get(k) for k in FRONTEND_KEYS + ("frontend_score",)})
+    combined.update({k: best[front_key]["metrics"].get(k)
+                     for k in FRONTEND_KEYS + ("frontend_score", "frontend_score_near")})
     parts = [combined.get("backend_score"), combined.get("frontend_score")]
     combined["score"] = float(np.mean([p for p in parts if p is not None and np.isfinite(p)]))
     report("  combined (backend epoch %d + frontend epoch %d): %s"
-           % (best["backend_score"]["epoch"], best["frontend_score"]["epoch"], format_metrics(combined)))
+           % (best["backend_score"]["epoch"], best[front_key]["epoch"], format_metrics(combined)))
     report("  fold finished in %.0f s" % (time.time() - started))
     report("")
     return {"best": best["score"]["metrics"], "combined": combined,
-            "epochs": {name: best[name]["epoch"] for name in best}}
+            "epochs": {("frontend_score" if name == front_key else name): best[name]["epoch"] for name in best}}
 
 
 def summarise(results, keys, section, report):

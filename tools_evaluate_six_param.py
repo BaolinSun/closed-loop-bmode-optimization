@@ -10,6 +10,9 @@
         last      last.pt
         auto      有 combined 所需文件就用 combined，否则 best，再否则 last
 
+闭环默认带滞回（--frontend-margin 0.1）并在打转后冻结前端，轨迹记录含逐步路径；
+--frontend-margin 0 --no-freeze-on-revisit 恢复 fieldii_v2 的行为。
+
 写出 <折目录>/evaluation_report_<选择>.txt、evaluation_<选择>.json、closed_loop_trajectories_<选择>.jsonl，
 --run 时另写 runs/<name>/evaluation_summary_<选择>.txt。终端输出与报告同内容（ASCII）。
 
@@ -29,8 +32,9 @@ import bmode_dl.constants as K
 from bmode_dl.checkpoint import load_checkpoint, load_combined
 from bmode_dl.closed_loop import run_closed_loop
 from bmode_dl.dataset import FieldIIData
-from bmode_dl.metrics import (MAIN_KEYS, compute_metrics, confusion, direction_from_delta_np,
-                              direction_from_index_np, format_metrics, predict, settings_lookup_baseline)
+from bmode_dl.metrics import (EXPECTED_KEYS, MAIN_KEYS, NEAR_KEYS, compute_metrics, confusion,
+                              direction_from_delta_np, direction_from_index_np, format_metrics, predict,
+                              settings_lookup_baseline)
 
 
 def parse_args(argv=None):
@@ -48,6 +52,13 @@ def parse_args(argv=None):
     p.add_argument("--redraw-seeds", type=int, default=3, help="extra evaluations on re-drawn back-end starts")
     p.add_argument("--max-steps", type=int, default=8)
     p.add_argument("--stop-deadband-levels", type=float, default=0.5)
+    p.add_argument("--frontend-margin", type=float, default=0.1,
+                   help="hysteresis: change a front-end step only when the new one beats the current one by this "
+                        "much probability (0 = the fieldii_v2 behaviour)")
+    p.add_argument("--no-freeze-on-revisit", action="store_true",
+                   help="do not freeze the front end after the loop returns to a setting it has already visited")
+    p.add_argument("--decision", choices=("argmax", "expected"), default="argmax",
+                   help="how the closed loop picks a ladder step")
     p.add_argument("--no-closed-loop", action="store_true")
     return p.parse_args(argv)
 
@@ -125,6 +136,10 @@ def evaluate_checkpoint(path, args, data_cache, frontend_path=None, label=None):
     m = compute_metrics(preds, tg, payload["norm"])
     results["network_recorded_start"] = m
     report("  network  %s" % format_metrics(m))
+    report("  near optimum (frames within one ladder step of it; the closed loop stops in this band)")
+    report("    %s" % format_metrics(m, NEAR_KEYS))
+    report("  expected-step decision instead of argmax")
+    report("    %s" % format_metrics(m, EXPECTED_KEYS))
     report("  TGC per-band MAE dB %s" % m.get("tgc_band_mae_db"))
     for axis in ("gain", "depth", "frequency", "focus"):
         if axis == "gain":
@@ -159,10 +174,15 @@ def evaluate_checkpoint(path, args, data_cache, frontend_path=None, label=None):
 
     trajectories = []
     if not args.no_closed_loop:
-        report("----- closed loop (max %d steps, stop deadband %.2f gain levels) -----"
-               % (args.max_steps, args.stop_deadband_levels))
+        report("----- closed loop (max %d steps, stop deadband %.2f gain levels, hysteresis %.2f, "
+               "freeze on revisit %s, %s decision) -----"
+               % (args.max_steps, args.stop_deadband_levels, args.frontend_margin,
+                  not args.no_freeze_on_revisit, args.decision))
         summary, trajectories = run_closed_loop(model, data, builder, eval_idx, max_steps=args.max_steps,
-                                                amp=amp, stop_deadband_levels=args.stop_deadband_levels)
+                                                amp=amp, stop_deadband_levels=args.stop_deadband_levels,
+                                                frontend_margin=args.frontend_margin,
+                                                freeze_on_revisit=not args.no_freeze_on_revisit,
+                                                decision=args.decision)
         results["closed_loop"] = summary
         for k, v in summary.items():
             report("  %-30s %s" % (k, ("%.4f" % v) if isinstance(v, float) else v))
@@ -203,6 +223,13 @@ def main(argv=None):
                       if section in r and isinstance(r[section].get(key), float) and np.isfinite(r[section][key])]
             if values:
                 report("    %-26s %.4f +- %.4f" % (key, np.mean(values), np.std(values)))
+    for section in ("network_recorded_start",):
+        report("  %s (near optimum / expected-step decision)" % section)
+        for key in NEAR_KEYS + EXPECTED_KEYS:
+            values = [r[section][key] for r in all_results
+                      if isinstance(r[section].get(key), float) and np.isfinite(r[section][key])]
+            if values:
+                report("    %-34s %.4f +- %.4f" % (key, np.mean(values), np.std(values)))
     if not args.no_closed_loop:
         report("  closed_loop")
         keys = [k for k, v in all_results[0]["closed_loop"].items() if isinstance(v, float)]

@@ -110,3 +110,14 @@ python tools_train_six_param.py --fold none --epochs 150 --frontend-epoch 30 --a
 | metrics.csv 保留全部指标 | 每轮按所有轮次列的并集重写；列表型指标展开为 `_0.._n` | — |
 
 旧检查点（没有 `backend_output` 字段）仍按 delta 方式载入，`tests/verify_six_param_model.py` 检查 `runs/fieldii_v1/fold_0/best.pt` 严格载入。组合模型的交叉验证数字与 `best.pt` 一样是在验证体模上选轮次，偏乐观。
+
+## 8. 修改记录：fieldii_v2 训练日志分析之后（2026-09-16）
+
+`runs/fieldii_v2` 的单步指标全面好于 v1，也高于只看设置的查表基线（增益 0.39→0.24 dB，聚焦准确率 0.78→0.86 且折间标准差 0.14→0.02）。问题都在闭环：25% 的轨迹在两个设置之间打转、一次后端修正也做不了，最终增益误差 5–15 dB，把平均值从停下轨迹的 0.22 dB 拉到 2.55 dB；停下的轨迹里三轴全对只有 16%，但 76% 在 1 档以内，深度与聚焦平均偏浅 0.4 档。改了两处：
+
+| 改动 | 做法 | 恢复旧行为 |
+|---|---|---|
+| 闭环加滞回与打转冻结，记录逐步路径 | 只有新档概率比当前档高出 `--frontend-margin`（默认 0.1）才换档；回到走过的设置时记为打转并冻结前端，之后只做后端修正。轨迹记录增加 `path`（逐步走到哪、做了什么）、`axis_changes`、`frozen`、`frontend_steps_to_optimum`；汇总增加停下轨迹单独的增益/TGC 误差、各轴平均偏档、打转时是哪一轴在反复改 | `--frontend-margin 0 --no-freeze-on-revisit` |
+| 近最优帧指标，并用它选前端检查点 | 只统计当前设置与最优相差不超过 1 档的帧（`*_near`），闭环停点全在这一带；`best_frontend.pt` 默认按 `frontend_score_near` 选。同时报告期望档决策（`*_expected`）与各轴平均偏档，用来判断偏浅是不是 argmax 造成的 | `--frontend-select frontend_score`；评估里两套指标都会报告 |
+
+已有的 `runs/fieldii_v2` 检查点不用重训就能拿到新的闭环与近最优帧结果：直接重跑 `tools_evaluate_six_param.py`。前端检查点选择的改动要重训才生效。
