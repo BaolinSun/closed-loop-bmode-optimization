@@ -119,28 +119,53 @@ def main():
         sets = [r for r in per_set("depth", "depth_mm", ["imaging_mode", "frequency_mhz", "focus_mm"])
                 if r["imaging_mode"] == mode and not r["depth_at_edge"]]
         # 2026-09-14 起深度判据改为「底部余量 >= 6 dB 的最深阶梯」，依据里记的是可用深度。
-        # 深度按 聚焦 -> 频率 -> 深度 的顺序求，依据来自哪个频率的比较集要看 depth_conditioned_on。
+        #
+        # 必须在【同一个族/体模内部】比：深度按 聚焦 -> 频率 -> 深度 求，用的是挑出来的
+        # 频率。跨体模混比时，衰减低的体模既被挑到更高频率、可用深度又本来就更深，相关会
+        # 变成正的——那是选择效应，不是物理出错（Field II 上混比得到 +0.84，族内比是负的）。
+        # 同一个族内体模不变，频率随每行的设置变化，比的才是频率本身。
         def set_frequency(r):
-            return (r["optimal_frequency_mhz"] if r["depth_conditioned_on"].startswith("optimal frequency")
-                    else r["frequency_mhz"])
+            how = r["depth_conditioned_on"] or ""
+            return r["optimal_frequency_mhz"] if how.startswith("optimal frequency") else r["frequency_mhz"]
+
         def set_focus(r):
-            return r["optimal_focus_mm"] if "optimal focus" in r["depth_conditioned_on"] else r["focus_mm"]
-        # 只比聚焦 15 mm 的比较集：聚焦深了深部更亮、可用深度更深（谐波 5.0 MHz 的比较集
-        # 大多来自 E9，聚焦 25-30 mm），混在一起比的是聚焦而不是频率。
-        pen = [(set_frequency(r), float(re.search(r"usable to ([0-9.]+) mm", r["depth_basis"]).group(1)))
-               for r in sets if r["depth_basis"] and re.search(r"usable to [0-9.]+ mm", r["depth_basis"])
-               and set_focus(r) == 15.0]
-        if len(pen) >= 3:
-            rho = spearman([f for f, _ in pen], [p for _, p in pen])
-            by = collections.defaultdict(list)
-            for f, p_ in pen:
-                by[f].append(p_)
-            emit(u"  usable depth vs frequency (non-edge, focus 15), %-11s sets %3d   rank corr %+.2f  (expect < 0)"
-                 % (mode, len(pen), rho))
-            emit(u"      " + u"   ".join(u"%g MHz -> %.1f mm" % (f, np.mean(v))
-                                         for f, v in sorted(by.items())))
-            if np.isfinite(rho) and rho > 0:
-                failures.append("penetration deepens with frequency in %s" % mode)
+            return (r["optimal_focus_mm"] if "optimal focus" in (r["depth_conditioned_on"] or "")
+                    else r["focus_mm"])
+
+        # 用所有行，不用上面按 (族, 模式, 当前频率, 聚焦) 去重后的 sets：那个键不含显示
+        # 深度，会把同一比较集的六个显示深度压成一行，Field II 上留下的恰好全是 60 mm 那
+        # 档，样本退化成「每组只剩一个频率」。这里按条件频率、条件聚焦分组才对得上比较集。
+        groups = collections.defaultdict(dict)
+        for r in rows:
+            if r["imaging_mode"] != mode or not r.get("depth_determined") or r["depth_at_edge"]:
+                continue
+            if not r["depth_basis"] or not re.search(r"usable to [0-9.]+ mm", r["depth_basis"]):
+                continue
+            key = (r["family_id"], round(set_focus(r), 1))
+            groups[key][set_frequency(r)] = float(
+                re.search(r"usable to ([0-9.]+) mm", r["depth_basis"]).group(1))
+        rhos, pooled, expected = [], collections.defaultdict(list), []
+        for key, by_frequency in groups.items():
+            if len(by_frequency) < 2:
+                continue
+            order = sorted(by_frequency)
+            # 低频的可用深度应当不浅于高频。两档的组秩相关只有正负两个值，所以另外报
+            # 「最低频不浅于最高频」的比例，它在两档组上也说得通。
+            expected.append(by_frequency[order[0]] >= by_frequency[order[-1]] - 0.05)
+            if len(order) >= 3:
+                rhos.append(spearman(order, [by_frequency[f] for f in order]))
+            for f, u in by_frequency.items():
+                pooled[f].append(u)
+        if expected:
+            emit(u"  usable depth vs frequency within a family, %-11s groups %3d   lowest frequency reaches "
+                 u"deepest in %d of them%s" % (mode, len(expected), sum(expected),
+                                               u"" if not rhos else
+                                               u";  median rank corr %+.2f over the %d groups with 3+ frequencies"
+                                               % (float(np.median(rhos)), len(rhos))))
+            emit(u"      " + u"   ".join(u"%g MHz -> %.1f mm (%d)" % (f, np.mean(v), len(v))
+                                         for f, v in sorted(pooled.items())))
+            if sum(expected) < 0.5 * len(expected):
+                failures.append("usable depth deepens with frequency in %s" % mode)
         if len(sets) >= 3:
             rho = spearman([r["frequency_mhz"] for r in sets], [r["optimal_depth_mm"] for r in sets])
             emit(u"  depth optimum vs frequency (non-edge), %-11s sets %3d   rank corr %+.2f  (informational)"
