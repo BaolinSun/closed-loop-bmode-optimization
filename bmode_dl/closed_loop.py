@@ -13,9 +13,13 @@
 
     fieldii_v2 的结果带来的两处改动
 
-滞回（frontend_margin）  只有新档的概率比当前档高出这个余量才换档。fieldii_v2 里 25% 的轨迹在
+滞回（frontend_margin）  新档的概率要比当前档高出这个余量才换档。fieldii_v2 里 25% 的轨迹在
                         两个设置之间来回跳，而打转的轨迹每一步都在换前端、一次后端修正也做不了，
                         最终增益误差 5-15 dB，把平均值整个拉高。
+                        fieldii_v3 对每一次换档都要余量（margin_mode="always"），打转降到 14%，
+                        但那等于整体倾向不动，深度仍然平均停早 0.35 档。所以默认改成
+                        margin_mode="revisit"：只有建议回到走过的设置时才要余量，没走过的新设置
+                        照常换——防打转的是回头这一下，不是所有换档。
 打转就冻结前端          回到走过的设置时记为打转，并冻结前端（之后只做后端修正），让轨迹至少把
                         曝光调好。freeze_on_revisit=False 可恢复旧行为。
 逐步路径                每条轨迹记录走过的设置与每一步做了什么，summarise 据此统计是哪一轴在打转。
@@ -35,6 +39,10 @@ from .dataset import make_batch
 from .metrics import decode
 
 AXES = ("depth", "frequency", "focus")
+# 滞回作用在哪些换档上：
+#   revisit  只拦回头（建议的设置这条轨迹已经走过），没走过的新设置照常换（默认）
+#   always   每一次换档都要余量，即 fieldii_v3 的行为
+MARGIN_MODES = ("revisit", "always")
 
 
 def build_grid(data):
@@ -58,23 +66,30 @@ def _resolve_setting(grid, group, depth_idx, frequency_idx, focus_idx):
     return min(candidates, key=lambda k: (abs(k[3] - focus_idx), k[3] > focus_idx))
 
 
-def _wanted_setting(dec, j, here, margin, decision):
-    """三轴各自的建议档，带滞回：新档概率不比当前档高出 margin 就不动。"""
-    wanted = []
+def _raw_wanted(dec, j, decision):
+    """三轴各自的建议档，不加滞回。"""
+    key = "%s_idx_expected" if decision == "expected" else "%s_idx"
+    return tuple(int(dec[key % axis][j]) for axis in AXES)
+
+
+def _apply_margin(dec, j, here, wanted, margin):
+    """滞回：某一轴的建议档概率不比当前档高出 margin 就留在当前档。"""
+    out = []
     for a, axis in enumerate(AXES):
-        key = "%s_idx_expected" % axis if decision == "expected" else "%s_idx" % axis
-        candidate = int(dec[key][j])
         prob = dec["%s_prob" % axis][j]
+        candidate = wanted[a]
         if candidate != here[a] and prob[candidate] - prob[here[a]] < margin:
             candidate = here[a]
-        wanted.append(candidate)
-    return tuple(wanted)
+        out.append(candidate)
+    return tuple(out)
 
 
 @torch.no_grad()
 def run_closed_loop(model, data, builder, idx, max_steps=8, batch_size=64, amp=False,
                     stop_deadband_levels=0.5, frontend_margin=0.1, freeze_on_revisit=True,
-                    decision="argmax"):
+                    decision="argmax", margin_mode="revisit"):
+    if margin_mode not in MARGIN_MODES:
+        raise ValueError("margin_mode must be one of %s" % (MARGIN_MODES,))
     model.eval()
     enc = data.encoded
     ladders = data.ladders
@@ -118,8 +133,15 @@ def run_closed_loop(model, data, builder, idx, max_steps=8, batch_size=64, amp=F
                 gain_slope = K.GAIN_DB_PER_LEVEL[mode]
                 tgc_slope = K.TGC_DB_PER_LEVEL[mode]
                 here = (int(enc["depth_idx"][row]), int(enc["frequency_idx"][row]), int(enc["focus_idx"][row]))
-                wanted = here if frozen[traj] else _wanted_setting(dec, j, here, frontend_margin, decision)
-                key = _resolve_setting(grid, data.group_ids[row], *wanted) if wanted != here else None
+                group = data.group_ids[row]
+                wanted = here if frozen[traj] else _raw_wanted(dec, j, decision)
+                key = _resolve_setting(grid, group, *wanted) if wanted != here else None
+                # 滞回：margin_mode="revisit" 只拦回头（建议的设置已经走过），没走过的照常换；
+                # "always" 是 fieldii_v3 的行为，对每一次换档都要余量，等于整体倾向不动。
+                if (key is not None and key[1:] != here and frontend_margin > 0
+                        and (margin_mode == "always" or key[1:] in visited[traj])):
+                    wanted = _apply_margin(dec, j, here, wanted, frontend_margin)
+                    key = _resolve_setting(grid, group, *wanted) if wanted != here else None
                 if key is not None and key[1:] != here:
                     if key[1:] in visited[traj]:
                         oscillated[traj] = True

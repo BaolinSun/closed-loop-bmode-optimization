@@ -198,6 +198,37 @@ class FieldIIData(object):
             out[key] = weights(np.bincount(labels, minlength=3)[:3] if labels.size else np.zeros(3))
         return out
 
+    def physics_coverage(self, train_idx, val_idx):
+        """每折的体模物理量覆盖：验证集落在训练集范围之外时，那一折只能外推。
+
+        fieldii_v3 的第 2 折验证集同时拿走了衰减最低与最高的体模，频率命中 0.62、深度 0.47，
+        都比另外三折低 0.2 以上，而这件事当时要手工查标签才看得出来。
+        """
+        per_phantom = {}
+        for i, row in enumerate(self.rows):
+            per_phantom[self.group_ids[i]] = row
+        lines, summary = [], {}
+        for key, unit in (("attenuation_db_cm_mhz", "dB/cm/MHz"), ("electronic_noise_db", "dB"),
+                          ("sound_speed_mps", "m/s")):
+            train_values = [per_phantom[g].get(key) for g in sorted(set(self.group_ids[i] for i in train_idx))]
+            val_values = [per_phantom[g].get(key) for g in sorted(set(self.group_ids[i] for i in val_idx))]
+            train_values = [float(v) for v in train_values if v is not None]
+            val_values = [float(v) for v in val_values if v is not None]
+            if not train_values or not val_values:
+                continue
+            below = min(val_values) < min(train_values)
+            above = max(val_values) > max(train_values)
+            flag = ("  EXTRAPOLATES " + " AND ".join([w for w, on in (("BELOW", below), ("ABOVE", above)) if on])
+                    if (below or above) else "")
+            summary[key] = {"train_min": min(train_values), "train_max": max(train_values),
+                            "val_min": min(val_values), "val_max": max(val_values),
+                            "val_values": val_values, "extrapolates_below": below, "extrapolates_above": above}
+            lines.append("    %-22s train %8.3f - %8.3f   val %8.3f - %8.3f  %s%s"
+                         % (key + " (" + unit + ")", min(train_values), max(train_values),
+                            min(val_values), max(val_values),
+                            " ".join("%.3f" % v for v in val_values), flag))
+        return lines, summary
+
     def label_summary(self, idx):
         """ASCII 的标签分布摘要。"""
         lines = []

@@ -25,6 +25,10 @@ frontend.pt（取交叉验证汇总里报告的前端最佳轮次中位数）。
      （--frontend-label-smoothing，默认 0.1）。
   3. metrics.csv 保留全部验证指标（旧版表头按第 1 轮定下，第 1 轮不验证，非主要指标被丢掉）。
 
+每折都打印体模物理量（衰减、电子噪声、声速）的训练/验证覆盖范围，验证集超出训练范围时标出
+EXTRAPOLATES：fieldii_v3 的第 2 折就是验证集同时拿走衰减最低与最高的体模，那一折所有前端指标
+都低 0.2 以上。
+
     fieldii_v2 日志分析后的改动
 
 best_frontend.pt 默认改按 frontend_score_near 选：只统计当前设置与最优相差不超过 1 档的帧。
@@ -182,6 +186,12 @@ def train_fold(args, data, fold, out_dir, report):
     report("  val:   %d frames, %d phantoms %s" % (len(val_idx), len(val_groups), val_groups))
     for line in data.label_summary(train_idx):
         report(line)
+    coverage_lines, coverage = ([], {})
+    if len(val_idx):
+        coverage_lines, coverage = data.physics_coverage(train_idx, val_idx)
+        report("  phantom physics coverage (validation outside the training range = that fold extrapolates)")
+        for line in coverage_lines:
+            report(line)
 
     norm = data.normalisation(train_idx, seed=args.seed)
     class_weights = data.class_weights(train_idx, seed=args.seed)
@@ -321,7 +331,7 @@ def train_fold(args, data, fold, out_dir, report):
            % (best["backend_score"]["epoch"], best[front_key]["epoch"], format_metrics(combined)))
     report("  fold finished in %.0f s" % (time.time() - started))
     report("")
-    return {"best": best["score"]["metrics"], "combined": combined,
+    return {"best": best["score"]["metrics"], "combined": combined, "coverage": coverage,
             "epochs": {("frontend_score" if name == front_key else name): best[name]["epoch"] for name in best}}
 
 

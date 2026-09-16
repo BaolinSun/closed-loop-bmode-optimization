@@ -10,8 +10,9 @@
         last      last.pt
         auto      有 combined 所需文件就用 combined，否则 best，再否则 last
 
-闭环默认带滞回（--frontend-margin 0.1）并在打转后冻结前端，轨迹记录含逐步路径；
---frontend-margin 0 --no-freeze-on-revisit 恢复 fieldii_v2 的行为。
+闭环默认带滞回（--frontend-margin 0.1，只拦回头：--margin-mode revisit）并在打转后冻结前端，
+轨迹记录含逐步路径。--margin-mode always 是 fieldii_v3 的行为（每次换档都要余量），
+--frontend-margin 0 --no-freeze-on-revisit 是 fieldii_v2 的行为。
 
 写出 <折目录>/evaluation_report_<选择>.txt、evaluation_<选择>.json、closed_loop_trajectories_<选择>.jsonl，
 --run 时另写 runs/<name>/evaluation_summary_<选择>.txt。终端输出与报告同内容（ASCII）。
@@ -30,7 +31,7 @@ import torch
 
 import bmode_dl.constants as K
 from bmode_dl.checkpoint import load_checkpoint, load_combined
-from bmode_dl.closed_loop import run_closed_loop
+from bmode_dl.closed_loop import MARGIN_MODES, run_closed_loop
 from bmode_dl.dataset import FieldIIData
 from bmode_dl.metrics import (EXPECTED_KEYS, MAIN_KEYS, NEAR_KEYS, compute_metrics, confusion,
                               direction_from_delta_np, direction_from_index_np, format_metrics, predict,
@@ -59,6 +60,9 @@ def parse_args(argv=None):
                    help="do not freeze the front end after the loop returns to a setting it has already visited")
     p.add_argument("--decision", choices=("argmax", "expected"), default="argmax",
                    help="how the closed loop picks a ladder step")
+    p.add_argument("--margin-mode", choices=MARGIN_MODES, default="revisit",
+                   help="where the hysteresis applies: revisit = only when the loop is about to return to a setting "
+                        "it has already visited (default); always = every front-end change (fieldii_v3)")
     p.add_argument("--no-closed-loop", action="store_true")
     return p.parse_args(argv)
 
@@ -174,15 +178,15 @@ def evaluate_checkpoint(path, args, data_cache, frontend_path=None, label=None):
 
     trajectories = []
     if not args.no_closed_loop:
-        report("----- closed loop (max %d steps, stop deadband %.2f gain levels, hysteresis %.2f, "
+        report("----- closed loop (max %d steps, stop deadband %.2f gain levels, hysteresis %.2f on %s, "
                "freeze on revisit %s, %s decision) -----"
-               % (args.max_steps, args.stop_deadband_levels, args.frontend_margin,
+               % (args.max_steps, args.stop_deadband_levels, args.frontend_margin, args.margin_mode,
                   not args.no_freeze_on_revisit, args.decision))
         summary, trajectories = run_closed_loop(model, data, builder, eval_idx, max_steps=args.max_steps,
                                                 amp=amp, stop_deadband_levels=args.stop_deadband_levels,
                                                 frontend_margin=args.frontend_margin,
                                                 freeze_on_revisit=not args.no_freeze_on_revisit,
-                                                decision=args.decision)
+                                                decision=args.decision, margin_mode=args.margin_mode)
         results["closed_loop"] = summary
         for k, v in summary.items():
             report("  %-30s %s" % (k, ("%.4f" % v) if isinstance(v, float) else v))

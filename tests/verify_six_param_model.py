@@ -302,12 +302,29 @@ def check_near_metrics_and_hysteresis(data, builder, model, norm, val_idx, preds
                    for a in ("depth", "frequency", "focus"))
     check("ladder probabilities sum to 1 and avoid unavailable steps", probs_ok and valid_ok)
 
-    # 滞回：余量给到 1.0 时前端永远不动，轨迹只做后端修正
+    # 滞回作用范围：always 时余量 1.0 挡住每一次换档；revisit 时只挡回头，新设置照常换
     summary, records = run_closed_loop(model, data, builder, val_idx[:24], max_steps=3, batch_size=24,
-                                       frontend_margin=1.0)
-    check("hysteresis of 1.0 stops every front-end change",
+                                       frontend_margin=1.0, margin_mode="always")
+    check("hysteresis 1.0 with margin_mode=always stops every front-end change",
           all(r["frontend_moves"] == 0 for r in records) and summary["oscillated"] == 0.0,
           "backend moves %s" % sorted(set(r["backend_moves"] for r in records)))
+
+    osc_records = run_closed_loop(Oscillator(data.ladders), data, builder, val_idx[:16], max_steps=6, batch_size=16,
+                                  frontend_margin=1.0, margin_mode="revisit", freeze_on_revisit=True)[1]
+    no_repeat = all(len(set(tuple(p["setting"]) for p in r["path"] if p["action"] in ("start", "frontend")))
+                    == 1 + r["frontend_moves"] for r in osc_records)
+    check("margin_mode=revisit lets new settings through but blocks the way back",
+          no_repeat and all(r["frontend_moves"] > 0 for r in osc_records)
+          and all(r["backend_moves"] > 0 for r in osc_records),
+          "front-end moves %s, back-end moves %s, oscillated %.2f"
+          % (sorted(set(r["frontend_moves"] for r in osc_records)),
+             sorted(set(r["backend_moves"] for r in osc_records)),
+             float(np.mean([r["oscillated"] for r in osc_records]))))
+
+    always_records = run_closed_loop(Oscillator(data.ladders), data, builder, val_idx[:16], max_steps=6,
+                                     batch_size=16, frontend_margin=1.0, margin_mode="always")[1]
+    check("margin_mode=always keeps the same model from moving at all",
+          all(r["frontend_moves"] == 0 for r in always_records))
 
     summary, records = run_closed_loop(model, data, builder, val_idx[:24], max_steps=6, batch_size=24,
                                        frontend_margin=0.0, freeze_on_revisit=True)
@@ -393,6 +410,14 @@ def check_smoke(rows, skip_scripts):
         train_idx, val_idx, val_groups = data.split_indices(num_folds=3, fold=0)
         check("fold split is by phantom", not (set(data.group_ids[i] for i in train_idx) & set(val_groups)),
               "train %d / val %d, val %s" % (len(train_idx), len(val_idx), val_groups))
+        lines, coverage = data.physics_coverage(train_idx, val_idx)
+        keys_ok = set(coverage) == {"attenuation_db_cm_mhz", "electronic_noise_db", "sound_speed_mps"}
+        att = coverage.get("attenuation_db_cm_mhz", {})
+        hand = [r["attenuation_db_cm_mhz"] for i, r in enumerate(data.rows) if i in set(val_idx.tolist())]
+        flagged = att.get("extrapolates_below") == (min(hand) < att.get("train_min", 0))
+        check("physics coverage per fold", keys_ok and flagged and len(lines) == 3,
+              " | ".join(line.strip() for line in lines))
+
         norm = data.normalisation(train_idx)
         cw = data.class_weights(train_idx, redraws=2)
         builder = InputBuilder(data.rows_out, data.lines, data.source_rows, norm)
