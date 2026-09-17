@@ -11,17 +11,18 @@
      增益点击为 0 且三组滑块修正都在死区内，则停下。
   4. 达到 max_steps 仍未停下记为未收敛。
 
-    fieldii_v2 的结果带来的两处改动
+    fieldii_v2 / fieldii_v3 的闭环对照带来的改动
 
-滞回（frontend_margin）  新档的概率要比当前档高出这个余量才换档。fieldii_v2 里 25% 的轨迹在
-                        两个设置之间来回跳，而打转的轨迹每一步都在换前端、一次后端修正也做不了，
-                        最终增益误差 5-15 dB，把平均值整个拉高。
-                        fieldii_v3 对每一次换档都要余量（margin_mode="always"），打转降到 14%，
-                        但那等于整体倾向不动，深度仍然平均停早 0.35 档。所以默认改成
-                        margin_mode="revisit"：只有建议回到走过的设置时才要余量，没走过的新设置
-                        照常换——防打转的是回头这一下，不是所有换档。
 打转就冻结前端          回到走过的设置时记为打转，并冻结前端（之后只做后端修正），让轨迹至少把
-                        曝光调好。freeze_on_revisit=False 可恢复旧行为。
+                        曝光调好。fieldii_v2 里 25% 的轨迹在两个设置之间来回跳，每一步都在换前端、
+                        一次后端修正也做不了，最终增益误差 5-15 dB，把平均值整个拉高。冻结之后
+                        停下比例 0.80 -> 0.92、最终增益误差 2.12 -> 0.27 dB。
+                        freeze_on_revisit=False 恢复没有这一条的行为。
+滞回（frontend_margin）  新档的概率要比当前档高出这个余量才换档。**默认关闭（0）**：在 fieldii_v3
+                        的四组对照里（余量 0/0.10 x 只拦回头/每次换档），加余量与不加余量有 99% 的
+                        轨迹逐条相同，汇总指标要么持平要么略差，深度停早 0.345 档三组完全一样。
+                        也就是说防打转靠的是冻结，与余量无关。参数保留供实验：margin_mode 决定余量
+                        作用在哪些换档上（revisit 只拦回头，always 每次换档都要）。
 逐步路径                每条轨迹记录走过的设置与每一步做了什么，summarise 据此统计是哪一轴在打转。
 
 停下后用该分片的标签评判：前端三轴的标签方向是否都为"正确"、增益与 TGC 离教师最优还有多少 dB。
@@ -39,8 +40,8 @@ from .dataset import make_batch
 from .metrics import decode
 
 AXES = ("depth", "frequency", "focus")
-# 滞回作用在哪些换档上：
-#   revisit  只拦回头（建议的设置这条轨迹已经走过），没走过的新设置照常换（默认）
+# 滞回作用在哪些换档上（frontend_margin > 0 时才有意义，默认余量为 0）：
+#   revisit  只拦回头（建议的设置这条轨迹已经走过），没走过的新设置照常换
 #   always   每一次换档都要余量，即 fieldii_v3 的行为
 MARGIN_MODES = ("revisit", "always")
 
@@ -86,7 +87,7 @@ def _apply_margin(dec, j, here, wanted, margin):
 
 @torch.no_grad()
 def run_closed_loop(model, data, builder, idx, max_steps=8, batch_size=64, amp=False,
-                    stop_deadband_levels=0.5, frontend_margin=0.1, freeze_on_revisit=True,
+                    stop_deadband_levels=0.5, frontend_margin=0.0, freeze_on_revisit=True,
                     decision="argmax", margin_mode="revisit"):
     if margin_mode not in MARGIN_MODES:
         raise ValueError("margin_mode must be one of %s" % (MARGIN_MODES,))

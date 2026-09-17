@@ -10,9 +10,8 @@
         last      last.pt
         auto      有 combined 所需文件就用 combined，否则 best，再否则 last
 
-闭环默认带滞回（--frontend-margin 0.1，只拦回头：--margin-mode revisit）并在打转后冻结前端，
-轨迹记录含逐步路径。--margin-mode always 是 fieldii_v3 的行为（每次换档都要余量），
---frontend-margin 0 --no-freeze-on-revisit 是 fieldii_v2 的行为。
+闭环默认是 argmax + 打转后冻结前端，轨迹记录含逐步路径；滞回默认关闭（--frontend-margin 0），
+fieldii_v3 的四组对照显示它与冻结相比贡献为零。--no-freeze-on-revisit 是 fieldii_v2 的行为。
 
 写出 <折目录>/evaluation_report_<选择>_<设置>.txt、evaluation_<选择>_<设置>.json、
 closed_loop_trajectories_<选择>_<设置>.jsonl，--run 时另写 runs/<name>/evaluation_summary_<选择>_<设置>.txt。
@@ -55,16 +54,17 @@ def parse_args(argv=None):
     p.add_argument("--redraw-seeds", type=int, default=3, help="extra evaluations on re-drawn back-end starts")
     p.add_argument("--max-steps", type=int, default=8)
     p.add_argument("--stop-deadband-levels", type=float, default=0.5)
-    p.add_argument("--frontend-margin", type=float, default=0.1,
-                   help="hysteresis: change a front-end step only when the new one beats the current one by this "
-                        "much probability (0 = the fieldii_v2 behaviour)")
+    p.add_argument("--frontend-margin", type=float, default=0.0,
+                   help="experimental hysteresis: change a front-end step only when the new one beats the current "
+                        "one by this much probability. Default 0 (off): on fieldii_v3 it changed 1%% of the "
+                        "trajectories and no summary metric; the freeze is what stops the oscillation")
     p.add_argument("--no-freeze-on-revisit", action="store_true",
                    help="do not freeze the front end after the loop returns to a setting it has already visited")
     p.add_argument("--decision", choices=("argmax", "expected"), default="argmax",
                    help="how the closed loop picks a ladder step")
     p.add_argument("--margin-mode", choices=MARGIN_MODES, default="revisit",
-                   help="where the hysteresis applies: revisit = only when the loop is about to return to a setting "
-                        "it has already visited (default); always = every front-end change (fieldii_v3)")
+                   help="only meaningful with --frontend-margin > 0: revisit = hold only when the loop is about to "
+                        "return to a setting it has already visited; always = every front-end change (fieldii_v3)")
     p.add_argument("--no-closed-loop", action="store_true")
     p.add_argument("--tag", default=None,
                    help="suffix for the output file names; by default it encodes the closed-loop settings so runs "
