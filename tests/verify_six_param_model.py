@@ -508,13 +508,22 @@ def check_smoke(rows, skip_scripts):
                   "%d columns, missing %s" % (len(header), missing))
             TE.main(["--run", os.path.join(runs, "smoke"), "--cache", cache_dir, "--labels", label_path,
                      "--device", "cpu", "--redraw-seeds", "1", "--max-steps", "2", "--frontend-margin", "0.1"])
-            check("evaluation script (combined model) wrote reports",
-                  os.path.exists(os.path.join(fold_dir, "evaluation_report_combined.txt"))
-                  and os.path.exists(os.path.join(runs, "smoke", "evaluation_summary_combined.txt")))
+            tag = "combined_m010_rev_frz_s2"   # --max-steps 2 也进文件名
+            check("evaluation script (combined model) wrote reports named after the loop settings",
+                  os.path.exists(os.path.join(fold_dir, "evaluation_report_%s.txt" % tag))
+                  and os.path.exists(os.path.join(runs, "smoke", "evaluation_summary_%s.txt" % tag)),
+                  tag)
+            TE.main(["--run", os.path.join(runs, "smoke"), "--cache", cache_dir, "--labels", label_path,
+                     "--device", "cpu", "--redraw-seeds", "1", "--max-steps", "2", "--frontend-margin", "0",
+                     "--no-freeze-on-revisit", "--no-closed-loop"])
+            check("a second run with different settings does not overwrite the first",
+                  os.path.exists(os.path.join(fold_dir, "evaluation_report_%s.txt" % tag))
+                  and os.path.exists(os.path.join(fold_dir, "evaluation_report_combined_noloop.txt")),
+                  str(sorted(f for f in os.listdir(fold_dir) if f.startswith("evaluation_report"))))
             payload = torch.load(os.path.join(fold_dir, "best_frontend.pt"), map_location="cpu", weights_only=False)
             check("best_frontend.pt is selected on the near-optimum score",
                   payload.get("selected_by") == "frontend_score_near", str(payload.get("selected_by")))
-            with io.open(os.path.join(fold_dir, "closed_loop_trajectories_combined.jsonl"), encoding="utf-8") as h:
+            with io.open(os.path.join(fold_dir, "closed_loop_trajectories_%s.jsonl" % tag), encoding="utf-8") as h:
                 first = json.loads(h.readline())
             check("closed-loop trajectories carry the path and the steps to the optimum",
                   "path" in first and "frontend_steps_to_optimum" in first and "axis_changes" in first,

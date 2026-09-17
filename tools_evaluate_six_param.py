@@ -14,8 +14,10 @@
 轨迹记录含逐步路径。--margin-mode always 是 fieldii_v3 的行为（每次换档都要余量），
 --frontend-margin 0 --no-freeze-on-revisit 是 fieldii_v2 的行为。
 
-写出 <折目录>/evaluation_report_<选择>.txt、evaluation_<选择>.json、closed_loop_trajectories_<选择>.jsonl，
---run 时另写 runs/<name>/evaluation_summary_<选择>.txt。终端输出与报告同内容（ASCII）。
+写出 <折目录>/evaluation_report_<选择>_<设置>.txt、evaluation_<选择>_<设置>.json、
+closed_loop_trajectories_<选择>_<设置>.jsonl，--run 时另写 runs/<name>/evaluation_summary_<选择>_<设置>.txt。
+<设置> 默认编码闭环参数（如 m010_rev_frz = 余量 0.10、只拦回头、打转冻结），所以不同设置的对照
+不会互相覆盖；--tag 可自定。终端输出与报告同内容（ASCII）。
 
 注意：用 --groups all 评估一个折的检查点时包含训练体模，只能看拟合程度，不能当泛化结论。
 """
@@ -64,6 +66,9 @@ def parse_args(argv=None):
                    help="where the hysteresis applies: revisit = only when the loop is about to return to a setting "
                         "it has already visited (default); always = every front-end change (fieldii_v3)")
     p.add_argument("--no-closed-loop", action="store_true")
+    p.add_argument("--tag", default=None,
+                   help="suffix for the output file names; by default it encodes the closed-loop settings so runs "
+                        "with different settings do not overwrite each other")
     return p.parse_args(argv)
 
 
@@ -78,6 +83,28 @@ class Report(object):
     def save(self, path):
         with io.open(path, "w", encoding="utf-8") as handle:
             handle.write("\n".join(self.lines) + "\n")
+
+
+def output_tag(args):
+    """输出文件名的后缀：默认编码闭环设置。
+
+    三次闭环对照（新默认 / --margin-mode always / 无滞回不冻结）曾经写到同一组文件名里，
+    互相覆盖，只剩最后一次。所以文件名必须带上闭环设置；--tag 可以自定。
+    """
+    if args.tag:
+        return args.tag
+    if args.no_closed_loop:
+        return "noloop"
+    parts = ["m%03d" % int(round(args.frontend_margin * 100)),
+             {"revisit": "rev", "always": "alw"}[args.margin_mode],
+             "nofrz" if args.no_freeze_on_revisit else "frz"]
+    if args.decision != "argmax":
+        parts.append(args.decision)
+    if abs(args.stop_deadband_levels - 0.5) > 1e-9:
+        parts.append("db%03d" % int(round(args.stop_deadband_levels * 100)))
+    if args.max_steps != 8:
+        parts.append("s%d" % args.max_steps)
+    return "_".join(parts)
 
 
 def resolve_fold(fold_dir, select):
@@ -100,13 +127,16 @@ def resolve_fold(fold_dir, select):
 def evaluate_checkpoint(path, args, data_cache, frontend_path=None, label=None):
     report = Report()
     device = torch.device(args.device)
+    suffix = "%s_%s" % (label or "model", output_tag(args))
     if frontend_path is None:
         model, builder, payload = load_checkpoint(path, device)
         label = label or os.path.splitext(os.path.basename(path))[0]
+        suffix = "%s_%s" % (label, output_tag(args))
         described = path
     else:
         model, builder, payload, front_payload = load_combined(frontend_path, path, device)
         label = label or "combined"
+        suffix = "%s_%s" % (label, output_tag(args))
         described = "front-end %s (epoch %s) + back-end %s (epoch %s)" % (
             frontend_path, front_payload.get("epoch"), path, payload.get("epoch"))
     amp = bool(args.amp and device.type == "cuda")
@@ -193,11 +223,11 @@ def evaluate_checkpoint(path, args, data_cache, frontend_path=None, label=None):
         report("")
 
     out_dir = os.path.dirname(os.path.abspath(path))
-    report.save(os.path.join(out_dir, "evaluation_report_%s.txt" % label))
-    with io.open(os.path.join(out_dir, "evaluation_%s.json" % label), "w", encoding="utf-8") as handle:
+    report.save(os.path.join(out_dir, "evaluation_report_%s.txt" % suffix))
+    with io.open(os.path.join(out_dir, "evaluation_%s.json" % suffix), "w", encoding="utf-8") as handle:
         handle.write(json.dumps(results, indent=2, default=float) + "\n")
     if trajectories:
-        with io.open(os.path.join(out_dir, "closed_loop_trajectories_%s.jsonl" % label), "w", encoding="utf-8") as handle:
+        with io.open(os.path.join(out_dir, "closed_loop_trajectories_%s.jsonl" % suffix), "w", encoding="utf-8") as handle:
             for record in trajectories:
                 handle.write(json.dumps(record) + "\n")
     return results
@@ -241,7 +271,7 @@ def main(argv=None):
             values = [r["closed_loop"][key] for r in all_results if np.isfinite(r["closed_loop"][key])]
             if values:
                 report("    %-30s %.4f +- %.4f" % (key, np.mean(values), np.std(values)))
-    report.save(os.path.join(args.run, "evaluation_summary_%s.txt" % "_".join(labels)))
+    report.save(os.path.join(args.run, "evaluation_summary_%s_%s.txt" % ("_".join(labels), output_tag(args))))
 
 
 if __name__ == "__main__":
