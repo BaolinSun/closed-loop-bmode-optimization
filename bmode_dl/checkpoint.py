@@ -46,8 +46,72 @@ def load_checkpoint(path, device="cpu"):
     model.to(device).eval()
     shape = payload["cache_shape"]
     builder = InputBuilder(shape["rows"], shape["lines"], shape["source_rows"], payload["norm"],
-                           use_noise_floor=not payload["config"].get("no_noise_floor", False)).to(device)
+                           use_noise_floor=not payload["config"].get("no_noise_floor", False),
+                           scalar_norm=payload["config"].get("scalar_norm", "fixed")).to(device)
     return model, builder, payload
+
+
+# 按训练数据重新估计、微调时不能被预训练值覆盖的缓冲区（optimum 输出方式的标准化）
+DOMAIN_BUFFERS = ("gain_opt_mean", "gain_opt_std", "tgc_opt_mean", "tgc_opt_std")
+
+
+def load_pretrained(model, path, log=print):
+    """把预训练检查点的权重装进一个新建的网络（微调用）。
+
+    跳过两类参数：
+      形状不同    档位表不同的输出层。实机的深度 7 档、频率 9 档（谐波与基波各 5 档的并集），
+                  Field II 是 6 / 4 档，前端三个头的最后一层只能重新初始化；隐藏层照常装入。
+      域相关缓冲  DOMAIN_BUFFERS：最优增益 / TGC 的均值方差按新数据重新估计，保留新值。
+    返回 (装入数, 形状不同跳过的名字, 缓冲跳过的名字, 新网络里预训练没有的名字)。
+    """
+    payload = torch.load(path, map_location="cpu", weights_only=False)
+    source = payload["model"]
+    target = model.state_dict()
+    loadable, shape_skipped, buffer_skipped = {}, [], []
+    for name, value in source.items():
+        if name not in target:
+            continue
+        if name in DOMAIN_BUFFERS:
+            buffer_skipped.append(name)
+        elif tuple(value.shape) != tuple(target[name].shape):
+            shape_skipped.append(name)
+        else:
+            loadable[name] = value
+    missing = [n for n in target if n not in loadable and n not in DOMAIN_BUFFERS and n not in shape_skipped]
+    model.load_state_dict(loadable, strict=False)
+    log("  pretrained %s (epoch %s, backend_output %s): loaded %d tensors"
+        % (path, payload.get("epoch"), payload["config"].get("backend_output", "delta"), len(loadable)))
+    if shape_skipped:
+        log("    re-initialised (ladder size differs): %s" % ", ".join(shape_skipped))
+    if buffer_skipped:
+        log("    kept new-domain normalisation: %s" % ", ".join(buffer_skipped))
+    if missing:
+        log("    not in the pretrained model: %s" % ", ".join(missing))
+    return len(loadable), shape_skipped, buffer_skipped, missing, payload
+
+
+# 冻结范围：encoders 冻结图像与剖面编码器（含其中的 FiLM）；backbone 冻结除各输出头以外的全部
+HEAD_MODULES = ("gain_head", "tgc_band_head", "slider_dir_head", "depth_head", "frequency_head",
+                "focus_head", "dr_head", "aux_head")
+FREEZE_CHOICES = ("none", "encoders", "backbone")
+
+
+def freeze(model, scope):
+    """按范围冻结参数，返回 (冻结的参数量, 仍可训练的参数量)。"""
+    if scope not in FREEZE_CHOICES:
+        raise ValueError("freeze must be one of %s" % (FREEZE_CHOICES,))
+    for name, parameter in model.named_parameters():
+        top = name.split(".", 1)[0]
+        if scope == "encoders":
+            frozen = top in ("image_encoder", "profile_encoder")
+        elif scope == "backbone":
+            frozen = top not in HEAD_MODULES
+        else:
+            frozen = False
+        parameter.requires_grad_(not frozen)
+    frozen_count = sum(p.numel() for p in model.parameters() if not p.requires_grad)
+    trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    return frozen_count, trainable
 
 
 class CombinedModel(nn.Module):

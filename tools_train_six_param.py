@@ -45,6 +45,17 @@ fieldii_v2 的闭环停点全在这一带，而整体单步准确率（聚焦 0.
     python tools_train_six_param.py --fold none --epochs 150 --frontend-epoch 30 --amp --name fieldii_v2_all
     python tools_train_six_param.py --fold all --amp --backend-output delta --frontend-dropout 0.1 \
         --frontend-label-smoothing 0 --name fieldii_v1_repro
+
+    实机微调（海信，labels_console.jsonl）
+
+    python tools_train_six_param.py --cache data/console_dl_cache --labels data/labels_console.jsonl \
+        --init-checkpoint runs/fieldii_v3_all/all_data/last.pt --freeze encoders --group-by placement \
+        --scalar-norm data --fold all --epochs 60 --lr 1e-4 --warmup-epochs 2 --eval-every 1 --amp \
+        --name console_ft_v1
+
+--init-checkpoint 装入预训练权重；网络结构（输入方式、宽度、层数、后端输出方式、底噪输入）跟随
+检查点。实机的深度 7 档、频率 9 档（谐波 5 档与基波 5 档的并集）与 Field II 不同，前端三个头的
+最后一层重新初始化，其余全部装入。最优增益 / TGC 的标准化按实机训练集重新估计。
 """
 
 import argparse
@@ -59,8 +70,8 @@ import time
 import numpy as np
 import torch
 
-from bmode_dl.checkpoint import model_from_config, save_checkpoint
-from bmode_dl.dataset import INPUT_MODES, FieldIIData, InputBuilder, make_batch
+from bmode_dl.checkpoint import FREEZE_CHOICES, freeze, load_pretrained, model_from_config, save_checkpoint
+from bmode_dl.dataset import GROUP_BY, INPUT_MODES, SCALAR_NORMS, FieldIIData, InputBuilder, make_batch
 from bmode_dl.losses import DEFAULT_WEIGHTS, SixParamLoss
 from bmode_dl.metrics import (MAIN_KEYS, NEAR_KEYS, compute_metrics, flatten_metrics, format_metrics,
                               predict)
@@ -117,6 +128,20 @@ def parse_args(argv=None):
     p.add_argument("--loss-weight", action="append", default=[], metavar="TERM=VALUE",
                    help="override a loss weight, e.g. --loss-weight aux=0; terms: %s" % ", ".join(DEFAULT_WEIGHTS))
     p.add_argument("--val-redraw-seed", type=int, default=12345)
+    # ---- 微调（例如 Field II 预训练 -> 海信实机）
+    p.add_argument("--init-checkpoint", default=None,
+                   help="start from this pretrained checkpoint; its architecture settings (input mode, width, "
+                        "layers, back-end output, noise-floor input) are taken over, ladder-dependent output "
+                        "layers are re-initialised")
+    p.add_argument("--freeze", choices=FREEZE_CHOICES, default="none",
+                   help="encoders: freeze the image and profile encoders; backbone: train the output heads only")
+    p.add_argument("--group-by", dest="group_by", choices=GROUP_BY, default="group",
+                   help="fold unit: group = label group_id (Field II phantom); placement = console probe "
+                        "placement (scene family, merging directories that differ only by a _GEN/_THI suffix), "
+                        "so one placement never sits in both training and validation")
+    p.add_argument("--scalar-norm", dest="scalar_norm", choices=SCALAR_NORMS, default="fixed",
+                   help="fixed = Field II dB constants (fieldii_v1..v3); data = standardise gain, reference and "
+                        "noise floor on the training data (use for console fine-tuning)")
     return p.parse_args(argv)
 
 
@@ -173,6 +198,25 @@ def format_norm(norm):
     return json.dumps(out)
 
 
+# 预训练检查点决定、微调时不能改的结构设置
+ARCHITECTURE_KEYS = ("input_mode", "d_model", "transformer_layers", "no_transformer", "backend_output",
+                     "no_noise_floor")
+
+
+def inherit_architecture(args, report):
+    """微调时网络结构跟随预训练检查点；命令行给了不同的值就报出来并以检查点为准。"""
+    payload = torch.load(args.init_checkpoint, map_location="cpu", weights_only=False)
+    config = payload["config"]
+    defaults = {"input_mode": "full", "d_model": 256, "transformer_layers": 2, "no_transformer": False,
+                "backend_output": "delta", "no_noise_floor": False}
+    for key in ARCHITECTURE_KEYS:
+        value = config.get(key, defaults[key])
+        if getattr(args, key) != value:
+            report("  --%s %s overridden by the pretrained checkpoint: %s"
+                   % (key.replace("_", "-"), getattr(args, key), value))
+        setattr(args, key, value)
+
+
 def train_fold(args, data, fold, out_dir, report):
     os.makedirs(out_dir, exist_ok=True)
     set_seed(args.seed + (0 if fold is None else int(fold)))
@@ -182,16 +226,17 @@ def train_fold(args, data, fold, out_dir, report):
     train_idx, val_idx, val_groups = data.split_indices(args.folds, fold, args.fold_seed)
     train_groups = sorted(set(data.group_ids[i] for i in train_idx))
     report("=========== fold %s ===========" % ("none" if fold is None else fold))
-    report("  train: %d frames, %d phantoms" % (len(train_idx), len(train_groups)))
-    report("  val:   %d frames, %d phantoms %s" % (len(val_idx), len(val_groups), val_groups))
+    report("  train: %d frames, %d groups" % (len(train_idx), len(train_groups)))
+    report("  val:   %d frames, %d groups %s" % (len(val_idx), len(val_groups), val_groups))
     for line in data.label_summary(train_idx):
         report(line)
     coverage_lines, coverage = ([], {})
     if len(val_idx):
         coverage_lines, coverage = data.physics_coverage(train_idx, val_idx)
-        report("  phantom physics coverage (validation outside the training range = that fold extrapolates)")
-        for line in coverage_lines:
-            report(line)
+        if coverage_lines:
+            report("  phantom physics coverage (validation outside the training range = that fold extrapolates)")
+            for line in coverage_lines:
+                report(line)
 
     norm = data.normalisation(train_idx, seed=args.seed)
     class_weights = data.class_weights(train_idx, seed=args.seed)
@@ -199,9 +244,16 @@ def train_fold(args, data, fold, out_dir, report):
     report("  class weights: %s" % json.dumps({k: [round(float(x), 3) for x in v] for k, v in class_weights.items()}))
 
     builder = InputBuilder(data.rows_out, data.lines, data.source_rows, norm,
-                           use_noise_floor=not args.no_noise_floor).to(device)
+                           use_noise_floor=not args.no_noise_floor, scalar_norm=args.scalar_norm).to(device)
     config = vars(args).copy()
-    model = model_from_config(config, data.ladders, norm).to(device)
+    model = model_from_config(config, data.ladders, norm)
+    if args.init_checkpoint:
+        load_pretrained(model, args.init_checkpoint, log=report)
+    frozen_count, trainable_count = freeze(model, args.freeze)
+    if args.freeze != "none":
+        report("  freeze %s: %.2f M frozen, %.2f M trainable" % (args.freeze, frozen_count / 1e6,
+                                                                 trainable_count / 1e6))
+    model = model.to(device)
     criterion = SixParamLoss(class_weights, norm, parse_loss_weights(args.loss_weight),
                              borderline_weight=args.borderline_weight,
                              uncertainty_weighting=args.uncertainty_weighting,
@@ -357,9 +409,12 @@ def main(argv=None):
     report("  torch %s, device %s, amp %s" % (torch.__version__, args.device, args.amp))
     report("  args %s" % json.dumps(vars(args), sort_keys=True))
 
-    data = FieldIIData(args.cache, args.labels, device=args.device, log=report)
-    report("  data: %d frames, %d phantoms, cache %dx%d (source rows %d)"
-           % (data.n, len(set(data.group_ids)), data.rows_out, data.lines, data.source_rows))
+    if args.init_checkpoint:
+        inherit_architecture(args, report)
+    data = FieldIIData(args.cache, args.labels, device=args.device, log=report, group_by=args.group_by)
+    report("  source %s, folds grouped by %s" % (data.source, args.group_by))
+    report("  data: %d frames, %d groups (%s), cache %dx%d (source rows %d)"
+           % (data.n, len(set(data.group_ids)), data.group_by, data.rows_out, data.lines, data.source_rows))
     report("  ladders %s" % json.dumps(data.ladders))
     report("")
 

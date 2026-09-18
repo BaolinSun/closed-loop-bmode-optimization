@@ -140,9 +140,11 @@ def evaluate_checkpoint(path, args, data_cache, frontend_path=None, label=None):
         described = "front-end %s (epoch %s) + back-end %s (epoch %s)" % (
             frontend_path, front_payload.get("epoch"), path, payload.get("epoch"))
     amp = bool(args.amp and device.type == "cuda")
-    key = (args.cache, args.labels)
+    group_by = payload["config"].get("group_by", "group")
+    key = (args.cache, args.labels, group_by)
     if key not in data_cache:
         data_cache[key] = FieldIIData(args.cache, args.labels, device=args.device, ladders=payload["ladders"],
+                                      group_by=group_by,
                                       log=report)
     data = data_cache[key]
     if data.ladders != payload["ladders"]:
@@ -207,7 +209,10 @@ def evaluate_checkpoint(path, args, data_cache, frontend_path=None, label=None):
     report("")
 
     trajectories = []
-    if not args.no_closed_loop:
+    if not args.no_closed_loop and data.source == "console":
+        report("----- closed loop skipped: console data has no full depth x frequency x focus grid per scene -----")
+        report("")
+    elif not args.no_closed_loop:
         report("----- closed loop (max %d steps, stop deadband %.2f gain levels, hysteresis %.2f on %s, "
                "freeze on revisit %s, %s decision) -----"
                % (args.max_steps, args.stop_deadband_levels, args.frontend_margin, args.margin_mode,
@@ -264,7 +269,8 @@ def main(argv=None):
                       if isinstance(r[section].get(key), float) and np.isfinite(r[section][key])]
             if values:
                 report("    %-34s %.4f +- %.4f" % (key, np.mean(values), np.std(values)))
-    if not args.no_closed_loop:
+    # 实机数据没有闭环（每个场景没有完整的设置网格），各折结果里就没有 closed_loop
+    if not args.no_closed_loop and all("closed_loop" in r for r in all_results):
         report("  closed_loop")
         keys = [k for k, v in all_results[0]["closed_loop"].items() if isinstance(v, float)]
         for key in keys:

@@ -144,7 +144,8 @@ def encode_rows(rows, ladders):
             out["gain_db"][i] = row["gain_db"]
             out["tgc_levels"][i] = row["tgc_levels"]
             out["dr_ui"][i] = row["dr_ui"]
-            out["reference_db"][i] = row["reference_db"]
+            # 实机标签行没有 reference_db（渲染参考是本组 pivot），由实机缓存覆盖
+            out["reference_db"][i] = row.get("reference_db", 0.0)
             out["optimal_gain_db"][i] = row["optimal_gain_db"]
             out["optimal_tgc_levels"][i] = row["optimal_tgc_levels"]
             out["deadband_gain_levels"][i] = row["deadband_gain_levels"]

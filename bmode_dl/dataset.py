@@ -13,6 +13,20 @@
 
 底噪是实机上接收机的已知常数的对应物（实机按场次一个常数），所以可以作输入；衰减、电子噪声、
 声速是仿真真值，只作辅助监督目标，不作输入。
+
+    实机（海信）缓存
+
+tools_build_console_training_cache.py 写出同一格式的缓存，另带 reference_db（本组 pivot）与
+底噪两端；实机标签行里没有这些字段，载入时用缓存里的值覆盖。
+
+    标量的刻度（scalar_norm）
+
+fixed  增益 / 10、(reference_db + 45) / 30、(底噪 + 90) / 10：按 Field II 的 dB 刻度写死，
+       fieldii_v1 到 v3 都是这样训练的，旧检查点没有 scalar_norm 字段时按它处理。
+data   增益按训练集均值方差标准化；reference_db 与底噪用图像 dB 的均值方差标准化（它们与图像
+       同一刻度）。实机 dB 刻度与 Field II 差一个任意常数（实机中位约 29 dB，Field II 约 -41 dB），
+       写死的换算会把实机标量推到预训练从没见过的范围（reference 2.3-3.2、底噪 8.6-11.3），
+       所以微调用 data。
 """
 
 import io
@@ -35,6 +49,36 @@ NUM_SCALARS = len(SCALAR_NAMES)
 PROFILE_CHANNELS = 5
 IMAGE_CHANNELS = 3
 INPUT_MODES = ("full", "no_image", "params_only")
+SCALAR_NORMS = ("fixed", "data")
+GROUP_BY = ("group", "placement")
+
+# 只差成像模式后缀的实机目录是同一次摆放：E8、E9 把基波与谐波存成 _GEN / _THI 两个目录
+_MODE_SUFFIXES = ("_GEN", "_THI", "/GEN", "/THI")
+
+
+def group_key(row, group_by="group"):
+    """分折用的组。
+
+    group      标签的 group_id（Field II 是体模；实机是 "场次/成像模式"）
+    placement  实机按探头摆放：独立单位是场景族（docs/console_training_data_20260914.md §2.1，
+               "同一族共享探头位置，必须整族进同一个集合"），即 family_id。同一次摆放在部分场次里
+               本来就跨两种模式（20260903/0 同时有基波 6 帧、谐波 67 帧），但 E8、E9 把基波与谐波
+               存成 _GEN / _THI 两个目录、分成了两个族，所以再把只差模式后缀的目录合并：
+               20260911_E8_GEN/0 与 20260911_E8_THI/0 -> 20260911_E8/0。按目录分组拦不住这一点，
+               会让同一次摆放的图像同时出现在训练与验证里。Field II 行不受影响，仍按体模。
+    """
+    group = row.get("group_id") or row.get("family_id")
+    if group_by != "placement" or row.get("source") != "console":
+        return group
+    family = row.get("family_id") or group
+    if "/" not in family:
+        return family
+    session, index = family.rsplit("/", 1)
+    for suffix in _MODE_SUFFIXES:
+        if session.endswith(suffix):
+            session = session[:-len(suffix)]
+            break
+    return "%s/%s" % (session, index)
 
 
 def read_jsonl(path):
@@ -75,7 +119,10 @@ def make_group_folds(group_ids, phantom_types, num_folds, seed=0):
 class FieldIIData(object):
     """缓存 + 标签，全部在 device 上。"""
 
-    def __init__(self, cache_dir, labels_path, device="cuda", ladders=None, log=print):
+    # 缓存里可以覆盖标签行的字段（实机标签行没有这些，由缓存脚本从标定写入）
+    CACHE_OVERRIDES = ("reference_db", "noise_floor_top_db", "noise_floor_bottom_db")
+
+    def __init__(self, cache_dir, labels_path, device="cuda", ladders=None, log=print, group_by="group"):
         self.device = torch.device(device)
         index, arrays = load_cache(cache_dir)
         self.index = index
@@ -92,7 +139,8 @@ class FieldIIData(object):
 
         self.ladders = ladders if ladders is not None else L.collect_ladders(kept)
         self.encoded = L.encode_rows(kept, self.ladders)
-        self.group_ids = [r.get("group_id") or r.get("family_id") for r in kept]
+        self.group_ids = [group_key(r, group_by) for r in kept]
+        self.group_by = group_by
         self.phantom_types = [r.get("phantom_type", "unknown") for r in kept]
         self.splits = [r.get("split") for r in kept]
         self.frame_ids = [r["frame_id"] for r in kept]
@@ -104,6 +152,18 @@ class FieldIIData(object):
         self.floor = torch.from_numpy(np.ascontiguousarray(arrays["floor"][order], dtype=np.float32)).to(self.device)
         self.min_depth_mm = torch.from_numpy(arrays["min_depth_mm"][order].astype(np.float32)).to(self.device)
         self.max_depth_mm = torch.from_numpy(arrays["max_depth_mm"][order].astype(np.float32)).to(self.device)
+        overridden = []
+        for key in self.CACHE_OVERRIDES:
+            if key in arrays:
+                self.encoded[key] = arrays[key][order].astype(np.float32)
+                overridden.append(key)
+        if overridden:
+            log("  cache overrides label fields: %s" % ", ".join(overridden))
+        lacking = [k for k in self.CACHE_OVERRIDES if k not in arrays and not all(k in r for r in kept)]
+        if lacking:
+            raise RuntimeError("label rows lack %s and the cache does not provide them; build console caches "
+                               "with tools_build_console_training_cache.py" % ", ".join(lacking))
+        self.source = index.get("source", "fieldii")
         self.t = {k: torch.from_numpy(v).to(self.device) for k, v in self.encoded.items()}
         self.n = len(kept)
 
@@ -161,6 +221,9 @@ class FieldIIData(object):
         out = {"db_mean": db_mean, "db_std": db_std,
                "att_mean": float(att.mean()), "att_std": float(att.std().clamp(min=1e-3)) if len(tr) > 1 else 1.0,
                "noise_mean": float(noise.mean()), "noise_std": float(noise.std().clamp(min=1e-3)) if len(tr) > 1 else 1.0}
+        gain = self.t["gain_db"][tr]
+        out["gain_mean"] = float(gain.mean())
+        out["gain_std"] = float(gain.std().clamp(min=0.5)) if len(tr) > 1 else 1.0
         out.update(opt)
         return out
 
@@ -244,14 +307,28 @@ class FieldIIData(object):
 class InputBuilder(torch.nn.Module):
     """从缓存切片 + 当前后端设置构造网络输入。无可学习参数。"""
 
-    def __init__(self, rows, lines, source_rows, norm, use_noise_floor=True):
+    def __init__(self, rows, lines, source_rows, norm, use_noise_floor=True, scalar_norm="fixed"):
         super().__init__()
         self.renderer = BackendRenderer(rows, source_rows)
         frac = row_positions(rows, source_rows) / max(1.0, float(source_rows - 1))
         self.register_buffer("row_fraction", torch.tensor(frac, dtype=torch.float32), persistent=False)
         self.norm = dict(norm)
         self.use_noise_floor = bool(use_noise_floor)
+        if scalar_norm not in SCALAR_NORMS:
+            raise ValueError("scalar_norm must be one of %s" % (SCALAR_NORMS,))
+        self.scalar_norm = scalar_norm
         self.lines = int(lines)
+
+    def _level(self, value, fixed_offset, fixed_scale):
+        """与图像同一 dB 刻度的标量（曝光参考、底噪）。"""
+        if self.scalar_norm == "data":
+            return (value - self.norm["db_mean"]) / self.norm["db_std"]
+        return (value + fixed_offset) / fixed_scale
+
+    def _gain(self, gain_db):
+        if self.scalar_norm == "data":
+            return (gain_db - self.norm["gain_mean"]) / self.norm["gain_std"]
+        return gain_db / 10.0
 
     @torch.no_grad()
     def forward(self, db, floor, min_depth_mm, max_depth_mm, depth_mm, frequency_mhz, focus_mm,
@@ -271,8 +348,8 @@ class InputBuilder(torch.nn.Module):
         norm_db = lambda x: (x - self.norm["db_mean"]) / self.norm["db_std"]
         if self.use_noise_floor:
             excess = (q50 - floor.float()) / 20.0
-            floor_top = (noise_floor_top_db + 90.0) / 10.0
-            floor_bottom = (noise_floor_bottom_db + 90.0) / 10.0
+            floor_top = self._level(noise_floor_top_db, 90.0, 10.0)
+            floor_bottom = self._level(noise_floor_bottom_db, 90.0, 10.0)
         else:
             excess = torch.zeros_like(q50)
             floor_top = torch.zeros_like(noise_floor_top_db)
@@ -282,8 +359,8 @@ class InputBuilder(torch.nn.Module):
 
         scalars = torch.cat([
             (depth_mm / 60.0)[:, None], (frequency_mhz / 8.0)[:, None], (focus_mm / 40.0)[:, None],
-            (gain_db / 10.0)[:, None], (tgc_levels - K.TGC_CENTER_LEVEL) / float(K.TGC_CENTER_LEVEL),
-            (dr_ui / 100.0)[:, None], ((reference_db + 45.0) / 30.0)[:, None], mode[:, None],
+            self._gain(gain_db)[:, None], (tgc_levels - K.TGC_CENTER_LEVEL) / float(K.TGC_CENTER_LEVEL),
+            (dr_ui / 100.0)[:, None], self._level(reference_db, 45.0, 30.0)[:, None], mode[:, None],
             floor_top[:, None], floor_bottom[:, None]], dim=1)
         return {"image": image, "profile": profile, "scalars": scalars}
 

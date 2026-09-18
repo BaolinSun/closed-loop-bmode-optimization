@@ -151,3 +151,39 @@ python tools_train_six_param.py --fold none --epochs 150 --frontend-epoch 30 --a
 - **深度停早与闭环无关**：四组都是 +0.343 到 +0.349 档。它是停点的选择效应——轨迹只停在网络说"不用动"的地方——要靠前端模型本身和体模数量解决。
 
 闭环这条线到此收尾。剩余差距（聚焦停点正确率 0.46、三轴全对 0.22、1 档内 0.84）都在模型侧。
+
+## 11. 实机（海信）微调（2026-09-18）
+
+`labels_console.jsonl`（422 帧、18 个场次、谐波 269 / 基波 153）与 Field II 标签的差异，决定了原有代码不能直接微调：
+
+| 差异 | 不处理的后果 | 做法 |
+|---|---|---|
+| 数据是 BC0（870 深度点 × 256 线），不是 Field II 的 HDF5 包络 | 缓存脚本读不了 | 新增 `tools_build_console_training_cache.py`：BC0 / 本组 counts_per_db + 本组深度响应（即生成后端标签时求解的那幅 dB），降到 512 × 128 |
+| 标签行没有 `reference_db`、底噪 | `encode_rows` 直接报错 | 缓存写入本组 pivot_db 与底噪（先经 `floors_in_counts`，与生成标签同一步），载入时覆盖标签行 |
+| 实机 dB 刻度与 Field II 差一个任意常数（中位约 29 对 −41 dB） | 写死的标量换算把参考推到 2.3–3.2、底噪 8.6–11.3，预训练只见过约 −1 到 1.4 | `--scalar-norm data`：增益按训练集标准化，参考与底噪用图像 dB 的均值方差标准化；旧检查点仍按 `fixed` |
+| 档位不同：深度 7 档（25.1–75.4 mm）、频率 9 档（谐波 4.4–5.7 与基波 5–11.4 的并集）、聚焦 6 档 | 前端输出层维度对不上 | `--init-checkpoint` 部分装入：只有前端三个头的最后一层重新初始化，其余 147 个张量装入；最优增益 / TGC 的标准化按实机重新估计 |
+| 全部来自同一个体模，独立单位是探头摆放；E8、E9 把同一次摆放的基波、谐波存成 `_GEN` / `_THI` 两个目录 | 按目录分组会让同一次摆放同时进训练与验证 | `--group-by placement`：按 family_id 分组并合并只差模式后缀的目录，18 个摆放单位 |
+| 没有完整的 深度 × 频率 × 聚焦 网格 | 闭环仿真无意义 | 评估脚本在实机数据上自动跳过闭环 |
+
+冻结范围 `--freeze encoders`（图像与剖面编码器，3.23 M 冻结、1.73 M 可训练）；`backbone` 只训输出头，`none` 全部训练。
+
+本地冒烟（CPU、第 0 折、从 `runs/fieldii_v3/fold_0/best_backend.pt` 起、20 轮）：链路完整，增益误差从第 1 轮的 7.1 dB 降到 1.34 dB。与同一折的查表基线相比各有胜负——增益平均误差 1.34 对 3.38 dB、深度 0.768 对 0.696 更好，但增益落入死区 0.24 对 0.53、聚焦 0.653 对 0.806 更差。单折 5 个摆放、114 帧，只能说明能学，不是结论。**实机全部来自同一个体模，查表基线相当于"记住这个体模"，是很强的对照**，交叉验证必须与它比。
+
+服务器上的命令见本节下方；建议同时跑"从零训练"对照，才能判断 Field II 预训练有没有用。
+
+```bash
+# 1. 用全部 15 个 Field II 体模重新预训练（标量改为按数据标准化，两个域刻度一致）
+python tools_train_six_param.py --fold none --epochs 150 --scalar-norm data --amp --name fieldii_v3_all
+# 2. 实机微调，4 折按摆放交叉验证
+python tools_train_six_param.py --cache data/console_dl_cache --labels data/labels_console.jsonl \
+    --init-checkpoint runs/fieldii_v3_all/all_data/last.pt --freeze encoders --group-by placement \
+    --scalar-norm data --fold all --epochs 40 --lr 1e-4 --warmup-epochs 2 --eval-every 1 --batch 16 \
+    --amp --name console_ft_v1
+# 3. 评估（含查表基线；闭环自动跳过）
+python tools_evaluate_six_param.py --run runs/console_ft_v1 --cache data/console_dl_cache \
+    --labels data/labels_console.jsonl --amp
+# 4. 对照：不用预训练
+python tools_train_six_param.py --cache data/console_dl_cache --labels data/labels_console.jsonl \
+    --freeze none --group-by placement --scalar-norm data --fold all --epochs 40 --lr 3e-4 \
+    --warmup-epochs 2 --eval-every 1 --batch 16 --amp --name console_scratch
+```

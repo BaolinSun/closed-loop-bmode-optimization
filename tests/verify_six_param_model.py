@@ -10,6 +10,8 @@
   5. fieldii_v1 日志分析后的改动：optimum 后端输出（最优值 - 当前值的算术、零初始化起点、旧检查点仍能载入）、
      前端标签平滑、前后端分开的检查点与组合模型、metrics.csv 保留全部验证指标。
   6. fieldii_v2 日志分析后的改动：近最优帧指标与期望档决策、闭环的滞回与打转冻结、逐步路径记录。
+  7. 实机微调：按探头摆放分组（_GEN/_THI 目录合并）、缓存覆盖标签行的参考与底噪、标量按数据标准化、
+     预训练权重部分装入（档位不同的输出层重新初始化、新域标准化保留）、冻结范围、结构跟随预训练。
 
 用法：python tests/verify_six_param_model.py [--labels data/labels_fieldii.jsonl] [--skip-scripts]
 """
@@ -169,8 +171,11 @@ def check_labels(label_path):
 
 
 # ---------------------------------------------------------------------------------------
-def write_synthetic_cache(rows, out_dir, cache_rows=128, lines=32, seed=0):
-    """合成缓存：dB 随深度衰减 + 斑点，底噪常数。只用于冒烟，不代表真实数据。"""
+def write_synthetic_cache(rows, out_dir, cache_rows=128, lines=32, seed=0, console=False):
+    """合成缓存：dB 随深度衰减 + 斑点，底噪常数。只用于冒烟，不代表真实数据。
+
+    console=True 时按实机缓存的格式另写 reference_db 与底噪两端（实机标签行没有这些字段）。
+    """
     rng = np.random.RandomState(seed)
     n = len(rows)
     z = np.linspace(0, 1, cache_rows)[None, :, None]
@@ -180,12 +185,19 @@ def write_synthetic_cache(rows, out_dir, cache_rows=128, lines=32, seed=0):
           + 5.6 * rng.randn(n, cache_rows, lines)).astype(np.float32)
     floor = np.full((n, cache_rows), -90.0, np.float32)
     os.makedirs(out_dir, exist_ok=True)
+    extra = {}
+    if console:
+        db = db + 70.0                         # 实机 dB 刻度（中位约 29 dB），与 Field II 差一个常数
+        floor = floor + 100.0
+        extra = {"reference_db": (30.0 + 5.0 * rng.rand(n)).astype(np.float32),
+                 "noise_floor_top_db": floor[:, 0].copy(), "noise_floor_bottom_db": floor[:, -1].copy()}
     np.savez(os.path.join(out_dir, "cache.npz"), db=db, floor=floor,
              frame_id=np.array([r["frame_id"] for r in rows]),
-             min_depth_mm=np.full(n, 0.5, np.float32), max_depth_mm=depth)
+             min_depth_mm=np.full(n, 0.5, np.float32), max_depth_mm=depth, **extra)
     with io.open(os.path.join(out_dir, "index.json"), "w", encoding="utf-8") as handle:
-        handle.write(json.dumps({"rows": cache_rows, "lines": lines, "source_rows": K.FIELDII_SOURCE_ROWS,
-                                 "frames": n}) + "\n")
+        handle.write(json.dumps({"rows": cache_rows, "lines": lines,
+                                 "source_rows": 870 if console else K.FIELDII_SOURCE_ROWS,
+                                 "source": "console" if console else "fieldii", "frames": n}) + "\n")
 
 
 def check_backend_output_and_smoothing(data, norm, cw, inputs, tg):
@@ -533,9 +545,139 @@ def check_smoke(rows, skip_scripts):
     emit("")
 
 
+def check_finetune(fieldii_rows, console_path, skip_scripts):
+    """实机微调的各个环节，用合成缓存（实机标签行 + 合成图像）走一遍。"""
+    from bmode_dl.checkpoint import DOMAIN_BUFFERS, HEAD_MODULES, freeze, load_pretrained
+    from bmode_dl.dataset import group_key
+    emit("=========== 7. console fine-tuning (synthetic images, real console labels) ===========")
+    if not os.path.exists(console_path):
+        emit("  skipped: %s not found" % console_path)
+        emit("")
+        return
+    console_rows = read_jsonl(console_path)
+
+    # 分组：同一次摆放的 _GEN / _THI 目录合并，Field II 行不受影响
+    e8 = {group_key(r, "placement") for r in console_rows if r.get("family_id", "").startswith("20260911_E8")}
+    kept = group_key({"source": "console", "group_id": "20260903/0", "family_id": "20260903/0"}, "placement")
+    fieldii = group_key(fieldii_rows[0], "placement")
+    check("placement grouping merges E8_GEN and E8_THI, keeps other families, leaves Field II alone",
+          e8 == {"20260911_E8/0"} and kept == "20260903/0" and fieldii == fieldii_rows[0]["group_id"],
+          "E8 -> %s, Field II -> %s" % (sorted(e8), fieldii))
+    placements = {group_key(r, "placement") for r in console_rows}
+    families = {r.get("family_id") for r in console_rows}
+    emit("  console: %d frames, %d families, %d placements" % (len(console_rows), len(families), len(placements)))
+
+    tmp = tempfile.mkdtemp(prefix="six_param_ft_")
+    try:
+        cache_dir = os.path.join(tmp, "console_cache")
+        write_synthetic_cache(console_rows, cache_dir, console=True)
+        data = FieldIIData(cache_dir, console_path, device="cpu", group_by="placement", log=lambda text: None)
+        arrays = np.load(os.path.join(cache_dir, "cache.npz"))
+        order = [list(arrays["frame_id"]).index(f) for f in data.frame_ids]
+        check("cache overrides reference_db and noise floor on console rows",
+              np.allclose(data.encoded["reference_db"], arrays["reference_db"][order])
+              and np.allclose(data.encoded["noise_floor_top_db"], arrays["noise_floor_top_db"][order]))
+        leaks = []
+        for fold in range(4):
+            train_idx, val_idx, _ = data.split_indices(4, fold)
+            shared = set(data.group_ids[i] for i in train_idx) & set(data.group_ids[i] for i in val_idx)
+            leaks.extend(shared)
+        check("no placement is in both training and validation", not leaks, str(sorted(set(leaks))))
+
+        train_idx, val_idx, _ = data.split_indices(4, 0)
+        norm = data.normalisation(train_idx)
+        builder = InputBuilder(data.rows_out, data.lines, data.source_rows, norm, scalar_norm="data")
+        inputs, tg = make_batch(data, builder, train_idx[:8])
+        tg_ref = data.t["reference_db"][torch.as_tensor(train_idx[:8])]
+        ref_expected = tg_ref - norm["db_mean"]
+        check("scalar_norm=data standardises reference with the image dB statistics",
+              bool(torch.allclose(inputs["scalars"][:, 13], ref_expected / norm["db_std"], atol=1e-5)))
+        fixed = InputBuilder(data.rows_out, data.lines, data.source_rows, norm, scalar_norm="fixed")
+        fixed_inputs, _ = make_batch(data, fixed, train_idx[:8])
+        check("scalar_norm=fixed keeps the Field II constants (legacy checkpoints)",
+              bool(torch.allclose(fixed_inputs["scalars"][:, 13], (tg_ref + 45.0) / 30.0, atol=1e-5)))
+
+        # 预训练（Field II 档位）-> 实机档位：只有前端三个头的最后一层重新初始化，新域标准化保留
+        fieldii_ladders = L.collect_ladders(fieldii_rows)
+        pretrained = model_from_config({"backend_output": "optimum"}, fieldii_ladders,
+                                       {"opt_gain_mean": 7.0, "opt_gain_std": 0.7,
+                                        "opt_tgc_db_mean": [0.0] * 8, "opt_tgc_db_std": [1.0] * 8})
+        with torch.no_grad():
+            for parameter in pretrained.parameters():
+                parameter.add_(0.01)
+        ckpt = os.path.join(tmp, "pretrained.pt")
+        save_checkpoint(ckpt, pretrained, {"backend_output": "optimum", "d_model": 256}, fieldii_ladders,
+                        {"db_mean": -41.0, "db_std": 19.0}, {"gain_dir": [1, 1, 1]},
+                        {"rows": 128, "lines": 32, "source_rows": K.FIELDII_SOURCE_ROWS})
+        target = model_from_config({"backend_output": "optimum"}, data.ladders, norm)
+        loaded, shape_skipped, buffer_skipped, missing, _ = load_pretrained(target, ckpt, log=lambda text: None)
+        expected_skip = {"%s_head.net.3.%s" % (a, w) for a in ("depth", "frequency", "focus")
+                         for w in ("weight", "bias")}
+        check("only the three front-end output layers are re-initialised",
+              set(shape_skipped) == expected_skip and not missing,
+              "%d loaded, skipped %s" % (loaded, sorted(shape_skipped)))
+        check("new-domain normalisation buffers are kept",
+              set(buffer_skipped) == set(DOMAIN_BUFFERS)
+              and abs(float(target.gain_opt_mean) - norm["opt_gain_mean"]) < 1e-5,
+              "gain_opt_mean %.3f (console) vs 7.0 (pretrained)" % float(target.gain_opt_mean))
+        source_state = pretrained.state_dict()
+        copied = all(torch.equal(target.state_dict()[k], v) for k, v in source_state.items()
+                     if k not in expected_skip and k not in DOMAIN_BUFFERS)
+        check("every other tensor equals the pretrained one", copied)
+
+        _, trainable = freeze(target, "encoders")
+        encoder_frozen = all(not p.requires_grad for n, p in target.named_parameters()
+                             if n.split(".", 1)[0] in ("image_encoder", "profile_encoder"))
+        rest_trainable = all(p.requires_grad for n, p in target.named_parameters()
+                             if n.split(".", 1)[0] not in ("image_encoder", "profile_encoder"))
+        check("freeze=encoders freezes only the image and profile encoders", encoder_frozen and rest_trainable,
+              "%.2f M trainable" % (trainable / 1e6))
+        freeze(target, "backbone")
+        heads_only = all(p.requires_grad == (n.split(".", 1)[0] in HEAD_MODULES)
+                         for n, p in target.named_parameters())
+        check("freeze=backbone leaves only the output heads trainable", heads_only)
+        freeze(target, "none")
+        check("freeze=none trains everything", all(p.requires_grad for p in target.parameters()))
+
+        if not skip_scripts:
+            import tools_train_six_param as TT
+            import tools_evaluate_six_param as TE
+            small = model_from_config({"backend_output": "optimum", "d_model": 64, "transformer_layers": 1},
+                                      fieldii_ladders, {"opt_gain_mean": 7.0, "opt_gain_std": 0.7,
+                                                        "opt_tgc_db_mean": [0.0] * 8, "opt_tgc_db_std": [1.0] * 8})
+            small_ckpt = os.path.join(tmp, "pretrained_small.pt")
+            save_checkpoint(small_ckpt, small, {"backend_output": "optimum", "d_model": 64, "transformer_layers": 1},
+                            fieldii_ladders, {"db_mean": -41.0, "db_std": 19.0}, {"gain_dir": [1, 1, 1]},
+                            {"rows": 128, "lines": 32, "source_rows": K.FIELDII_SOURCE_ROWS})
+            runs = os.path.join(tmp, "runs")
+            TT.main(["--cache", cache_dir, "--labels", console_path, "--runs", runs, "--name", "ft",
+                     "--init-checkpoint", small_ckpt, "--freeze", "encoders", "--group-by", "placement",
+                     "--scalar-norm", "data", "--fold", "0", "--epochs", "1", "--batch", "16", "--eval-every", "1",
+                     "--device", "cpu"])
+            fold_dir = os.path.join(runs, "ft", "fold_0")
+            payload = torch.load(os.path.join(fold_dir, "best_backend.pt"), map_location="cpu", weights_only=False)
+            check("fine-tuning inherits the pretrained architecture and records the settings",
+                  payload["config"]["d_model"] == 64 and payload["config"]["transformer_layers"] == 1
+                  and payload["config"]["scalar_norm"] == "data" and payload["config"]["group_by"] == "placement"
+                  and payload["ladders"] == data.ladders,
+                  "d_model %s, layers %s, scalar_norm %s, group_by %s"
+                  % (payload["config"]["d_model"], payload["config"]["transformer_layers"],
+                     payload["config"]["scalar_norm"], payload["config"]["group_by"]))
+            TE.main(["--run", os.path.join(runs, "ft"), "--cache", cache_dir, "--labels", console_path,
+                     "--device", "cpu", "--redraw-seeds", "1"])
+            report_path = [f for f in os.listdir(fold_dir) if f.startswith("evaluation_report_combined")]
+            text = io.open(os.path.join(fold_dir, report_path[0]), encoding="utf-8").read() if report_path else ""
+            check("evaluation on console data runs and skips the closed loop",
+                  "closed loop skipped" in text and "settings " in text, str(report_path))
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+    emit("")
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--labels", default=os.path.join(ROOT, "data", "labels_fieldii.jsonl"))
+    parser.add_argument("--console-labels", default=os.path.join(ROOT, "data", "labels_console.jsonl"))
     parser.add_argument("--skip-scripts", action="store_true")
     args = parser.parse_args()
     os.chdir(ROOT)
@@ -545,6 +687,7 @@ def main():
     rows = check_labels(args.labels)
     emit("")
     check_smoke(rows, args.skip_scripts)
+    check_finetune(rows, args.console_labels, args.skip_scripts)
     emit("=========== result ===========")
     emit("  %d failure(s)%s" % (len(FAILURES), (": " + ", ".join(FAILURES)) if FAILURES else ""))
     captured = list(LINES)
