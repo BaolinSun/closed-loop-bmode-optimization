@@ -143,15 +143,24 @@ def decode(out, tg):
 #   只看设置的查表基线
 
 def settings_lookup_baseline(data, train_idx, eval_idx, start="label", seed=None):
-    """同一 (深度, 频率, 聚焦) 设置下训练集的众数最优档 / 中位最优增益与滑块。
+    """同一 (成像模式, 深度, 频率, 聚焦) 设置下训练集的众数最优档 / 中位最优增益与滑块。
 
     对应 docs/fieldii_labels_20260915.md §4.1 "只用设置猜方向" 的检查；网络要比它好才说明看了图像。
+
+    成像模式必须在键里：实机的基波与谐波增益刻度相差很大（每级 dB 不同、档位区间不同），而 5.0 MHz
+    两种模式都有、深度与聚焦档也共用，不分模式时同一格里混着两种模式，没见过的格还会退回两种
+    模式合在一起的中位数。console_ft_v1 的首次评估就是这样：查表增益误差 5.24 dB，比只按模式取
+    均值（约 2.4 dB）还差，把网络的优势夸大了一倍多。Field II 只有基波，加这一维不影响它的结果。
+    没见过的格退回同模式的训练集中位数。
     """
     train_idx = np.asarray(train_idx)
     enc = data.encoded
     table = defaultdict(list)
+    by_mode = defaultdict(list)
     for i in train_idx:
-        table[(int(enc["depth_idx"][i]), int(enc["frequency_idx"][i]), int(enc["focus_idx"][i]))].append(i)
+        mode = int(enc["mode"][i])
+        table[(mode, int(enc["depth_idx"][i]), int(enc["frequency_idx"][i]), int(enc["focus_idx"][i]))].append(i)
+        by_mode[mode].append(i)
 
     def mode_of(values, default):
         values = [v for v in values if v >= 0]
@@ -159,6 +168,8 @@ def settings_lookup_baseline(data, train_idx, eval_idx, start="label", seed=None
             return default
         return int(np.bincount(values).argmax())
 
+    fallback_gain = {m: np.median(enc["optimal_gain_db"][ix]) for m, ix in by_mode.items()}
+    fallback_tgc = {m: np.median(enc["optimal_tgc_levels"][ix], axis=0) for m, ix in by_mode.items()}
     all_gain = np.median(enc["optimal_gain_db"][train_idx])
     all_tgc = np.median(enc["optimal_tgc_levels"][train_idx], axis=0)
     _, targets = _targets_only(data, eval_idx, start, seed)
@@ -167,16 +178,19 @@ def settings_lookup_baseline(data, train_idx, eval_idx, start="label", seed=None
              "depth_idx": np.zeros(n, np.int64), "frequency_idx": np.zeros(n, np.int64),
              "focus_idx": np.zeros(n, np.int64)}
     for j, i in enumerate(eval_idx):
-        key = (int(enc["depth_idx"][i]), int(enc["frequency_idx"][i]), int(enc["focus_idx"][i]))
+        mode = int(enc["mode"][i])
+        key = (mode, int(enc["depth_idx"][i]), int(enc["frequency_idx"][i]), int(enc["focus_idx"][i]))
         members = table.get(key, [])
-        opt_gain = np.median(enc["optimal_gain_db"][members]) if members else all_gain
-        opt_tgc = np.median(enc["optimal_tgc_levels"][members], axis=0) if members else all_tgc
-        tgc_slope = K.TGC_DB_PER_LEVEL[int(enc["mode"][i])]
+        opt_gain = (np.median(enc["optimal_gain_db"][members]) if members
+                    else fallback_gain.get(mode, all_gain))
+        opt_tgc = (np.median(enc["optimal_tgc_levels"][members], axis=0) if members
+                   else fallback_tgc.get(mode, all_tgc))
+        tgc_slope = K.TGC_DB_PER_LEVEL[mode]
         preds["gain_delta_db"][j] = opt_gain - targets["gain_db"][j]
         preds["tgc_delta_db"][j] = (opt_tgc - targets["tgc_levels"][j]) * tgc_slope
-        preds["depth_idx"][j] = mode_of([int(enc["optimal_depth_idx"][m]) for m in members], key[0])
-        preds["frequency_idx"][j] = mode_of([int(enc["optimal_frequency_idx"][m]) for m in members], key[1])
-        preds["focus_idx"][j] = mode_of([int(enc["optimal_focus_idx"][m]) for m in members], key[2])
+        preds["depth_idx"][j] = mode_of([int(enc["optimal_depth_idx"][m]) for m in members], key[1])
+        preds["frequency_idx"][j] = mode_of([int(enc["optimal_frequency_idx"][m]) for m in members], key[2])
+        preds["focus_idx"][j] = mode_of([int(enc["optimal_focus_idx"][m]) for m in members], key[3])
     return preds, targets
 
 
