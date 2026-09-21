@@ -1,5 +1,10 @@
-# 数据不进版本库：field_ii 9.3G + hisense_medical 2.8G
-data/
+# 原始数据不进版本库：field_ii 12G + hisense_medical 2.8G。
+# 但两个标签文件要进：它们是所有下游工作的输入，体积小（git 内部按 zlib 压缩后
+# Field II 约 1.1 MB、实机约 0.1 MB），而且每次重新生成都需要能看出改了什么。
+# 备份版本（labels_*_before_*.jsonl、labels_fieldii_1?phantoms.jsonl）仍然不进。
+data/*
+!data/labels_console.jsonl
+!data/labels_fieldii.jsonl
 
 __pycache__/
 *.pyc
