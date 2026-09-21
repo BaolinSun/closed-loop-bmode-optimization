@@ -13,7 +13,8 @@ reference_db 等 Field II 专有字段。数据目录 data/field_ii/full_noise�
   噪声底    实机是每个场次一个常数；Field II 由 fieldii_noise 按生成器参数逐行解析算出
             （接收孔径随深度变大，底噪随深度下降约 0.2 dB/mm）
   阶梯      Field II 的深度 25/30/35/42/50/60 mm、频率 4/5/6.5/8 MHz、聚焦 5 到 40 mm
-  分辨率表  Field II 自己的，由无噪声旧数据集的点靶体模测得（point_targets.fieldii_resolution_table）
+  分辨率表  Field II 自己的，由本数据集训练集的点靶体模测得（point_targets.fieldii_resolution_table），
+            缓存在 bmode_opt/fieldii_resolution_table.json
 
     2026-09-13 推迟、仿真完成后要做的两处修改，在这里落实
 
@@ -60,7 +61,11 @@ from fieldii_loader import find_shards, load_shard, parse_shard_name
 import tools_generate_console_labels as G
 
 DATA_DIR = "data/field_ii/full_noise"
-POINT_TABLE_DIR = "data/field_ii/full"
+# 分辨率表的来源。2026-09-21 起用本数据集自己的训练集点靶体模；在它们生成之前借用的是
+# 无噪声旧数据集 data/field_ii/full。两张表最锐的一档都是 8 MHz，各频率分数最大差 0.046
+# （4 MHz），排序完全一致；换成新表的好处是同源、同噪声，而且多了 25 mm 显示深度这一档
+# （旧表最浅只到 30 mm，25 mm 是外推的），靶数也从 49-89 根增加到 70-156 根。
+POINT_TABLE_DIR = DATA_DIR
 RESOLUTION_CACHE = "bmode_opt/fieldii_resolution_table.json"
 OUT_PATH = "data/labels_fieldii.jsonl"
 REPORT_PATH = "tools_generate_fieldii_labels.txt"
@@ -84,7 +89,7 @@ def load_resolution_table():
         data = json.load(io.open(RESOLUTION_CACHE, encoding="utf-8"))
     else:
         tables, pins, sets = PT.fieldii_resolution_table(POINT_TABLE_DIR, split="train")
-        data = {"source": POINT_TABLE_DIR + " (train point phantoms, noiseless)",
+        data = {"source": POINT_TABLE_DIR + " (train point phantoms)",
                 "created": time.strftime("%Y-%m-%d %H:%M"),
                 "tables": [{"display_depth_mm": d, "scores": {"%g" % f: s for f, s in sc.items()},
                             "pins": pins[(m, d)], "comparison_sets": sets[(m, d)]}
