@@ -66,6 +66,7 @@ import math
 import os
 import random
 import time
+from collections import Counter
 
 import numpy as np
 import torch
@@ -412,7 +413,12 @@ def main(argv=None):
     if args.init_checkpoint:
         inherit_architecture(args, report)
     data = FieldIIData(args.cache, args.labels, device=args.device, log=report, group_by=args.group_by)
-    report("  source %s, folds grouped by %s" % (data.source, args.group_by))
+    if data.uses_split_field():
+        counts = Counter(s for s in data.splits)
+        report("  source %s, split from the labels: %s (folds not used)"
+               % (data.source, dict(sorted((str(k), v) for k, v in counts.items()))))
+    else:
+        report("  source %s, folds grouped by %s" % (data.source, args.group_by))
     report("  data: %d frames, %d groups (%s), cache %dx%d (source rows %d)"
            % (data.n, len(set(data.group_ids)), data.group_by, data.rows_out, data.lines, data.source_rows))
     report("  ladders %s" % json.dumps(data.ladders))
@@ -424,6 +430,13 @@ def main(argv=None):
         folds = list(range(args.folds))
     else:
         folds = [int(args.fold)]
+
+    # 标签自带 val 划分时不分折：每一折都会得到同一套训练 / 验证集，跑 4 折只是重复 4 次
+    if data.uses_split_field() and folds != [None]:
+        if len(folds) > 1:
+            report("  NOTE: the labels carry a val split, so folds are ignored; running once instead of %d times"
+                   % len(folds))
+        folds = [0]
 
     results = {}
     for fold in folds:

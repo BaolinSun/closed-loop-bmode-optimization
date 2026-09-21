@@ -47,7 +47,10 @@ def parse_args(argv=None):
     p.add_argument("--cache", default="data/fieldii_dl_cache")
     p.add_argument("--labels", default="data/labels_fieldii.jsonl")
     p.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
-    p.add_argument("--groups", default="val", help="'val' (checkpoint's validation phantoms) or 'all'")
+    p.add_argument("--groups", choices=("val", "test", "all"), default="val",
+                   help="'val' = the checkpoint's validation groups; 'test' = the rows the labels mark split=test, "
+                        "which never took part in training or model selection (run it once, at the end); "
+                        "'all' = everything, which for a fold checkpoint includes its own training groups")
     p.add_argument("--select", choices=("auto", "combined", "best", "last"), default="auto",
                    help="which model of each fold to evaluate with --run")
     p.add_argument("--amp", action="store_true")
@@ -93,6 +96,8 @@ def output_tag(args):
     """
     if args.tag:
         return args.tag
+    if args.groups != "val":
+        return "%s_%s" % (args.groups, "noloop" if args.no_closed_loop else "loop")
     if args.no_closed_loop:
         return "noloop"
     parts = ["m%03d" % int(round(args.frontend_margin * 100)),
@@ -151,7 +156,12 @@ def evaluate_checkpoint(path, args, data_cache, frontend_path=None, label=None):
         raise SystemExit("ladders in %s differ from the data" % path)
 
     val_groups = payload.get("val_groups") or []
-    if args.groups == "all" or not val_groups:
+    if args.groups == "test":
+        eval_idx = np.array([i for i in range(data.n) if data.splits[i] == "test"], np.int64)
+        if not len(eval_idx):
+            raise SystemExit("no label row has split=test")
+        scope = "held-out test groups %s" % sorted(set(data.group_ids[i] for i in eval_idx))
+    elif args.groups == "all" or not val_groups:
         eval_idx = np.arange(data.n)
         scope = "all phantoms" + ("" if val_groups else " (checkpoint has no validation set)")
     else:

@@ -168,6 +168,10 @@ class FieldIIData(object):
         self.n = len(kept)
 
     # -------------------------------------------------------------------------------
+    def uses_split_field(self):
+        """标签自带 val 划分（仿真跑完验证集后即如此），分折参数不再起作用。"""
+        return "val" in set(s for s in self.splits if s)
+
     def split_indices(self, num_folds=4, fold=0, seed=0):
         """返回 (train_idx, val_idx, val_groups)。
 
