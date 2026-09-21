@@ -24,6 +24,10 @@
                         也就是说防打转靠的是冻结，与余量无关。参数保留供实验：margin_mode 决定余量
                         作用在哪些换档上（revisit 只拦回头，always 每次换档都要）。
 逐步路径                每条轨迹记录走过的设置与每一步做了什么，summarise 据此统计是哪一轴在打转。
+后端限幅                单步增益修正不超过 max_gain_step_clicks 级、相对起点的累计变化不超过
+                        max_gain_total_clicks 级（0 = 不限）。实机档位是有界的；fieldii_v4 的 data 模型
+                        曾给出单步 +368、-472、+671 级的修正，把最终增益推出 266 dB。限幅只是最后一道
+                        保险，根治靠训练时的不变性约束；被限幅的轨迹比例记为 gain_clamped。
 
 停下后用该分片的标签评判：前端三轴的标签方向是否都为"正确"、增益与 TGC 离教师最优还有多少 dB。
 停止用的死区是固定值（stop_deadband_levels，默认 0.5 级，约为训练集死区中位数），因为实机上
@@ -88,7 +92,8 @@ def _apply_margin(dec, j, here, wanted, margin):
 @torch.no_grad()
 def run_closed_loop(model, data, builder, idx, max_steps=8, batch_size=64, amp=False,
                     stop_deadband_levels=0.5, frontend_margin=0.0, freeze_on_revisit=True,
-                    decision="argmax", margin_mode="revisit"):
+                    decision="argmax", margin_mode="revisit", max_gain_step_clicks=40,
+                    max_gain_total_clicks=120):
     if margin_mode not in MARGIN_MODES:
         raise ValueError("margin_mode must be one of %s" % (MARGIN_MODES,))
     model.eval()
@@ -107,6 +112,8 @@ def run_closed_loop(model, data, builder, idx, max_steps=8, batch_size=64, amp=F
     frontend_moves = np.zeros(n, np.int64)
     backend_moves = np.zeros(n, np.int64)
     axis_changes = np.zeros((n, len(AXES)), np.int64)
+    total_clicks = np.zeros(n, np.float64)
+    clamped = np.zeros(n, bool)
     here0 = [(int(enc["depth_idx"][i]), int(enc["frequency_idx"][i]), int(enc["focus_idx"][i])) for i in idx]
     visited = [{h} for h in here0]
     paths = [[{"step": 0, "action": "start", "setting": list(h)}] for h in here0]
@@ -173,6 +180,13 @@ def run_closed_loop(model, data, builder, idx, max_steps=8, batch_size=64, amp=F
                     done[traj] = True
                     paths[traj].append({"step": int(steps[traj]), "action": "stop", "setting": list(here)})
                     continue
+                if max_gain_step_clicks and abs(clicks) > max_gain_step_clicks:
+                    clicks = float(np.sign(clicks) * max_gain_step_clicks)
+                    clamped[traj] = True
+                if max_gain_total_clicks and abs(total_clicks[traj] + clicks) > max_gain_total_clicks:
+                    clicks = float(np.sign(total_clicks[traj] + clicks) * max_gain_total_clicks - total_clicks[traj])
+                    clamped[traj] = True
+                total_clicks[traj] += clicks
                 gain_rel[traj] += clicks * gain_slope
                 if not sliders_ok:
                     levels[traj] = np.clip(np.round(levels[traj] + delta_levels), K.TGC_MIN_LEVEL, K.TGC_MAX_LEVEL)
@@ -203,6 +217,7 @@ def run_closed_loop(model, data, builder, idx, max_steps=8, batch_size=64, amp=F
         records.append({
             "start_frame": data.frame_ids[start_row], "final_frame": data.frame_ids[row],
             "converged": bool(done[t]), "oscillated": bool(oscillated[t]), "frozen": bool(frozen[t]),
+            "gain_clamped": bool(clamped[t]), "gain_total_clicks": float(total_clicks[t]),
             "steps": int(steps[t]), "frontend_moves": int(frontend_moves[t]), "backend_moves": int(backend_moves[t]),
             "axis_changes": {axis: int(axis_changes[t, a]) for a, axis in enumerate(AXES)},
             "frontend_correct": axes_ok, "frontend_steps_to_optimum": axes_steps,
@@ -223,6 +238,7 @@ def summarise(records):
            "converged": float(np.mean([r["converged"] for r in records])),
            "oscillated": float(np.mean([r["oscillated"] for r in records])),
            "frozen_frontend": float(np.mean([r["frozen"] for r in records])),
+           "gain_clamped": float(np.mean([r.get("gain_clamped", False) for r in records])),
            "steps_hist": dict(sorted(Counter(r["steps"] for r in records).items())),
            "frontend_moves_hist": dict(sorted(Counter(r["frontend_moves"] for r in records).items())),
            "gain_abs_error_db_start": float(np.mean([abs(r["start_gain_error_db"]) for r in records])),

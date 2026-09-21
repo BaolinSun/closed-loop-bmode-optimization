@@ -73,15 +73,19 @@ import torch
 
 from bmode_dl.checkpoint import FREEZE_CHOICES, freeze, load_pretrained, model_from_config, save_checkpoint
 from bmode_dl.dataset import GROUP_BY, INPUT_MODES, SCALAR_NORMS, FieldIIData, InputBuilder, make_batch
-from bmode_dl.losses import DEFAULT_WEIGHTS, SixParamLoss
+from bmode_dl.losses import DEFAULT_WEIGHTS, SixParamLoss, invariance_loss
 from bmode_dl.metrics import (MAIN_KEYS, NEAR_KEYS, compute_metrics, flatten_metrics, format_metrics,
-                              predict)
+                              gain_feedback_slope, predict)
 from bmode_dl.model import BACKEND_OUTPUTS, count_parameters
 
-BACKEND_KEYS = ("gain_mae_db", "gain_within_deadband", "gain_dir_f1_derived", "tgc_mae_db", "slider_dir_f1_derived")
+BACKEND_KEYS = ("gain_mae_db", "gain_within_deadband", "gain_dir_f1_derived", "tgc_mae_db", "slider_dir_f1_derived",
+                "gain_feedback_slope", "gain_feedback_frac_gt1")
 FRONTEND_KEYS = ("depth_top1", "depth_within1", "depth_dir_f1_derived", "frequency_hit", "frequency_dir_f1_derived",
                  "focus_top1", "focus_within1", "focus_dir_f1_derived") + NEAR_KEYS
 FRONTEND_SELECT = ("frontend_score_near", "frontend_score")
+# 预测最优增益对当前增益的斜率中位数不小于它时，闭环会正反馈发散（fieldii_v4 的 data 模型是 1.45）。
+# 这样的轮次不能被选为 best.pt / best_backend.pt，除非还没有任何稳定的轮次。
+STABLE_SLOPE = 0.5
 
 
 def parse_args(argv=None):
@@ -140,9 +144,16 @@ def parse_args(argv=None):
                    help="fold unit: group = label group_id (Field II phantom); placement = console probe "
                         "placement (scene family, merging directories that differ only by a _GEN/_THI suffix), "
                         "so one placement never sits in both training and validation")
+    p.add_argument("--invariance-weight", type=float, default=1.0,
+                   help="weight of the penalty on the predicted optimum gain / TGC changing with the back-end "
+                        "start (a second pass on the same images from a re-drawn start); 0 turns it off")
+    p.add_argument("--overwrite", action="store_true",
+                   help="allow reusing an existing run directory (its report is started afresh)")
     p.add_argument("--scalar-norm", dest="scalar_norm", choices=SCALAR_NORMS, default="fixed",
                    help="fixed = Field II dB constants (fieldii_v1..v3); data = standardise gain, reference and "
-                        "noise floor on the training data (use for console fine-tuning)")
+                        "noise floor on the training data (made fieldii_v4's gain feedback slope 1.45 and its "
+                        "closed loop diverge); levels = gain as in fixed, reference and noise floor standardised "
+                        "(recommended for Field II pre-training that is to be fine-tuned on the console)")
     return p.parse_args(argv)
 
 
@@ -309,6 +320,16 @@ def train_fold(args, data, fold, out_dir, report):
             with torch.autocast(device_type=device.type, dtype=torch.float16, enabled=amp):
                 out = model(inputs)
             loss, logs = criterion(out, targets)
+            if args.invariance_weight > 0:
+                # 同一批图像换一个后端起点再算一次：预测的最优值不应随起点变
+                inputs_b, targets_b = make_batch(data, builder, batch_idx, start="redraw", generator=generator,
+                                                 flip=flip)
+                with torch.autocast(device_type=device.type, dtype=torch.float16, enabled=amp):
+                    out_b = model(inputs_b)
+                invariance = invariance_loss(out, targets, out_b, targets_b)
+                loss = loss + args.invariance_weight * invariance
+                logs["invariance"] = float(invariance.detach())
+                logs["total"] = float(loss.detach())
             optimizer.zero_grad(set_to_none=True)
             scaler.scale(loss).backward()
             scaler.unscale_(optimizer)
@@ -331,16 +352,28 @@ def train_fold(args, data, fold, out_dir, report):
             metrics = compute_metrics(preds, tg, norm)
             preds_r, tg_r = predict(model, data, builder, val_idx, start="redraw", seed=args.val_redraw_seed, amp=amp)
             metrics_r = compute_metrics(preds_r, tg_r, norm)
+            slope, slope_unstable = gain_feedback_slope(model, data, builder, val_idx, seed=args.seed, amp=amp)
+            metrics["gain_feedback_slope"] = slope
+            metrics["gain_feedback_frac_gt1"] = slope_unstable
+            stable = np.isfinite(slope) and slope < STABLE_SLOPE
             row.update(flatten_metrics(metrics, "val_"))
             row.update(flatten_metrics(metrics_r, "valredraw_"))
             line += "  | val %s" % format_metrics(metrics, ("score", "backend_score", front_key, "gain_mae_db",
                                                               "tgc_mae_db", "depth_top1", "frequency_hit",
-                                                              "focus_top1"))
+                                                              "focus_top1", "gain_feedback_slope"))
+            if not stable:
+                line += "  UNSTABLE(slope>=%.1f)" % STABLE_SLOPE
             improved = ""
             for name in selection:
                 value = metrics.get(name, float("nan"))
-                if np.isfinite(value) and value > best[name]["score"]:
-                    best[name] = {"score": value, "epoch": epoch, "metrics": metrics}
+                # 后端相关的检查点只在闭环稳定的轮次里选；还没有稳定轮次时才退而求其次
+                needs_stability = name in ("score", "backend_score")
+                if needs_stability and not stable and best[name].get("stable", False):
+                    continue
+                better = value > best[name]["score"] or (needs_stability and stable
+                                                         and not best[name].get("stable", False))
+                if np.isfinite(value) and better:
+                    best[name] = {"score": value, "epoch": epoch, "metrics": metrics, "stable": bool(stable)}
                     save_checkpoint(os.path.join(out_dir, files[name]), model, config, data.ladders, norm,
                                     class_weights, cache_shape,
                                     dict(extra, epoch=epoch, selected_by=name, metrics=metrics,
@@ -403,8 +436,13 @@ def main(argv=None):
     args = parse_args(argv)
     name = args.name or time.strftime("six_param_%Y%m%d_%H%M%S")
     run_dir = os.path.join(args.runs, name)
+    report_path = os.path.join(run_dir, "train_report.txt")
+    if os.path.exists(report_path):
+        if not args.overwrite:
+            raise SystemExit("%s already holds a run; choose another --name or pass --overwrite" % run_dir)
+        os.remove(report_path)          # 不再把两次训练的日志接在一起
     os.makedirs(run_dir, exist_ok=True)
-    report = Report(os.path.join(run_dir, "train_report.txt"))
+    report = Report(report_path)
     report("=========== six-parameter network training ===========")
     report("  run dir %s" % run_dir)
     report("  torch %s, device %s, amp %s" % (torch.__version__, args.device, args.amp))

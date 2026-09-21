@@ -25,8 +25,13 @@ fixed  增益 / 10、(reference_db + 45) / 30、(底噪 + 90) / 10：按 Field I
        fieldii_v1 到 v3 都是这样训练的，旧检查点没有 scalar_norm 字段时按它处理。
 data   增益按训练集均值方差标准化；reference_db 与底噪用图像 dB 的均值方差标准化（它们与图像
        同一刻度）。实机 dB 刻度与 Field II 差一个任意常数（实机中位约 29 dB，Field II 约 -41 dB），
-       写死的换算会把实机标量推到预训练从没见过的范围（reference 2.3-3.2、底噪 8.6-11.3），
-       所以微调用 data。
+       写死的换算会把实机标量推到预训练从没见过的范围（reference 2.3-3.2、底噪 8.6-11.3）。
+       但在 Field II 上它有副作用：训练集增益标准差只有 3.8 dB，标准化后当前增益成了很强的输入，
+       而训练起点是在最优值附近抽的，网络学会了"最优 ≈ 当前 + 修正"的捷径——fieldii_v4 两次用
+       data 训练，预测最优对当前增益的斜率都大于 1（中位 1.45），闭环发散（最终增益误差 12-36 dB）；
+       用 fixed 训练的斜率为 0.002，闭环稳定。
+levels 推荐：增益照 fixed（除以 10），只有与图像同一刻度的参考与底噪按 data 标准化。
+       增益是捷径的来源，参考与底噪是跨域刻度差的来源，两个问题分开处理。
 """
 
 import io
@@ -49,7 +54,7 @@ NUM_SCALARS = len(SCALAR_NAMES)
 PROFILE_CHANNELS = 5
 IMAGE_CHANNELS = 3
 INPUT_MODES = ("full", "no_image", "params_only")
-SCALAR_NORMS = ("fixed", "data")
+SCALAR_NORMS = ("fixed", "data", "levels")
 GROUP_BY = ("group", "placement")
 
 # 只差成像模式后缀的实机目录是同一次摆放：E8、E9 把基波与谐波存成 _GEN / _THI 两个目录
@@ -324,8 +329,8 @@ class InputBuilder(torch.nn.Module):
         self.lines = int(lines)
 
     def _level(self, value, fixed_offset, fixed_scale):
-        """与图像同一 dB 刻度的标量（曝光参考、底噪）。"""
-        if self.scalar_norm == "data":
+        """与图像同一 dB 刻度的标量（曝光参考、底噪）。data 与 levels 都按图像 dB 标准化。"""
+        if self.scalar_norm in ("data", "levels"):
             return (value - self.norm["db_mean"]) / self.norm["db_std"]
         return (value + fixed_offset) / fixed_scale
 

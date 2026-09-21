@@ -12,6 +12,8 @@
   6. fieldii_v2 日志分析后的改动：近最优帧指标与期望档决策、闭环的滞回与打转冻结、逐步路径记录。
   7. 实机微调：按探头摆放分组（_GEN/_THI 目录合并）、缓存覆盖标签行的参考与底噪、标量按数据标准化、
      预训练权重部分装入（档位不同的输出层重新初始化、新域标准化保留）、冻结范围、结构跟随预训练。
+  8. 增益正反馈的防护：levels 标量刻度、预测最优不随起点变的不变性损失、正反馈斜率指标、
+     闭环单步与累计限幅、运行目录防覆盖。
 
 用法：python tests/verify_six_param_model.py [--labels data/labels_fieldii.jsonl] [--skip-scripts]
 """
@@ -290,6 +292,82 @@ class Oscillator(torch.nn.Module):
         }
 
 
+class ShiftedOptimum(torch.nn.Module):
+    """假模型：修正量 = 系数 * (6 - 当前增益) + 常数，即预测最优 = 当前 + 修正。
+
+    系数 1、常数 0 时预测最优恒为 6 dB（正确，斜率 0）；系数 0、常数 c 时预测最优 = 当前 + c
+    （正反馈，斜率 1）；用来检验斜率指标、不变性损失与闭环限幅。
+    """
+
+    def __init__(self, ladders, pull=1.0, push=0.0):
+        super().__init__()
+        self.inner = Oscillator(ladders)
+        self.pull, self.push = float(pull), float(push)
+
+    def forward(self, inputs):
+        out = self.inner(inputs)
+        current = inputs["scalars"][:, 3].float() * 10.0          # fixed 刻度下还原当前增益
+        out["gain_delta_db"] = self.pull * (6.0 - current) + self.push
+        # 最优 TGC 恒为 0 dB（修正量 = -当前），这样 TGC 部分对两种假模型都不随起点变
+        out["tgc_delta_db"] = -inputs["scalars"][:, 4:12].float() * 127.0 * K.TGC_DB_PER_LEVEL[0]
+        # 前端保持不动，只测后端
+        for axis, ladder in (("depth", "depth_mm"), ("frequency", "frequency_mhz"), ("focus", "focus_mm")):
+            values = inputs["scalars"][:, {"depth": 0, "frequency": 1, "focus": 2}[axis]].float() \
+                * {"depth": 60.0, "frequency": 8.0, "focus": 40.0}[axis]
+            here = self.inner._current(values, self.inner.ladders[ladder])
+            out["%s_logits" % axis] = torch.nn.functional.one_hot(
+                here, len(self.inner.ladders[ladder])).float() * 10.0
+        return out
+
+
+def check_feedback_guards(data, builder, val_idx):
+    """levels 刻度、正反馈斜率、不变性损失、闭环限幅。"""
+    from bmode_dl.losses import invariance_loss
+    from bmode_dl.metrics import gain_feedback_slope
+    from bmode_dl.dataset import InputBuilder as IB
+    norm = dict(builder.norm)
+    levels = IB(data.rows_out, data.lines, data.source_rows, norm, scalar_norm="levels")
+    fixed = IB(data.rows_out, data.lines, data.source_rows, norm, scalar_norm="fixed")
+    idx = val_idx[:8]
+    a, tg = make_batch(data, levels, idx)
+    b, _ = make_batch(data, fixed, idx)
+    ref = tg["optimal_gain_db"] * 0 + data.t["reference_db"][torch.as_tensor(idx)]
+    check("scalar_norm=levels: gain as fixed, reference standardised with the image dB statistics",
+          bool(torch.allclose(a["scalars"][:, 3], b["scalars"][:, 3]))
+          and bool(torch.allclose(a["scalars"][:, 13], (ref - norm["db_mean"]) / norm["db_std"], atol=1e-5)))
+
+    good, bad = ShiftedOptimum(data.ladders, 1.0, 0.0), ShiftedOptimum(data.ladders, 0.0, 3.0)
+    slope_good, _ = gain_feedback_slope(good, data, fixed, val_idx, max_frames=32)
+    slope_bad, frac_bad = gain_feedback_slope(bad, data, fixed, val_idx, max_frames=32)
+    check("feedback slope: 0 for an optimum that ignores the current gain, 1 for one that tracks it",
+          abs(slope_good) < 1e-3 and abs(slope_bad - 1.0) < 1e-3,
+          "good %.4f, bad %.4f" % (slope_good, slope_bad))
+
+    gen = torch.Generator().manual_seed(3)
+    ia, ta = make_batch(data, fixed, idx, start="redraw", generator=gen)
+    ib, tb = make_batch(data, fixed, idx, start="redraw", generator=gen)
+    with torch.no_grad():
+        loss_good = float(invariance_loss(good(ia), ta, good(ib), tb))
+        loss_bad = float(invariance_loss(bad(ia), ta, bad(ib), tb))
+    check("invariance loss is zero when the optimum ignores the start and positive when it tracks it",
+          loss_good < 1e-5 and loss_bad > 0.1, "good %.2e, bad %.3f" % (loss_good, loss_bad))
+
+    # 限幅：每步都要 +100 dB 的模型，单步不超过 40 级，累计不超过 120 级
+    runaway = ShiftedOptimum(data.ladders, 0.0, 100.0)
+    summary, records = run_closed_loop(runaway, data, fixed, val_idx[:8], max_steps=6, batch_size=8)
+    steps_ok = all(abs(p.get("gain_clicks", 0)) <= 40 for r in records for p in r["path"])
+    total_ok = all(abs(r["gain_total_clicks"]) <= 120 + 1e-6 for r in records)
+    check("closed loop clamps the gain step (40 clicks) and the net change (120 clicks)",
+          steps_ok and total_ok and summary["gain_clamped"] == 1.0,
+          "max total %.0f clicks, clamped %.2f" % (max(abs(r["gain_total_clicks"]) for r in records),
+                                                    summary["gain_clamped"]))
+    _, unbounded = run_closed_loop(runaway, data, fixed, val_idx[:8], max_steps=6, batch_size=8,
+                                   max_gain_step_clicks=0, max_gain_total_clicks=0)
+    check("without the clamp the same model runs away",
+          max(abs(r["gain_total_clicks"]) for r in unbounded) > 1000,
+          "max total %.0f clicks" % max(abs(r["gain_total_clicks"]) for r in unbounded))
+
+
 def check_near_metrics_and_hysteresis(data, builder, model, norm, val_idx, preds, tg):
     """近最优帧指标、期望档决策、闭环滞回与打转冻结、逐步路径。"""
     metrics = compute_metrics(preds, tg, norm)
@@ -495,6 +573,7 @@ def check_smoke(rows, skip_scripts):
         summary, records = run_closed_loop(model2, data, builder2, val_idx[:40], max_steps=3, batch_size=32)
         check("closed loop runs", summary["trajectories"] == 40, json.dumps(summary)[:160])
         check_near_metrics_and_hysteresis(data, builder2, model2, norm, val_idx, preds, ptg)
+        check_feedback_guards(data, builder2, val_idx)
 
         if not skip_scripts:
             import tools_train_six_param as TT
@@ -509,18 +588,25 @@ def check_smoke(rows, skip_scripts):
                        if os.path.exists(os.path.join(fold_dir, f))]
             check("training script wrote best/best_backend/best_frontend/last", len(written) == 4,
                   "%s, %.0f s" % (written, time.time() - started))
+            try:
+                TT.main(["--cache", cache_dir, "--labels", label_path, "--runs", runs, "--name", "smoke",
+                         "--epochs", "1", "--device", "cpu"])
+                refused = False
+            except SystemExit:
+                refused = True
+            check("reusing a run name without --overwrite is refused", refused)
             with io.open(os.path.join(fold_dir, "metrics.csv"), encoding="utf-8") as handle:
                 header = next(csv.reader(handle))
             wanted = ["val_aux_attenuation_mae", "val_gain_dir_f1_head", "val_slider_near_dir_f1_derived",
                       "val_tgc_band_mae_db_0", "val_backend_score", "val_frontend_score", "valredraw_tgc_mae_db",
                       "val_frontend_score_near", "val_focus_top1_near", "val_depth_mean_signed_steps",
-                      "val_focus_top1_expected"]
+                      "val_focus_top1_expected", "val_gain_feedback_slope", "train_invariance"]
             missing = [w for w in wanted if w not in header]
             check("metrics.csv keeps every validation metric", not missing,
                   "%d columns, missing %s" % (len(header), missing))
             TE.main(["--run", os.path.join(runs, "smoke"), "--cache", cache_dir, "--labels", label_path,
                      "--device", "cpu", "--redraw-seeds", "1", "--max-steps", "2", "--frontend-margin", "0.1"])
-            tag = "combined_m010_rev_frz_s2"   # --max-steps 2 也进文件名
+            tag = "combined_m010_rev_frz_c40-120_s2"   # 限幅与 --max-steps 2 也进文件名
             check("evaluation script (combined model) wrote reports named after the loop settings",
                   os.path.exists(os.path.join(fold_dir, "evaluation_report_%s.txt" % tag))
                   and os.path.exists(os.path.join(runs, "smoke", "evaluation_summary_%s.txt" % tag)),

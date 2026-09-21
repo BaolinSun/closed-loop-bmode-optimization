@@ -139,6 +139,39 @@ def decode(out, tg):
     return decoded
 
 
+@torch.no_grad()
+def gain_feedback_slope(model, data, builder, idx, delta_db=4.0, max_frames=128, seed=0, amp=False,
+                        batch_size=64):
+    """预测最优增益对当前增益的斜率（每帧一个），用来发现闭环正反馈。
+
+    同一帧在当前增益 -delta 与 +delta 两处各预测一次最优值，斜率 = 两者之差 / (2 delta)。
+    正确的模型斜率约为 0（最优值是图像的属性）；大于 1 时每做一次后端修正，目标跑得更远，闭环
+    必然发散。单步指标看不出这个问题（fieldii_v4 的 data 模型单步很好，斜率 1.45）。
+    返回 (中位数, 大于 1 的比例)。
+    """
+    model.eval()
+    idx = np.asarray(idx)
+    if len(idx) > max_frames:
+        idx = np.random.RandomState(seed).choice(idx, max_frames, replace=False)
+    slopes = []
+    for s in range(0, len(idx), batch_size):
+        batch_idx = idx[s:s + batch_size]
+        t = torch.as_tensor(batch_idx, device=data.device, dtype=torch.long)
+        gain, levels = data.t["gain_db"][t].float(), data.t["tgc_levels"][t].float()
+        optima = []
+        for shift in (-delta_db, delta_db):
+            state = {"gain_db": gain + shift, "tgc_levels": levels}
+            inputs, tg = make_batch(data, builder, batch_idx, state=state)
+            with torch.autocast(device_type=data.device.type, dtype=torch.float16, enabled=bool(amp)):
+                out = model(inputs)
+            optima.append(out["gain_delta_db"].float() + state["gain_db"])
+        slopes.append(((optima[1] - optima[0]) / (2.0 * delta_db)).cpu().numpy())
+    slopes = np.concatenate(slopes) if slopes else np.zeros(0)
+    if not slopes.size:
+        return float("nan"), float("nan")
+    return float(np.median(slopes)), float((slopes > 1.0).mean())
+
+
 # ---------------------------------------------------------------------------------------
 #   只看设置的查表基线
 
@@ -330,7 +363,7 @@ def flatten_metrics(m, prefix=""):
     return flat
 
 
-MAIN_KEYS = ("score", "backend_score", "frontend_score", "frontend_score_near", "gain_mae_db", "gain_within_deadband", "gain_dir_f1_derived", "tgc_mae_db",
+MAIN_KEYS = ("score", "backend_score", "frontend_score", "frontend_score_near", "gain_feedback_slope", "gain_mae_db", "gain_within_deadband", "gain_dir_f1_derived", "tgc_mae_db",
              "slider_dir_f1_derived", "depth_top1", "depth_top1_near", "depth_within1", "depth_dir_f1_derived",
              "frequency_hit", "frequency_hit_near", "frequency_dir_f1_derived", "focus_top1", "focus_top1_near",
              "focus_within1", "focus_dir_f1_derived")

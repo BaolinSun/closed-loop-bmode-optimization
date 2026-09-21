@@ -84,6 +84,29 @@ def ladder_losses(logits, valid, target, mask, smoothing=0.0):
     return ce, ordinal, total
 
 
+def predicted_optimum(out, tg):
+    """网络给出的最优增益（dB）与最优 TGC 曲线（各段 dB）。两种后端输出方式都适用：
+    最优 = 当前 + 修正量。"""
+    gain = out["gain_delta_db"].float() + tg["gain_db"].float()
+    current_tgc_db = (tg["tgc_levels"].float() - 127.0) * tg["tgc_db_per_level"][:, None]
+    return gain, current_tgc_db + out["tgc_delta_db"].float()
+
+
+def invariance_loss(out_a, tg_a, out_b, tg_b):
+    """同一批图像、两个不同的后端起点，预测的最优增益 / TGC 应当相同。
+
+    最优值是图像的属性，与当前设置无关；标签就是按这个定义生成的。fieldii_v4 用 --scalar-norm data
+    训练时，网络学到了"最优 ≈ 当前 + 修正"，预测最优对当前增益的斜率 1.45，闭环正反馈发散，而单步
+    指标完全看不出来。这一项直接惩罚预测最优随起点的变化（Huber，dB），从根上堵住这条捷径。
+    """
+    gain_a, tgc_a = predicted_optimum(out_a, tg_a)
+    gain_b, tgc_b = predicted_optimum(out_b, tg_b)
+    mask = tg_a["backend_mask"].float()
+    value = huber(gain_a - gain_b) + huber(tgc_a - tgc_b).mean(dim=1)
+    loss, _ = masked_mean(value, mask)
+    return loss
+
+
 class SixParamLoss(nn.Module):
     def __init__(self, class_weights, norm, weights=None, borderline_weight=0.5,
                  uncertainty_weighting=False, frontend_label_smoothing=0.0):

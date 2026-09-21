@@ -35,8 +35,8 @@ from bmode_dl.checkpoint import load_checkpoint, load_combined
 from bmode_dl.closed_loop import MARGIN_MODES, run_closed_loop
 from bmode_dl.dataset import FieldIIData
 from bmode_dl.metrics import (EXPECTED_KEYS, MAIN_KEYS, NEAR_KEYS, compute_metrics, confusion,
-                              direction_from_delta_np, direction_from_index_np, format_metrics, predict,
-                              settings_lookup_baseline)
+                              direction_from_delta_np, direction_from_index_np, format_metrics,
+                              gain_feedback_slope, predict, settings_lookup_baseline)
 
 
 def parse_args(argv=None):
@@ -69,6 +69,10 @@ def parse_args(argv=None):
                    help="only meaningful with --frontend-margin > 0: revisit = hold only when the loop is about to "
                         "return to a setting it has already visited; always = every front-end change (fieldii_v3)")
     p.add_argument("--no-closed-loop", action="store_true")
+    p.add_argument("--max-gain-step-clicks", type=int, default=40,
+                   help="closed loop: largest gain correction per step, in console clicks (0 = no limit)")
+    p.add_argument("--max-gain-total-clicks", type=int, default=120,
+                   help="closed loop: largest net gain change from the start, in clicks (0 = no limit)")
     p.add_argument("--tag", default=None,
                    help="suffix for the output file names; by default it encodes the closed-loop settings so runs "
                         "with different settings do not overwrite each other")
@@ -102,7 +106,8 @@ def output_tag(args):
         return "noloop"
     parts = ["m%03d" % int(round(args.frontend_margin * 100)),
              {"revisit": "rev", "always": "alw"}[args.margin_mode],
-             "nofrz" if args.no_freeze_on_revisit else "frz"]
+             "nofrz" if args.no_freeze_on_revisit else "frz",
+             "c%d-%d" % (args.max_gain_step_clicks, args.max_gain_total_clicks)]
     if args.decision != "argmax":
         parts.append(args.decision)
     if abs(args.stop_deadband_levels - 0.5) > 1e-9:
@@ -187,6 +192,10 @@ def evaluate_checkpoint(path, args, data_cache, frontend_path=None, label=None):
     report("  expected-step decision instead of argmax")
     report("    %s" % format_metrics(m, EXPECTED_KEYS))
     report("  TGC per-band MAE dB %s" % m.get("tgc_band_mae_db"))
+    slope, unstable = gain_feedback_slope(model, data, builder, eval_idx, amp=amp)
+    m["gain_feedback_slope"], m["gain_feedback_frac_gt1"] = slope, unstable
+    report("  gain feedback: d(predicted optimum)/d(current gain) median %.3f, fraction > 1: %.2f%s"
+           % (slope, unstable, "   <- the closed loop will diverge" if slope >= 1.0 else ""))
     for axis in ("gain", "depth", "frequency", "focus"):
         if axis == "gain":
             backend = tg["backend_mask"] > 0
@@ -231,7 +240,9 @@ def evaluate_checkpoint(path, args, data_cache, frontend_path=None, label=None):
                                                 amp=amp, stop_deadband_levels=args.stop_deadband_levels,
                                                 frontend_margin=args.frontend_margin,
                                                 freeze_on_revisit=not args.no_freeze_on_revisit,
-                                                decision=args.decision, margin_mode=args.margin_mode)
+                                                decision=args.decision, margin_mode=args.margin_mode,
+                                                max_gain_step_clicks=args.max_gain_step_clicks,
+                                                max_gain_total_clicks=args.max_gain_total_clicks)
         results["closed_loop"] = summary
         for k, v in summary.items():
             report("  %-30s %s" % (k, ("%.4f" % v) if isinstance(v, float) else v))
