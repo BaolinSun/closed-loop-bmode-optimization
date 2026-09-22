@@ -146,7 +146,11 @@ def main():
     emit("=========== cache ===========")
     emit("  wrote %s/cache.npz: db %s, floor %s, %.0f MB"
          % (args.out, db.shape, floor.shape, (db.nbytes + floor.nbytes) / 1e6))
-    emit("  db range p1 %.1f  p50 %.1f  p99 %.1f dB" % tuple(np.percentile(db[:: max(1, len(db) // 64)], [1, 50, 99])))
+    # 随机抽帧，不能等间隔抽：帧按体模排列、每个体模 168 片，5376 帧时步长 84 正好是体模的一半，
+    # 每个体模只抽到第 0 与第 84 片（两种固定设置），中位数报成 -31 dB，实际是 -44 dB。
+    sample = np.sort(np.random.RandomState(0).choice(len(db), min(256, len(db)), replace=False))
+    emit("  db range p1 %.1f  p50 %.1f  p99 %.1f dB (random %d frames)"
+         % (tuple(np.percentile(db[sample], [1, 50, 99])) + (len(sample),)))
     emit("  display depth %s mm" % sorted(set(np.round(max_depth, 1).tolist())))
     emit("  done in %.0f s" % (time.time() - started))
     text = "\n".join(lines)
