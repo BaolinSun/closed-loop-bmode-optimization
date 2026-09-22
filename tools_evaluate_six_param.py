@@ -69,9 +69,9 @@ def parse_args(argv=None):
                    help="only meaningful with --frontend-margin > 0: revisit = hold only when the loop is about to "
                         "return to a setting it has already visited; always = every front-end change (fieldii_v3)")
     p.add_argument("--no-closed-loop", action="store_true")
-    p.add_argument("--max-gain-step-clicks", type=int, default=40,
+    p.add_argument("--max-gain-step-clicks", type=int, default=80,
                    help="closed loop: largest gain correction per step, in console clicks (0 = no limit)")
-    p.add_argument("--max-gain-total-clicks", type=int, default=120,
+    p.add_argument("--max-gain-total-clicks", type=int, default=255,
                    help="closed loop: largest net gain change from the start, in clicks (0 = no limit)")
     p.add_argument("--tag", default=None,
                    help="suffix for the output file names; by default it encodes the closed-loop settings so runs "

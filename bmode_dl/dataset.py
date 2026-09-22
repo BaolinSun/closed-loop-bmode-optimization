@@ -181,11 +181,17 @@ class FieldIIData(object):
         """返回 (train_idx, val_idx, val_groups)。
 
         标签里有 val/test split 时按 split 字段（train -> 训练，val -> 验证，test 不参与）；
-        否则按体模分折。fold=None 表示全部用于训练、无验证集。
+        否则按体模分折。fold=None 表示全部用于训练、无验证集——标签带划分时是训练 + 验证，
+        split=test 的行仍然排除在外（选模在验证集上做完之后，用训练 + 验证重训最终模型，
+        测试集只评一次）。
         """
         idx = np.arange(self.n)
         split_names = set(s for s in self.splits if s)
         if fold is None:
+            # 全部数据训练：标签自带划分时是训练 + 验证，测试集永远不参与训练
+            if split_names:
+                keep = np.array([i for i in idx if self.splits[i] != "test"], np.int64)
+                return keep, np.zeros(0, np.int64), []
             return idx, np.zeros(0, np.int64), []
         if "val" in split_names:
             train = np.array([i for i in idx if self.splits[i] == "train"], np.int64)

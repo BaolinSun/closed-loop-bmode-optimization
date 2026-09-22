@@ -355,9 +355,9 @@ def check_feedback_guards(data, builder, val_idx):
     # 限幅：每步都要 +100 dB 的模型，单步不超过 40 级，累计不超过 120 级
     runaway = ShiftedOptimum(data.ladders, 0.0, 100.0)
     summary, records = run_closed_loop(runaway, data, fixed, val_idx[:8], max_steps=6, batch_size=8)
-    steps_ok = all(abs(p.get("gain_clicks", 0)) <= 40 for r in records for p in r["path"])
-    total_ok = all(abs(r["gain_total_clicks"]) <= 120 + 1e-6 for r in records)
-    check("closed loop clamps the gain step (40 clicks) and the net change (120 clicks)",
+    steps_ok = all(abs(p.get("gain_clicks", 0)) <= 80 for r in records for p in r["path"])
+    total_ok = all(abs(r["gain_total_clicks"]) <= 255 + 1e-6 for r in records)
+    check("closed loop clamps the gain step (80 clicks) and the net change (255 clicks)",
           steps_ok and total_ok and summary["gain_clamped"] == 1.0,
           "max total %.0f clicks, clamped %.2f" % (max(abs(r["gain_total_clicks"]) for r in records),
                                                     summary["gain_clamped"]))
@@ -606,7 +606,7 @@ def check_smoke(rows, skip_scripts):
                   "%d columns, missing %s" % (len(header), missing))
             TE.main(["--run", os.path.join(runs, "smoke"), "--cache", cache_dir, "--labels", label_path,
                      "--device", "cpu", "--redraw-seeds", "1", "--max-steps", "2", "--frontend-margin", "0.1"])
-            tag = "combined_m010_rev_frz_c40-120_s2"   # 限幅与 --max-steps 2 也进文件名
+            tag = "combined_m010_rev_frz_c80-255_s2"   # 限幅与 --max-steps 2 也进文件名
             check("evaluation script (combined model) wrote reports named after the loop settings",
                   os.path.exists(os.path.join(fold_dir, "evaluation_report_%s.txt" % tag))
                   and os.path.exists(os.path.join(runs, "smoke", "evaluation_summary_%s.txt" % tag)),
@@ -626,6 +626,39 @@ def check_smoke(rows, skip_scripts):
             check("closed-loop trajectories carry the path and the steps to the optimum",
                   "path" in first and "frontend_steps_to_optimum" in first and "axis_changes" in first,
                   json.dumps({k: first[k] for k in ("frozen", "axis_changes", "frontend_steps_to_optimum")}))
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+    emit("")
+
+
+def check_split_field(rows):
+    """标签带 train / val / test 划分时：分折用 split 字段，--fold none 训练训练 + 验证、不含测试。"""
+    emit("=========== 9. split field (train / val / test) ===========")
+    splits = {}
+    for r in rows:
+        splits.setdefault(r.get("split"), []).append(r["group_id"])
+    if not all(s in splits for s in ("train", "val", "test")):
+        emit("  skipped: labels have no train/val/test split")
+        emit("")
+        return
+    picked = {s: sorted(set(splits[s]))[0] for s in ("train", "val", "test")}
+    subset = [r for r in rows if r["group_id"] in picked.values()]
+    tmp = tempfile.mkdtemp(prefix="six_param_split_")
+    try:
+        cache_dir = os.path.join(tmp, "cache")
+        label_path = os.path.join(tmp, "labels.jsonl")
+        with io.open(label_path, "w", encoding="utf-8") as handle:
+            for r in subset:
+                handle.write(json.dumps(r, ensure_ascii=False) + "\n")
+        write_synthetic_cache(subset, cache_dir)
+        data = FieldIIData(cache_dir, label_path, device="cpu", log=lambda text: None)
+        train_idx, val_idx, _ = data.split_indices(4, 0)
+        check("with a split field, fold 0 trains on split=train and validates on split=val",
+              {data.splits[i] for i in train_idx} == {"train"} and {data.splits[i] for i in val_idx} == {"val"})
+        all_idx, none_val, _ = data.split_indices(4, None)
+        check("--fold none trains on train + val and never on test",
+              {data.splits[i] for i in all_idx} == {"train", "val"} and len(none_val) == 0,
+              "%d frames, splits %s" % (len(all_idx), sorted({data.splits[i] for i in all_idx})))
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
     emit("")
@@ -774,6 +807,7 @@ def main():
     emit("")
     check_smoke(rows, args.skip_scripts)
     check_finetune(rows, args.console_labels, args.skip_scripts)
+    check_split_field(rows)
     emit("=========== result ===========")
     emit("  %d failure(s)%s" % (len(FAILURES), (": " + ", ".join(FAILURES)) if FAILURES else ""))
     captured = list(LINES)

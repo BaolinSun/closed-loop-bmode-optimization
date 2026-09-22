@@ -24,8 +24,11 @@
                         也就是说防打转靠的是冻结，与余量无关。参数保留供实验：margin_mode 决定余量
                         作用在哪些换档上（revisit 只拦回头，always 每次换档都要）。
 逐步路径                每条轨迹记录走过的设置与每一步做了什么，summarise 据此统计是哪一轴在打转。
-后端限幅                单步增益修正不超过 max_gain_step_clicks 级、相对起点的累计变化不超过
-                        max_gain_total_clicks 级（0 = 不限）。实机档位是有界的；fieldii_v4 的 data 模型
+后端限幅                单步增益修正不超过 max_gain_step_clicks 级（默认 80）、相对起点的累计变化不超过
+                        max_gain_total_clicks 级（默认 255，即实机增益档位全程；0 = 不限）。最初定的
+                        40 / 120 太紧：前端大幅换档（如 25 mm / 4 MHz -> 50 mm / 8 MHz）后正常需要的修正
+                        最多 163 级，fieldii_v5 在验证集上 46% 的轨迹被限幅、测试集最终增益误差
+                        0.20 -> 0.55 dB；80 / 255 与不限幅几乎相同（停下 0.994 对 0.997）。实机档位是有界的；fieldii_v4 的 data 模型
                         曾给出单步 +368、-472、+671 级的修正，把最终增益推出 266 dB。限幅只是最后一道
                         保险，根治靠训练时的不变性约束；被限幅的轨迹比例记为 gain_clamped。
 
@@ -92,8 +95,8 @@ def _apply_margin(dec, j, here, wanted, margin):
 @torch.no_grad()
 def run_closed_loop(model, data, builder, idx, max_steps=8, batch_size=64, amp=False,
                     stop_deadband_levels=0.5, frontend_margin=0.0, freeze_on_revisit=True,
-                    decision="argmax", margin_mode="revisit", max_gain_step_clicks=40,
-                    max_gain_total_clicks=120):
+                    decision="argmax", margin_mode="revisit", max_gain_step_clicks=80,
+                    max_gain_total_clicks=255):
     if margin_mode not in MARGIN_MODES:
         raise ValueError("margin_mode must be one of %s" % (MARGIN_MODES,))
     model.eval()
