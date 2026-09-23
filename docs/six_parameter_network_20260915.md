@@ -18,6 +18,7 @@
 | `bmode_dl/checkpoint.py` | 检查点存取 |
 | `tools_train_six_param.py` | 训练 |
 | `tools_evaluate_six_param.py` | 评估（单步 + 基线 + 闭环） |
+| `tools_suggest_six_param.py` | 推理：一次实机采集 → 六参数调整建议（第 13 节） |
 | `tests/verify_six_param_model.py` | 不变量检查与 CPU 冒烟测试 |
 
 训练与评估只依赖 numpy 与 torch，服务器上不需要 HDF5、h5py 和 bmode_opt。
@@ -212,9 +213,45 @@ python tools_train_six_param.py --cache data/console_dl_cache --labels data/labe
 |---|---|---|
 | 不变性约束 | 每个训练批次对同一批图像另抽一个后端起点再前向一次，惩罚两次预测的最优增益 / TGC 之差（Huber，dB）。最优值是图像的属性，本就与当前设置无关；这一项从根上堵住捷径。训练时间约增加一半 | `--invariance-weight 0` |
 | 斜率指标与选模 | 每次验证计算预测最优对当前增益的斜率（`val_gain_feedback_slope`、`val_gain_feedback_frac_gt1`），中位数 ≥ 0.5 时日志标 UNSTABLE，这样的轮次不能成为 `best.pt` / `best_backend.pt`（除非还没有任何稳定轮次）。评估报告也打印斜率，≥ 1 时提示闭环会发散 | — |
-| 闭环限幅 | 单步增益修正不超过 40 级、相对起点累计不超过 120 级（`--max-gain-step-clicks`、`--max-gain-total-clicks`，0 = 不限），被限幅的轨迹比例记为 `gain_clamped`。只是最后一道保险 | 设为 0 |
+| 闭环限幅 | 单步增益修正不超过 80 级、相对起点累计不超过 255 级（最初定的 40 / 120 太紧：`fieldii_v5` 验证集上 46% 的轨迹被限幅、测试集最终增益误差 0.20 → 0.55 dB）（`--max-gain-step-clicks`、`--max-gain-total-clicks`，0 = 不限），被限幅的轨迹比例记为 `gain_clamped`。只是最后一道保险 | 设为 0 |
 | 运行目录防覆盖 | 运行目录已有训练报告时拒绝启动，除非加 `--overwrite`（此时旧报告被删除，不再首尾相接） | `--overwrite` |
 
-评估输出文件名里加了限幅设置（如 `m000_rev_frz_c40-120`），不会覆盖此前未限幅的结果。
+评估输出文件名里加了限幅设置（如 `m000_rev_frz_c80-255`），不会覆盖此前未限幅的结果。
 
 不变性约束在完整训练上的效果还没有验证：只在假模型上确认了它对"跟随当前增益"的输出给出正损失。下次训练的日志里每次验证都会打印斜率，可以直接看到。
+
+## 13. 推理：一次实机采集 → 六参数调整建议（2026-09-23）
+
+`tools_suggest_six_param.py` 把实机微调的模型接到一次真实采集上，是上机闭环实测的前提。
+
+```bash
+# 一帧
+python tools_suggest_six_param.py --capture data/hisense_medical/20260910/20260910155437862
+# 整个场次，并与训练缓存 / 标签逐帧对账，另写一份 jsonl 给上位机
+python tools_suggest_six_param.py --capture data/hisense_medical/20260910     --self-check data/console_dl_cache --json data/suggestions_20260910.jsonl
+```
+
+默认模型是 `runs/console_final_v2/all_data` 的 `frontend.pt`（前端三轴，第 6 轮）+ `last.pt`（增益 / TGC，第 22 轮）。
+
+**预处理与训练同一条**：图像这一路直接调用 `tools_build_console_training_cache.pool_rows / pool_lines`，
+标量这一路照抄那个脚本写缓存时的取值。显示深度取一位小数——主机原始值是 41.871418，
+`tools_generate_console_labels.py` 合并前端标签时统一成 41.9，不跟着取整，当前档就不在档位表上。
+
+**怎么确认没有走样**：`--self-check` 对能在训练缓存 / 标签里找到的帧逐项比对。20260910（6 帧）与
+20260903_GEN（44 帧）上，图像与底噪逐位相同（差 0.000e+00），深度两端、曝光参考、底噪两端差 1e-6 以内，
+当前六个设置与标签完全一致。端到端另比过一次：同一帧上本脚本与 `metrics.predict`（训练 / 评估那条路）
+给出的 `gain_delta_db`、`tgc_delta_db` 逐位相同，前端三轴选同一档。
+
+**档位按成像模式限制**：基波 5.0–11.4 MHz、谐波 4.4–5.7 MHz，训练时实机标签行没有档位字段、
+九档全都可选；推理时按 `--labels` 里该模式见过的档位限制，聚焦再按不超过当前显示深度过滤，当前档永远可选。
+这只是护栏：20260903_GEN 的 44 帧上，限不限制模型选的都是同一档（可接受集合命中 0.750）。
+
+**执行顺序与闭环一致**：前端有改动时先改前端、重新采一帧，再回来做后端修正——后端修正是在当前这幅图上
+算出来的。死区 0.5 级、单步限幅 80 级都取自 `bmode_dl/closed_loop.py`，`tests/verify_six_param_model.py`
+第 10 组检查两处默认值仍然相等。
+
+**标定是前提**：新场次在 `console_calibration.json` 里没有条目时向同模式借，报告里大写标明。借来的标定
+会整体搬动 dB 刻度：20260828/GEN（可用像素只有 18%，本来就不可标定）借 20260911_E8_GEN 的标定后，
+增益建议全部顶到 +80 级的限幅上。**新场次采完先跑 `tools_refit_calibration.py` 定标，再用建议。**
+
+动态范围仍然只重复当前值：标签里 `dr_determined` 全为假，这根轴没有训练。

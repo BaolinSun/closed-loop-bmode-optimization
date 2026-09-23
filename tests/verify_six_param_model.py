@@ -14,6 +14,8 @@
      预训练权重部分装入（档位不同的输出层重新初始化、新域标准化保留）、冻结范围、结构跟随预训练。
   8. 增益正反馈的防护：levels 标量刻度、预测最优不随起点变的不变性损失、正反馈斜率指标、
      闭环单步与累计限幅、运行目录防覆盖。
+  9. 标签自带 train / val / test 划分时的分折；--fold none 不含测试集。
+ 10. 推理脚本 tools_suggest_six_param.py 的档位掩膜与后端换算，且死区与限幅跟着闭环走。
 
 用法：python tests/verify_six_param_model.py [--labels data/labels_fieldii.jsonl] [--skip-scripts]
 """
@@ -793,6 +795,97 @@ def check_finetune(fieldii_rows, console_path, skip_scripts):
     emit("")
 
 
+def check_suggestion():
+    """推理脚本的档位掩膜与后端换算。不需要采集数据与检查点，纯算术。
+
+    与闭环重复的两件事（死区、单步限幅）在这里对齐：闭环的默认值一改，这个检查就失败。
+    """
+    emit("=========== 10. suggestion script (one capture -> six suggestions) ===========")
+    import inspect
+
+    import tools_suggest_six_param as SG
+
+    ladders = {"depth_mm": [25.1, 33.5, 41.9, 50.2, 58.6, 67.0, 75.4],
+               "frequency_mhz": [4.4, 4.7, 5.0, 5.3, 5.7, 6.7, 8.0, 10.0, 11.4],
+               "focus_mm": [5.0, 10.0, 15.0, 20.0, 25.0, 30.0]}
+
+    # 频率按成像模式限制：谐波只在 4.4-5.7 里挑，基波的 6.7-11.4 不可选
+    mask, idx, exact = SG.valid_mask(ladders["frequency_mhz"], [4.4, 4.7, 5.0, 5.3, 5.7], 5.0)
+    check("the frequency mask keeps only this imaging mode's steps",
+          list(mask) == [1, 1, 1, 1, 1, 0, 0, 0, 0] and idx == 2 and exact, str(list(mask)))
+    check("steps are counted over the selectable steps only",
+          SG.steps_between(mask, 2, 0) == -2 and SG.steps_between(mask, 2, 4) == 2)
+    # 主机原始显示深度（41.871418）落在档位之间：取最近的一档，并标出当前值不在表上
+    off, off_idx, off_exact = SG.valid_mask(ladders["depth_mm"], None, 41.871418)
+    check("an off-ladder current value snaps to the nearest step and is flagged",
+          off_idx == 2 and not off_exact and off.sum() == len(ladders["depth_mm"]))
+    # 当前档永远可选，哪怕不在允许集合里（否则网络只能被迫换档）
+    forced, forced_idx, _ = SG.valid_mask(ladders["focus_mm"], [5.0, 10.0], 25.0)
+    check("the current step is always selectable", forced[forced_idx] == 1 and forced_idx == 4)
+
+    sig = inspect.signature(run_closed_loop).parameters
+    args = SG.parse_args(["--capture", "unused"])
+    check("the deadband and the single-step clamp follow the closed loop",
+          args.stop_deadband_levels == sig["stop_deadband_levels"].default
+          and args.max_gain_step_clicks == sig["max_gain_step_clicks"].default,
+          "deadband %.2f clicks, clamp %d clicks" % (args.stop_deadband_levels, args.max_gain_step_clicks))
+
+    mode = K.MODE_HARMONIC
+    gain_slope, tgc_slope = K.GAIN_DB_PER_LEVEL[mode], K.TGC_DB_PER_LEVEL[mode]
+    frame = {"frame_id": "synthetic", "mode": mode, "mode_name": "harmonic", "depth_mm": 41.9,
+             "frequency_mhz": 5.0, "focus_mm": 15.0, "gain_level": 120, "gain_db": 9.2,
+             "tgc_levels": np.full(K.NUM_TGC_BANDS, 127.0), "dr_ui": 67.0,
+             "_depth_idx": 2, "_frequency_idx": 2, "_focus_idx": 2,
+             "_depth_exact": True, "_frequency_exact": True, "_focus_exact": True}
+    masks = {"depth": torch.ones(1, len(ladders["depth_mm"])),
+             "frequency": torch.tensor(mask)[None, :],
+             "focus": torch.ones(1, len(ladders["focus_mm"]))}
+
+    def run(gain_clicks, tgc_levels_delta, wanted=(2, 2, 2), gain_level=120):
+        dec = {"gain_delta_db": np.array([gain_clicks * gain_slope], np.float32),
+               "tgc_delta_db": np.full((1, K.NUM_TGC_BANDS), tgc_levels_delta * tgc_slope, np.float32)}
+        for a, axis in enumerate(("depth", "frequency", "focus")):
+            n = masks[axis].shape[1]
+            prob = np.full((1, n), 0.1, np.float32)
+            prob[0, wanted[a]] = 0.6
+            dec["%s_idx" % axis] = np.array([wanted[a]], np.int64)
+            dec["%s_idx_expected" % axis] = np.array([wanted[a]], np.int64)
+            dec["%s_prob" % axis] = prob
+        return SG.one_suggestion(dict(frame, gain_level=gain_level), 0, dec, masks, ladders, args)
+
+    inside = run(0.4, 1.0)
+    check("a correction inside the deadband reads as 'keep'",
+          inside["backend"]["gain"]["clicks"] == 0
+          and inside["backend"]["tgc"]["within_deadband"]
+          and inside["backend"]["tgc"]["suggested_levels"] == [127] * K.NUM_TGC_BANDS
+          and inside["settled"],
+          "deadband is %.1f gain clicks = %.1f slider levels"
+          % (args.stop_deadband_levels, args.stop_deadband_levels * gain_slope / tgc_slope))
+    moved = run(-3.4, 10.0)
+    check("gain rounds to whole clicks and TGC to whole levels",
+          moved["backend"]["gain"]["clicks"] == -3
+          and moved["backend"]["gain"]["suggested_level"] == 117
+          and moved["backend"]["tgc"]["suggested_levels"] == [137] * K.NUM_TGC_BANDS
+          and not moved["settled"],
+          "gain %d clicks, TGC %s" % (moved["backend"]["gain"]["clicks"],
+                                      moved["backend"]["tgc"]["suggested_levels"][0]))
+    clamped = run(200.0, 0.0, gain_level=200)
+    check("a huge gain correction is clamped, then clipped at the console's range",
+          clamped["backend"]["gain"]["clicks"] == args.max_gain_step_clicks
+          and clamped["backend"]["gain"]["clamped"] and clamped["backend"]["gain"]["level_clipped"]
+          and clamped["backend"]["gain"]["suggested_level"] == SG.GAIN_MAX_LEVEL,
+          "level 200 %+d -> %d" % (clamped["backend"]["gain"]["clicks"],
+                                   clamped["backend"]["gain"]["suggested_level"]))
+    changed = run(0.0, 0.0, wanted=(3, 0, 3))
+    steps = {a: changed["frontend"][a]["steps"] for a in ("depth", "frequency", "focus")}
+    words = {a: changed["frontend"][a]["direction"] for a in ("depth", "frequency", "focus")}
+    check("front-end changes are reported as signed steps in the console's own words",
+          steps == {"depth": 1, "frequency": -2, "focus": 1}
+          and words == {"depth": "deeper", "frequency": "lower", "focus": "deeper"}
+          and changed["frontend_changed"] and not changed["settled"], str(steps))
+    emit("")
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--labels", default=os.path.join(ROOT, "data", "labels_fieldii.jsonl"))
@@ -808,6 +901,7 @@ def main():
     check_smoke(rows, args.skip_scripts)
     check_finetune(rows, args.console_labels, args.skip_scripts)
     check_split_field(rows)
+    check_suggestion()
     emit("=========== result ===========")
     emit("  %d failure(s)%s" % (len(FAILURES), (": " + ", ".join(FAILURES)) if FAILURES else ""))
     captured = list(LINES)
