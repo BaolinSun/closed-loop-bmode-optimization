@@ -31,8 +31,31 @@ from . import constants as K
 # ---------------------------------------------------------------------------------------
 #   档位
 
+# 两个档位值相差不到这个数就是同一档。ladder_index 的容差也是 1e-3，所以比它更近的两个值
+# 永远无法区分，留成两档只会制造永远选不到的输出类别，并把一个真实档差算成两档。
+LADDER_TOLERANCE = 1e-3
+
+
+def merge_ladder(values, tol=LADDER_TOLERANCE):
+    """排好序并按容差合并。保留每组里最靠「整」的写法（小数位最少的那个）。
+
+    人体颈动脉标签踩过这件事：新固件把 BFreqValue 写成 4.400000095，而最优频率与档位表字段是
+    四舍五入过的 4.4，取并集后 5 个谐波频率变成 9 档，其中 4 个永远选不到，`*_within1` 与闭环的
+    「差一档」也跟着失真。标签生成已经改成写入前取整，这里再兜一层：旧标签文件照样能正确训练。
+    """
+    out = []
+    for value in sorted(float(v) for v in values):
+        if out and value - out[-1] <= tol:
+            # 同一档的两种写法：留小数位少的那个（4.4 而不是 4.400000095）
+            if len(repr(value).split(".")[-1]) < len(repr(out[-1]).split(".")[-1]):
+                out[-1] = value
+            continue
+        out.append(value)
+    return out
+
+
 def collect_ladders(rows):
-    """所有行的深度 / 频率 / 聚焦档位并集，排好序。写进检查点，推理时按同一套下标解码。"""
+    """所有行的深度 / 频率 / 聚焦档位并集，排好序去重。写进检查点，推理时按同一套下标解码。"""
     depth, frequency, focus = set(), set(), set()
     for row in rows:
         depth.update(float(v) for v in (row.get("depth_ladder") or []))
@@ -41,7 +64,8 @@ def collect_ladders(rows):
         depth.add(float(row["depth_mm"]))
         frequency.add(float(row["frequency_mhz"]))
         focus.add(float(row["focus_mm"]))
-    return {"depth_mm": sorted(depth), "frequency_mhz": sorted(frequency), "focus_mm": sorted(focus)}
+    return {"depth_mm": merge_ladder(depth), "frequency_mhz": merge_ladder(frequency),
+            "focus_mm": merge_ladder(focus)}
 
 
 def ladder_index(ladder, value, tol=1e-3):

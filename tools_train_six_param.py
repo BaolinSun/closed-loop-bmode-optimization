@@ -82,7 +82,9 @@ BACKEND_KEYS = ("gain_mae_db", "gain_within_deadband", "gain_dir_f1_derived", "t
                 "gain_feedback_slope", "gain_feedback_frac_gt1")
 FRONTEND_KEYS = ("depth_top1", "depth_within1", "depth_dir_f1_derived", "frequency_hit", "frequency_dir_f1_derived",
                  "focus_top1", "focus_within1", "focus_dir_f1_derived") + NEAR_KEYS
-FRONTEND_SELECT = ("frontend_score_near", "frontend_score")
+# 只训了一部分前端轴时（人体数据上深度与频率的标签还近乎可猜，先屏蔽），前端检查点不能按三轴
+# 平均分选：被屏蔽的轴只是噪声，会让选出来的那一轮与聚焦好不好无关。focus_top1_near 只看聚焦。
+FRONTEND_SELECT = ("frontend_score_near", "frontend_score", "focus_top1_near", "focus_top1")
 # 预测最优增益对当前增益的斜率中位数不小于它时，闭环会正反馈发散（fieldii_v4 的 data 模型是 1.45）。
 # 这样的轮次不能被选为 best.pt / best_backend.pt，除非还没有任何稳定的轮次。
 STABLE_SLOPE = 0.5
@@ -125,7 +127,8 @@ def parse_args(argv=None):
     p.add_argument("--frontend-label-smoothing", dest="frontend_label_smoothing", type=float, default=0.1)
     p.add_argument("--frontend-select", choices=FRONTEND_SELECT, default="frontend_score_near",
                    help="metric that chooses best_frontend.pt: frontend_score_near counts only frames within one "
-                        "ladder step of the optimum, which is where the closed loop actually stops")
+                        "ladder step of the optimum, which is where the closed loop actually stops; "
+                        "focus_top1_near when depth and frequency are masked out of the loss")
     p.add_argument("--frontend-epoch", type=int, default=None,
                    help="with --fold none: also save frontend.pt at this epoch")
     p.add_argument("--borderline-weight", type=float, default=0.5)
@@ -141,9 +144,10 @@ def parse_args(argv=None):
     p.add_argument("--freeze", choices=FREEZE_CHOICES, default="none",
                    help="encoders: freeze the image and profile encoders; backbone: train the output heads only")
     p.add_argument("--group-by", dest="group_by", choices=GROUP_BY, default="group",
-                   help="fold unit: group = label group_id (Field II phantom); placement = console probe "
-                        "placement (scene family, merging directories that differ only by a _GEN/_THI suffix), "
-                        "so one placement never sits in both training and validation")
+                   help="fold unit: group = label group_id (Field II phantom, console session/mode); "
+                        "placement = console probe placement (scene family, merging directories that differ "
+                        "only by a _GEN/_THI suffix); subject = console session without the mode suffix, "
+                        "which is one person in the in-vivo data. A fold unit never sits in both sets")
     p.add_argument("--invariance-weight", type=float, default=1.0,
                    help="weight of the penalty on the predicted optimum gain / TGC changing with the back-end "
                         "start (a second pass on the same images from a re-drawn start); 0 turns it off")

@@ -16,6 +16,9 @@
      闭环单步与累计限幅、运行目录防覆盖。
   9. 标签自带 train / val / test 划分时的分折；--fold none 不含测试集。
  10. 推理脚本 tools_suggest_six_param.py 的档位掩膜与后端换算，且死区与限幅跟着闭环走。
+ 11. 上机闭环记录 tools_track_console_loop.py 的实际动作判读与协议检查；停点测量
+     tests/measure_loop_stop_points.py 的档差算术与轨迹文件发现。
+ 12. 人体数据的三处改动：档位表按容差去重、按受试者分组、按受试者划分训练 / 验证 / 测试。
 
 用法：python tests/verify_six_param_model.py [--labels data/labels_fieldii.jsonl] [--skip-scripts]
 """
@@ -886,6 +889,195 @@ def check_suggestion():
     emit("")
 
 
+def synthetic_suggestion(ladders, args, frame, masks, wanted, gain_clicks, tgc_levels_delta):
+    """用推理脚本自己的 one_suggestion 造一条建议，避免检查里另写一套换算。"""
+    import tools_suggest_six_param as SG
+
+    mode = int(frame["mode"])
+    dec = {"gain_delta_db": np.array([gain_clicks * K.GAIN_DB_PER_LEVEL[mode]], np.float32),
+           "tgc_delta_db": np.full((1, K.NUM_TGC_BANDS), tgc_levels_delta * K.TGC_DB_PER_LEVEL[mode], np.float32)}
+    for a, axis in enumerate(("depth", "frequency", "focus")):
+        n = masks[axis].shape[1]
+        prob = np.full((1, n), 0.1, np.float32)
+        prob[0, wanted[a]] = 0.6
+        dec["%s_idx" % axis] = np.array([wanted[a]], np.int64)
+        dec["%s_idx_expected" % axis] = np.array([wanted[a]], np.int64)
+        dec["%s_prob" % axis] = prob
+    return SG.one_suggestion(frame, 0, dec, masks, ladders, args)
+
+
+def check_loop_tools():
+    """上机闭环记录与停点测量：两个脚本里不依赖采集数据的算术。"""
+    emit("=========== 11. on-console loop recording and stop-point measurement ===========")
+    import tools_suggest_six_param as SG
+    import tools_track_console_loop as TR
+    sys.path.insert(0, os.path.join(ROOT, "tests"))
+    import measure_loop_stop_points as MS
+
+    ladders = {"depth_mm": [25.1, 33.5, 41.9, 50.2, 58.6, 67.0, 75.4],
+               "frequency_mhz": [4.4, 4.7, 5.0, 5.3, 5.7, 6.7, 8.0, 10.0, 11.4],
+               "focus_mm": [5.0, 10.0, 15.0, 20.0, 25.0, 30.0]}
+    args = SG.parse_args(["--capture", "unused"])
+    args.gain_tolerance_clicks, args.tgc_tolerance_levels = 1.0, 2.0
+    frame = {"frame_id": "a", "mode": K.MODE_HARMONIC, "mode_name": "harmonic", "depth_mm": 41.9,
+             "frequency_mhz": 5.0, "focus_mm": 15.0, "gain_level": 120, "gain_db": 9.2,
+             "tgc_levels": np.full(K.NUM_TGC_BANDS, 127.0), "dr_ui": 67.0,
+             "_depth_idx": 2, "_frequency_idx": 2, "_focus_idx": 2,
+             "_depth_exact": True, "_frequency_exact": True, "_focus_exact": True}
+    masks = {"depth": torch.ones(1, 7),
+             "frequency": torch.tensor([[1., 1., 1., 1., 1., 0., 0., 0., 0.]]),
+             "focus": torch.ones(1, 6)}
+
+    # 实际动作的判读：逐轴改动、增益点击数、TGC 增量
+    after = dict(frame, frame_id="b", focus_mm=25.0, gain_level=117,
+                 tgc_levels=np.full(K.NUM_TGC_BANDS, 137.0))
+    applied = TR.applied_between(frame, after)
+    check("the applied change is read off the two captures",
+          applied["frontend"]["focus"]["changed"] and not applied["frontend"]["depth"]["changed"]
+          and applied["gain_clicks"] == -3 and applied["tgc_delta_levels"][0] == 10.0
+          and applied["frontend_changed"] and applied["backend_changed"],
+          "gain %+d clicks, focus %g -> %g" % (applied["gain_clicks"], applied["frontend"]["focus"]["from"],
+                                               applied["frontend"]["focus"]["to"]))
+
+    # 前端有建议时：这一步应当只改前端，改到建议档才算照做
+    wants_focus = synthetic_suggestion(ladders, args, frame, masks, (2, 2, 4), 0.0, 0.0)
+    only_focus = TR.applied_between(frame, dict(frame, focus_mm=25.0))
+    expected, ok, notes = TR.compare(wants_focus, only_focus, args)
+    check("a front-end step counts as followed when the axis lands on the suggested value",
+          expected == "frontend" and ok and not notes, "%s %s" % (expected, notes))
+    wrong_focus = TR.applied_between(frame, dict(frame, focus_mm=20.0))
+    _, ok_wrong, notes_wrong = TR.compare(wants_focus, wrong_focus, args)
+    check("landing on another step is reported as a difference, with both values named",
+          not ok_wrong and "25.0" in " ".join(notes_wrong) and "20.0" in " ".join(notes_wrong),
+          str(notes_wrong))
+    both = TR.applied_between(frame, dict(frame, focus_mm=25.0, gain_level=110))
+    _, _, notes_both = TR.compare(wants_focus, both, args)
+    check("changing the back end in the same step as the front end is flagged",
+          any("back end was changed" in n for n in notes_both), str(notes_both))
+
+    # 前端不动时：按点击数与滑块值判读，容差内算照做
+    wants_gain = synthetic_suggestion(ladders, args, frame, masks, (2, 2, 2), -3.0, 0.0)
+    close = TR.applied_between(frame, dict(frame, gain_level=118))
+    expected_gain, ok_close, _ = TR.compare(wants_gain, close, args)
+    far = TR.applied_between(frame, dict(frame, gain_level=112))
+    _, ok_far, notes_far = TR.compare(wants_gain, far, args)
+    check("a back-end step is judged on clicks, within the tolerance",
+          expected_gain == "backend" and ok_close and not ok_far, "%s" % notes_far)
+    moved_front = TR.applied_between(frame, dict(frame, depth_mm=50.2))
+    _, ok_front, notes_front = TR.compare(wants_gain, moved_front, args)
+    check("moving the front end when the model asked to keep it is a difference",
+          not ok_front and any("front end moved" in n for n in notes_front), str(notes_front))
+
+    # 停点测量：起点档差的算术与轨迹文件的发现
+    tmp = tempfile.mkdtemp(prefix="six_param_loop_")
+    try:
+        labels = os.path.join(tmp, "labels.jsonl")
+        with io.open(labels, "w", encoding="utf-8") as handle:
+            for frame_id, depth, optimal in (("f0", 25.1, 41.9), ("f1", 41.9, 41.9)):
+                handle.write(json.dumps({"frame_id": frame_id, "source": "console", "depth_mm": depth,
+                                         "frequency_mhz": 5.0, "focus_mm": 15.0, "depth_determined": True,
+                                         "optimal_depth_mm": optimal, "depth_direction": "deep",
+                                         "depth_ladder": ladders["depth_mm"]}) + "\n")
+        # 档位表由标签里出现过的值与 *_ladder 字段合起来构成：只写两个深度、不写 depth_ladder 时，
+        # 25.1 与 41.9 就成了相邻两档，档差会被压扁。所以这里连 depth_ladder 一起写。
+        index = MS.label_index(labels)
+        here, best = index["f0"]["depth"]
+        check("the start point's distance to the optimum is counted on the labels' own ladder",
+              best - here == 2 and index["f1"]["depth"][0] == index["f1"]["depth"][1],
+              "f0 %d -> %d on a %d-step ladder" % (here, best, len(ladders["depth_mm"])))
+
+        fold = os.path.join(tmp, "runs", "x", "fold_0")
+        os.makedirs(fold)
+        for tag in ("combined", "combined_other"):
+            with io.open(os.path.join(fold, "closed_loop_trajectories_%s.jsonl" % tag), "w",
+                         encoding="utf-8") as handle:
+                handle.write(json.dumps({"start_frame": "f0", "converged": True, "frontend_moves": 1,
+                                         "frontend_correct": {"depth": True, "frequency": False,
+                                                              "focus": True},
+                                         "frontend_steps_to_optimum": {"depth": 0}}) + "\n")
+        found = MS.find_trajectories(os.path.join(tmp, "runs", "x"))
+        check("trajectory files are found under each fold, with their evaluation json when it exists",
+              len(found) == 2 and all(f[3] is None for f in found)
+              and MS.pick_tag(found) in ("combined", "combined_other"),
+              str([f[1] for f in found]))
+        records = read_jsonl(os.path.join(fold, "closed_loop_trajectories_combined.jsonl"))
+        check("the stop-point score is the mean of the three axes' stop-point accuracy",
+              abs(MS.stop_point_score(records) - 2.0 / 3.0) < 1e-9, "%.4f" % MS.stop_point_score(records))
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+    emit("")
+
+
+def check_invivo_grouping():
+    """人体数据：档位去重、按受试者分组、按受试者划分。"""
+    emit("=========== 12. in-vivo data: ladders, subject folds, subject splits ===========")
+    import tools_assign_invivo_splits as SP
+
+    # 档位表：同一档的两种写法（主机原始浮点与取整值）必须合成一档，并留取整的那个写法
+    merged = L.merge_ladder([4.4, 4.400000095, 4.699999809, 4.7, 5.0, 5.3, 5.300000191, 5.699999809, 5.7])
+    check("a ladder merges values closer together than the index tolerance",
+          merged == [4.4, 4.7, 5.0, 5.3, 5.7], str(merged))
+    rows = [{"source": "console", "group_id": "20261009_092743_00001/1", "family_id": "20261009_092743_00001/3",
+             "depth_mm": 41.9, "frequency_mhz": 4.400000095, "focus_mm": 15.0,
+             "frequency_ladder": [4.4, 4.7, 5.0, 5.3, 5.7]}]
+    ladders = L.collect_ladders(rows)
+    index = L.ladder_index(ladders["frequency_mhz"], rows[0]["frequency_mhz"])
+    check("an unrounded current value still lands on its own ladder step",
+          len(ladders["frequency_mhz"]) == 5 and index == 0,
+          "ladder %s, index %d" % (ladders["frequency_mhz"], index))
+
+    # 分组：受试者 = 去掉成像模式后缀；同一个人的基波与谐波场次是同一组
+    from bmode_dl.dataset import group_key
+    harmonic = {"source": "console", "group_id": "20261009_092743_00001/1",
+                "family_id": "20261009_092743_00001/3"}
+    fundamental = dict(harmonic, group_id="20261009_092743_00001/0")
+    check("subject folds strip the imaging-mode suffix, so one person is one fold unit",
+          group_key(harmonic, "subject") == group_key(fundamental, "subject") == "20261009_092743_00001"
+          and group_key(harmonic, "group") != group_key(fundamental, "group"),
+          group_key(harmonic, "subject"))
+    check("Field II rows are unaffected by subject folds",
+          group_key({"source": "fieldii", "group_id": "train/cyst/20283801"}, "subject")
+          == "train/cyst/20283801")
+
+    # 划分：每名受试者恰好一个集合，每个采集日都出现在三个集合里，只有 split 字段被改写
+    tmp = tempfile.mkdtemp(prefix="six_param_split_assign_")
+    try:
+        labels = os.path.join(tmp, "labels.jsonl")
+        subjects = []
+        with io.open(labels, "w", encoding="utf-8") as handle:
+            for day in ("20261009", "20261010", "20261011"):
+                for k in range(10):
+                    subject = "%s_1200%02d_00001" % (day, k)
+                    subjects.append(subject)
+                    for frame in range(8 + k):
+                        handle.write(json.dumps({"frame_id": "%s_%d" % (subject, frame), "source": "console",
+                                                 "group_id": subject + "/1", "split": None,
+                                                 "depth_mm": 41.9, "frequency_mhz": 5.0, "focus_mm": 15.0,
+                                                 "depth_determined": False}) + "\n")
+        mapping = os.path.join(tmp, "splits.json")
+        assignment = SP.main(["--labels", labels, "--map", mapping, "--ratios", "0.7", "0.15", "0.15"])
+        written = [json.loads(line) for line in io.open(labels, encoding="utf-8")]
+        per_subject = collections.defaultdict(set)
+        for row in written:
+            per_subject[row["group_id"].rsplit("/", 1)[0]].add(row["split"])
+        check("every subject lands in exactly one split, and every frame of that subject follows it",
+              len(assignment) == len(subjects) and all(len(v) == 1 for v in per_subject.values())
+              and set(assignment.values()) == {"train", "val", "test"},
+              "%d subjects, %d frames" % (len(per_subject), len(written)))
+        days = collections.defaultdict(set)
+        for subject, name in assignment.items():
+            days[name].add(subject.split("_", 1)[0])
+        check("every acquisition day appears in all three splits",
+              all(len(days[name]) == 3 for name in ("train", "val", "test")),
+              str({k: sorted(v) for k, v in days.items()}))
+        # 重跑时套用已有映射，不重新分
+        again = SP.main(["--labels", labels, "--map", mapping])
+        check("a second run reuses the stored map instead of re-drawing", again == assignment)
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+    emit("")
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--labels", default=os.path.join(ROOT, "data", "labels_fieldii.jsonl"))
@@ -902,6 +1094,8 @@ def main():
     check_finetune(rows, args.console_labels, args.skip_scripts)
     check_split_field(rows)
     check_suggestion()
+    check_loop_tools()
+    check_invivo_grouping()
     emit("=========== result ===========")
     emit("  %d failure(s)%s" % (len(FAILURES), (": " + ", ".join(FAILURES)) if FAILURES else ""))
     captured = list(LINES)

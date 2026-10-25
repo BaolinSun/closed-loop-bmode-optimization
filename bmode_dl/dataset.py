@@ -55,7 +55,7 @@ PROFILE_CHANNELS = 5
 IMAGE_CHANNELS = 3
 INPUT_MODES = ("full", "no_image", "params_only")
 SCALAR_NORMS = ("fixed", "data", "levels")
-GROUP_BY = ("group", "placement")
+GROUP_BY = ("group", "placement", "subject")
 
 # 只差成像模式后缀的实机目录是同一次摆放：E8、E9 把基波与谐波存成 _GEN / _THI 两个目录
 _MODE_SUFFIXES = ("_GEN", "_THI", "/GEN", "/THI")
@@ -65,6 +65,10 @@ def group_key(row, group_by="group"):
     """分折用的组。
 
     group      标签的 group_id（Field II 是体模；实机是 "场次/成像模式"）
+    subject     人体数据的独立单位是人：group_id 去掉成像模式后缀（"20261009_092743_00001/1" ->
+               "20261009_092743_00001"），按方案每名受试者一个检查，所以场次号就是受试者。
+               group 在只采了谐波时与它等价，但一旦同一个人另有基波场次，group 会把同一个人
+               拆成两组、分到训练与验证两边。Field II 行不受影响，仍按体模。
     placement  实机按探头摆放：独立单位是场景族（docs/console_training_data_20260914.md §2.1，
                "同一族共享探头位置，必须整族进同一个集合"），即 family_id。同一次摆放在部分场次里
                本来就跨两种模式（20260903/0 同时有基波 6 帧、谐波 67 帧），但 E8、E9 把基波与谐波
@@ -73,6 +77,10 @@ def group_key(row, group_by="group"):
                会让同一次摆放的图像同时出现在训练与验证里。Field II 行不受影响，仍按体模。
     """
     group = row.get("group_id") or row.get("family_id")
+    if group_by == "subject":
+        if row.get("source") != "console" or "/" not in group:
+            return group
+        return group.rsplit("/", 1)[0]
     if group_by != "placement" or row.get("source") != "console":
         return group
     family = row.get("family_id") or group
