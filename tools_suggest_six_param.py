@@ -351,6 +351,94 @@ def one_suggestion(f, j, dec, masks, ladders, args):
 
 
 # ---------------------------------------------------------------------------------------
+#   装模型与预处理（tools_track_console_loop.py 复用这两个函数，保证两个脚本看到的输入一致）
+
+def load_model(args):
+    """按参数装模型，返回 (model, 后端检查点, 前端检查点, 说明文字)。"""
+    if args.checkpoint:
+        model, _, payload = load_checkpoint(args.checkpoint, args.device)
+        return model, payload, payload, args.checkpoint
+    model, _, payload, front_payload = load_combined(args.frontend, args.backend, args.device)
+    return model, payload, front_payload, ("%s (front end) + %s (gain / TGC)"
+                                           % (args.frontend, args.backend))
+
+
+def describe_model(payload, front_payload, model_text, emit):
+    emit("  model      %s" % model_text)
+    emit("             trained on %s, epoch %s (front end epoch %s), scalar_norm %s"
+         % (payload["config"].get("labels", "?"), payload.get("epoch"), front_payload.get("epoch"),
+            payload["config"].get("scalar_norm", "fixed")))
+
+
+def prepare_frames(capture_dirs, payload, args, emit):
+    """采集目录列表 -> (frames, builder, per_mode)。标定、档位表与逐帧预处理都在这里。"""
+    import hisense_backend_sim as S
+    from hisense_loader import load_capture
+    import tools_generate_labels as TG
+    import tools_generate_console_labels as G
+
+    ladders = payload["ladders"]
+    shape = payload["cache_shape"]
+    rows, lines_out = int(shape["rows"]), int(shape["lines"])
+
+    cal_by_group = TG.load_calibration()
+    G.floors_in_counts(cal_by_group)
+    per_mode = mode_ladders(args.labels, ladders)
+    if per_mode:
+        emit("  ladders    per imaging mode from %s" % args.labels)
+    else:
+        emit("  ladders    every step of the checkpoint's ladder is offered (no labels file)")
+    for key in ("depth_mm", "frequency_mhz", "focus_mm"):
+        emit("    %-14s %s" % (key, " ".join("%g" % v for v in ladders[key])))
+
+    frames, skipped, groups = [], [], {}
+    for path in capture_dirs:
+        try:
+            capture = load_capture(path)
+            mode = S.capture_image_mode(capture)
+            session = session_name(path)
+            entry, used, borrowed = resolve_calibration(cal_by_group, session, mode, args.calibration_group)
+            if entry["floor"] is None:
+                raise ValueError("the calibration group %s/%d has no noise floor" % used)
+            frame = prepare_capture(capture, entry, rows, lines_out)
+            frame["path"] = path
+            frame["session"] = session
+            frame["calibration"] = {"group": "%s/%d" % used, "borrowed": bool(borrowed),
+                                    "floor_measured": bool(entry.get("floor_measured")),
+                                    "counts_per_db": float(entry["cal"].counts_per_db),
+                                    "pivot_db": float(entry["cal"].pivot_db),
+                                    "floor_db": float(entry["floor"])}
+            groups.setdefault(frame["calibration"]["group"], frame["calibration"])
+            frames.append(frame)
+        except Exception as error:
+            skipped.append((os.path.basename(path), "%s: %s" % (type(error).__name__, error)))
+
+    emit("  calibration")
+    for name in sorted(groups):
+        c = groups[name]
+        emit("    %-18s counts/dB %7.1f  pivot %6.2f dB  floor %5.2f dB%s%s"
+             % (name, c["counts_per_db"], c["pivot_db"], c["floor_db"],
+                "" if c["floor_measured"] else "  [floor borrowed within the mode]",
+                "  [BORROWED FROM ANOTHER SESSION: run tools_refit_calibration.py for this one]"
+                if c["borrowed"] else ""))
+    for name, why in skipped:
+        emit("    skipped %s (%s)" % (name, why))
+    if not frames:
+        raise SystemExit("no capture could be prepared")
+
+    source_rows = sorted(set(f["source_rows"] for f in frames))
+    if len(source_rows) != 1:
+        raise SystemExit("captures have different depth sample counts: %s" % source_rows)
+    if source_rows[0] != int(shape["source_rows"]):
+        emit("  NOTE: these captures have %d depth samples, the training cache had %d; the TGC curve and the "
+             "depth axis are rebuilt for %d" % (source_rows[0], int(shape["source_rows"]), source_rows[0]))
+    builder = InputBuilder(rows, lines_out, source_rows[0], payload["norm"],
+                           use_noise_floor=not payload["config"].get("no_noise_floor", False),
+                           scalar_norm=payload["config"].get("scalar_norm", "fixed")).to(args.device)
+    return frames, builder, per_mode
+
+
+# ---------------------------------------------------------------------------------------
 #   报告
 
 def format_suggestion(result, emit):
@@ -491,21 +579,8 @@ def main(argv=None):
     def emit(text=""):
         lines.append(text)
 
-    import hisense_backend_sim as S
-    from hisense_loader import load_capture
-    import tools_generate_labels as TG
-    import tools_generate_console_labels as G
-
-    if args.checkpoint:
-        model, builder, payload = load_checkpoint(args.checkpoint, args.device)
-        front_payload = payload
-        model_text = args.checkpoint
-    else:
-        model, builder, payload, front_payload = load_combined(args.frontend, args.backend, args.device)
-        model_text = "%s (front end) + %s (gain / TGC)" % (args.frontend, args.backend)
+    model, payload, front_payload, model_text = load_model(args)
     ladders = payload["ladders"]
-    shape = payload["cache_shape"]
-    rows, lines_out = int(shape["rows"]), int(shape["lines"])
 
     capture_dirs = find_capture_dirs(args.capture)
     if args.limit:
@@ -514,65 +589,9 @@ def main(argv=None):
         raise SystemExit("no capture under %s" % args.capture)
 
     emit("=========== six-parameter suggestions ===========")
-    emit("  model      %s" % model_text)
-    emit("             trained on %s, epoch %s (front end epoch %s), scalar_norm %s"
-         % (payload["config"].get("labels", "?"), payload.get("epoch"), front_payload.get("epoch"),
-            payload["config"].get("scalar_norm", "fixed")))
+    describe_model(payload, front_payload, model_text, emit)
     emit("  captures   %d under %s" % (len(capture_dirs), args.capture))
-
-    cal_by_group = TG.load_calibration()
-    G.floors_in_counts(cal_by_group)
-    per_mode = mode_ladders(args.labels, ladders)
-    if per_mode:
-        emit("  ladders    per imaging mode from %s" % args.labels)
-    else:
-        emit("  ladders    every step of the checkpoint's ladder is offered (no labels file)")
-    for key in ("depth_mm", "frequency_mhz", "focus_mm"):
-        emit("    %-14s %s" % (key, " ".join("%g" % v for v in ladders[key])))
-
-    frames, skipped, groups = [], [], {}
-    for path in capture_dirs:
-        try:
-            capture = load_capture(path)
-            mode = S.capture_image_mode(capture)
-            session = session_name(path)
-            entry, used, borrowed = resolve_calibration(cal_by_group, session, mode, args.calibration_group)
-            if entry["floor"] is None:
-                raise ValueError("the calibration group %s/%d has no noise floor" % used)
-            frame = prepare_capture(capture, entry, rows, lines_out)
-            frame["session"] = session
-            frame["calibration"] = {"group": "%s/%d" % used, "borrowed": bool(borrowed),
-                                    "floor_measured": bool(entry.get("floor_measured")),
-                                    "counts_per_db": float(entry["cal"].counts_per_db),
-                                    "pivot_db": float(entry["cal"].pivot_db),
-                                    "floor_db": float(entry["floor"])}
-            groups.setdefault(frame["calibration"]["group"], frame["calibration"])
-            frames.append(frame)
-        except Exception as error:
-            skipped.append((os.path.basename(path), "%s: %s" % (type(error).__name__, error)))
-
-    emit("  calibration")
-    for name in sorted(groups):
-        c = groups[name]
-        emit("    %-18s counts/dB %7.1f  pivot %6.2f dB  floor %5.2f dB%s%s"
-             % (name, c["counts_per_db"], c["pivot_db"], c["floor_db"],
-                "" if c["floor_measured"] else "  [floor borrowed within the mode]",
-                "  [BORROWED FROM ANOTHER SESSION: run tools_refit_calibration.py for this one]"
-                if c["borrowed"] else ""))
-    for name, why in skipped:
-        emit("    skipped %s (%s)" % (name, why))
-    if not frames:
-        raise SystemExit("no capture could be prepared")
-
-    source_rows = sorted(set(f["source_rows"] for f in frames))
-    if len(source_rows) != 1:
-        raise SystemExit("captures have different depth sample counts: %s" % source_rows)
-    if source_rows[0] != int(shape["source_rows"]):
-        emit("  NOTE: these captures have %d depth samples, the training cache had %d; the TGC curve and the "
-             "depth axis are rebuilt for %d" % (source_rows[0], int(shape["source_rows"]), source_rows[0]))
-    builder = InputBuilder(rows, lines_out, source_rows[0], payload["norm"],
-                           use_noise_floor=not payload["config"].get("no_noise_floor", False),
-                           scalar_norm=payload["config"].get("scalar_norm", "fixed")).to(args.device)
+    frames, builder, per_mode = prepare_frames(capture_dirs, payload, args, emit)
     emit("")
 
     if args.self_check:
