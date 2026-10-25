@@ -82,9 +82,12 @@ def parse_args(argv=None):
     p.add_argument("--frontend", default=os.path.join(SG.DEFAULT_RUN, "frontend.pt"))
     p.add_argument("--backend", default=os.path.join(SG.DEFAULT_RUN, "last.pt"))
     p.add_argument("--checkpoint", default=None, help="one checkpoint for all six axes")
-    p.add_argument("--labels", default="data/labels_console.jsonl",
-                   help="labels the per-mode ladders are read from; also supplies the teacher's answer "
-                        "for any step that happens to be a labelled frame (dry runs on existing data)")
+    p.add_argument("--dataset", choices=("auto", "phantom", "invivo"), default="auto",
+                   help="which console dataset the captures belong to (see tools_suggest_six_param.py)")
+    p.add_argument("--calibration", default=None, help="calibration json; by default the --dataset one")
+    p.add_argument("--labels", default=None,
+                   help="labels the per-mode ladders are read from (default: the --dataset one); also supplies "
+                        "the teacher's answer for any step that happens to be a labelled frame (dry runs)")
     p.add_argument("--calibration-group", default=None, help="borrow this group's calibration, as session/mode")
     p.add_argument("--device", default="cpu")
     p.add_argument("--batch-size", type=int, default=8)
@@ -247,7 +250,7 @@ def format_step(number, frame, stats, result, emit):
     wants = []
     for axis in AXES:
         s = result["frontend"][axis]
-        if s["steps"]:
+        if s["steps"] and s.get("trained", True):
             wants.append("%s %.1f -> %.1f %s (%s %d)" % (axis, s["current"], s["suggested"], AXIS_UNIT[axis],
                                                         s["direction"], abs(s["steps"])))
     gain, tgc = result["backend"]["gain"], result["backend"]["tgc"]
@@ -302,7 +305,7 @@ def main(argv=None):
         source = "%d capture(s) given on the command line" % len(capture_dirs)
         name = args.name or os.path.basename(os.path.dirname(os.path.abspath(capture_dirs[0])))
     else:
-        capture_dirs = SG.find_capture_dirs(args.session)
+        capture_dirs = SG.find_capture_dirs(args.session, args.dataset)
         source = args.session
         name = args.name or os.path.basename(os.path.abspath(args.session))
     if args.limit:
@@ -310,6 +313,9 @@ def main(argv=None):
     if len(capture_dirs) < 2:
         raise SystemExit("a trajectory needs at least two captures; got %d" % len(capture_dirs))
 
+    args.dataset = SG.resolve_dataset(capture_dirs, args.dataset)
+    if args.labels is None:
+        args.labels = SG.CS.output_path(args.dataset, "labels")
     model, payload, front_payload, model_text = SG.load_model(args)
     ladders = payload["ladders"]
 
@@ -326,10 +332,16 @@ def main(argv=None):
         SG.self_check(args.self_check, args.labels, frames, emit)
         emit("")
 
+    trained = SG.trained_axes(payload)
+    untrained = [axis for axis, ok in sorted(trained.items()) if not ok]
+    if untrained:
+        emit("  NOTE: %s not trained in this checkpoint (loss weight 0); those axes are held at their "
+             "current value" % ", ".join(untrained))
+        emit("")
     results = []
     for s in range(0, len(frames), args.batch_size):
         results.extend(SG.suggest_batch(model, builder, args.device, frames[s:s + args.batch_size],
-                                        ladders, per_mode, args))
+                                        ladders, per_mode, args, trained))
     stats = [image_stats(f) for f in frames]
     rows = teacher_rows(args.labels)
 

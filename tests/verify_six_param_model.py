@@ -941,6 +941,21 @@ def check_suggestion():
           and clamped["backend"]["gain"]["suggested_level"] == SG.GAIN_MAX_LEVEL,
           "level 200 %+d -> %d" % (clamped["backend"]["gain"]["clicks"],
                                    clamped["backend"]["gain"]["suggested_level"]))
+    # 没训练过的轴（检查点 config 里 loss_weight 置 0）只重复当前值，也不算进「需要改前端」
+    check("trained_axes reads the masked axes out of the checkpoint config",
+          SG.trained_axes({"config": {"loss_weight": ["depth_cls=0", "frequency_cls=0", "aux=0"]}})
+          == {"depth": False, "frequency": False, "focus": True}
+          and SG.trained_axes({"config": {}}) == {"depth": True, "frequency": True, "focus": True})
+    held = synthetic_suggestion(ladders, args, frame, masks, (5, 0, 4), 0.0, 0.0,
+                                trained={"depth": False, "frequency": False, "focus": True})
+    check("an untrained axis is held at its current value and does not count as a front-end change",
+          held["frontend"]["depth"]["suggested"] == frame["depth_mm"]
+          and held["frontend"]["depth"]["steps"] == 0 and not held["frontend"]["depth"]["trained"]
+          and held["frontend"]["focus"]["steps"] == 2 and held["frontend_changed"],
+          "depth %.1f (trained %s), focus %+d steps"
+          % (held["frontend"]["depth"]["suggested"], held["frontend"]["depth"]["trained"],
+             held["frontend"]["focus"]["steps"]))
+
     changed = run(0.0, 0.0, wanted=(3, 0, 3))
     steps = {a: changed["frontend"][a]["steps"] for a in ("depth", "frequency", "focus")}
     words = {a: changed["frontend"][a]["direction"] for a in ("depth", "frequency", "focus")}
@@ -951,7 +966,7 @@ def check_suggestion():
     emit("")
 
 
-def synthetic_suggestion(ladders, args, frame, masks, wanted, gain_clicks, tgc_levels_delta):
+def synthetic_suggestion(ladders, args, frame, masks, wanted, gain_clicks, tgc_levels_delta, trained=None):
     """用推理脚本自己的 one_suggestion 造一条建议，避免检查里另写一套换算。"""
     import tools_suggest_six_param as SG
 
@@ -965,7 +980,7 @@ def synthetic_suggestion(ladders, args, frame, masks, wanted, gain_clicks, tgc_l
         dec["%s_idx" % axis] = np.array([wanted[a]], np.int64)
         dec["%s_idx_expected" % axis] = np.array([wanted[a]], np.int64)
         dec["%s_prob" % axis] = prob
-    return SG.one_suggestion(frame, 0, dec, masks, ladders, args)
+    return SG.one_suggestion(frame, 0, dec, masks, ladders, args, trained)
 
 
 def check_loop_tools():

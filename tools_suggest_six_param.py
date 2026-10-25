@@ -22,9 +22,22 @@ tools_build_console_training_cache.pool_rows / pool_lines，标量这一路照�
 --self-check data/console_dl_cache 把这条预处理的结果与训练缓存逐帧对照（能对上的帧），
 用来确认换了机器、换了标定文件之后，推理与训练看到的仍是同一幅图。
 
+    两套数据
+
+--dataset 决定三件事：读哪个标定文件、怎么还原场次号、档位表取自哪个标签文件。
+
+    phantom  体模。标定 bmode_opt/console_calibration.json；采集在 <根>/<场次>/<采集>/ 下。
+    invivo   人体颈动脉。标定 bmode_opt/console_calibration_invivo_carotid.json；原始数据是
+             扁平的（一次存储一个目录），场次号只能从清单 data/invivo_carotid_manifest.json
+             里反查，推不出来也猜不得——猜错就等于用了别人的标定。
+    auto     默认：采集在人体清单里就按 invivo，否则按 phantom。
+
+两套的场次号都由 console_sessions 的权威索引反查（体模目录在 E 盘改过名，按 PHANTOM_ALIASES
+还原），不靠目录名。--calibration 可以单独指定标定文件，--capture 也接受一个场次号。
+
     标定从哪来
 
-新场次在 console_calibration.json 里没有条目时，向同一成像模式、底噪实测的场次借
+新场次在标定文件里没有条目时，向同一成像模式、底噪实测的场次借
 （--calibration-group 指定借谁），报告里标明借了谁。借标定直接影响 dB 刻度：谐波场次之间
 counts_per_db 相差过 44%，借来的增益建议就差同样的比例。所以新场次采完应当先跑
 tools_refit_calibration.py 定标，再用这里的建议；借用只是没有标定时的下策。
@@ -42,7 +55,9 @@ tools_refit_calibration.py 定标，再用这里的建议；借用只是没有�
 与单步限幅（--max-gain-step-clicks，默认 80 级）也与闭环一致。
 
 动态范围没有判据（gCNR 对单调变换不变，标签里 dr_determined 全为假），这根轴没有训练，
-报告里只重复当前值。
+报告里只重复当前值。前端三轴同理：检查点的 config 里 loss_weight 把某根轴置 0 的（人体模型屏蔽了
+深度与频率，因为那两轴的标签不看图就能猜中 0.78-0.91），那根轴的输出头从未训练，报告里同样
+只重复当前值——否则会打印出「41.9 -> 92.1 mm，深 6 档」这种其实是噪声的建议（概率 0.13 对 0.11）。
 
 终端输出与写在脚本旁边的 tools_suggest_six_param.txt 同内容（ASCII）；--json 另写一份
 每帧一行的 jsonl，供上位机脚本直接读。
@@ -60,6 +75,7 @@ import numpy as np
 import torch
 
 import bmode_dl.constants as K
+import console_sessions as CS
 import tools_build_console_training_cache as CACHE
 from bmode_dl.checkpoint import load_checkpoint, load_combined
 from bmode_dl.dataset import InputBuilder
@@ -86,8 +102,15 @@ def parse_args(argv=None):
                    help="checkpoint used for gain / TGC / dynamic range")
     p.add_argument("--checkpoint", default=None,
                    help="one checkpoint for all six axes, instead of --frontend + --backend")
-    p.add_argument("--labels", default="data/labels_console.jsonl",
-                   help="labels the per-mode ladders are read from; without it every ladder step is offered")
+    p.add_argument("--dataset", choices=("auto", "phantom", "invivo"), default="auto",
+                   help="which console dataset the captures belong to; it picks the calibration file, how the "
+                        "session id is resolved and the default labels. auto = invivo when the capture is in "
+                        "the in-vivo manifest, else phantom")
+    p.add_argument("--calibration", default=None,
+                   help="calibration json; by default the one --dataset points at")
+    p.add_argument("--labels", default=None,
+                   help="labels the per-mode ladders are read from (default: the --dataset one); "
+                        "without it every ladder step is offered")
     p.add_argument("--calibration-group", default=None,
                    help="borrow this group's calibration, as session/mode (e.g. 20260910/1); "
                         "by default the capture's own group, or the newest group of the same mode")
@@ -108,23 +131,63 @@ def parse_args(argv=None):
 # ---------------------------------------------------------------------------------------
 #   采集与标定
 
-def find_capture_dirs(path):
-    """一个采集目录 -> [它自己]；一个场次目录 -> 里面的全部采集。"""
+def find_capture_dirs(path, dataset="auto"):
+    """一个采集目录 -> [它自己]；一个场次目录 -> 里面的全部采集；一个场次号 -> 那个场次的全部采集。"""
     from hisense_loader import BC0_FILE, find_captures
-    if os.path.isfile(os.path.join(path, BC0_FILE)):
-        return [path]
-    return [str(p) for p in find_captures(path)]
+    if os.path.isdir(path):
+        if os.path.isfile(os.path.join(path, BC0_FILE)):
+            return [path]
+        return [str(p) for p in find_captures(path)]
+    for name in (("invivo", "phantom") if dataset == "auto" else (dataset,)):
+        try:
+            if path in CS.sessions(name):
+                return [str(p) for p in CS.session_captures(path)]
+        except Exception:
+            continue
+    raise SystemExit("%s is neither a capture directory, a session directory, nor a known session id" % path)
 
 
-def session_name(capture_dir):
-    """采集目录相对 data/hisense_medical 的场次名（20260910、20260828/GEN 这样）。"""
-    from hisense_loader import DEFAULT_DATA_DIR
+_SESSION_INDEX = {}
+
+
+def _key(path):
+    return os.path.normcase(os.path.abspath(str(path)))
+
+
+def session_index(dataset):
+    """{采集目录: 场次名}，取自 console_sessions 的权威索引（人体读清单，体模扫根目录）。"""
+    if dataset not in _SESSION_INDEX:
+        out = {}
+        try:
+            labels = CS.sessions(dataset)
+        except Exception:
+            labels = []
+        for label in labels:
+            for path in CS.session_captures(label):
+                out[_key(path)] = label
+        _SESSION_INDEX[dataset] = out
+    return _SESSION_INDEX[dataset]
+
+
+def resolve_dataset(capture_dirs, dataset):
+    """auto：采集在人体清单里就是 invivo，否则 phantom。"""
+    if dataset != "auto":
+        return dataset
+    invivo = session_index("invivo")
+    return "invivo" if any(_key(p) in invivo for p in capture_dirs) else "phantom"
+
+
+def session_name(capture_dir, dataset="phantom"):
+    """采集目录属于哪个场次。反查索引；人体的原始数据是扁平的，目录名推不出场次号。"""
+    label = session_index(dataset).get(_key(capture_dir))
+    if label is not None:
+        return label
+    if dataset == "invivo":
+        raise ValueError("%s is not in the in-vivo manifest; run tools_build_invivo_manifest.py, or pass "
+                         "--dataset phantom" % capture_dir)
+    # 体模：索引里没有（新采的场次还没进根目录），退回目录名
     parent = os.path.abspath(os.path.join(capture_dir, os.pardir))
-    try:
-        rel = os.path.relpath(parent, str(DEFAULT_DATA_DIR))
-    except ValueError:
-        return os.path.basename(parent)
-    return rel.replace(os.sep, "/")
+    return os.path.basename(parent)
 
 
 def resolve_calibration(cal_by_group, session, mode, override=None):
@@ -245,7 +308,7 @@ def steps_between(mask, from_idx, to_idx):
 # ---------------------------------------------------------------------------------------
 #   建议
 
-def suggest_batch(model, builder, device, frames, ladders, per_mode, args):
+def suggest_batch(model, builder, device, frames, ladders, per_mode, args, trained=None):
     """一批帧 -> 每帧一个建议字典。"""
     def column(key, dtype=np.float32):
         return torch.as_tensor(np.asarray([f[key] for f in frames], dtype), device=device)
@@ -279,11 +342,11 @@ def suggest_batch(model, builder, device, frames, ladders, per_mode, args):
 
     results = []
     for j, f in enumerate(frames):
-        results.append(one_suggestion(f, j, dec, masks, ladders, args))
+        results.append(one_suggestion(f, j, dec, masks, ladders, args, trained))
     return results
 
 
-def one_suggestion(f, j, dec, masks, ladders, args):
+def one_suggestion(f, j, dec, masks, ladders, args, trained=None):
     """一帧的六根轴建议。前端按档位表给目标档，后端按主机的级给点击数。"""
     mode = f["mode"]
     gain_slope = K.GAIN_DB_PER_LEVEL[mode]
@@ -302,8 +365,13 @@ def one_suggestion(f, j, dec, masks, ladders, args):
         prob = dec["%s_prob" % axis][j]
         steps = steps_between(mask, current_idx, wanted_idx)
         value = float(ladders[key][wanted_idx])
+        axis_trained = True if trained is None else bool(trained.get(axis, True))
+        if not axis_trained:
+            # 这根轴的头没训练过，输出是噪声：只重复当前值，也不算进「需要改前端」
+            wanted_idx, steps, value = current_idx, 0, float(f[key])
         frontend_changed = frontend_changed or steps != 0
         out["frontend"][axis] = {
+            "trained": axis_trained,
             "current": f[key], "suggested": value, "steps": int(steps), "unit": unit,
             "direction": "keep" if steps == 0 else AXIS_WORDS[axis][0 if steps > 0 else 1],
             "probability": float(prob[wanted_idx]), "probability_current": float(prob[current_idx]),
@@ -353,6 +421,19 @@ def one_suggestion(f, j, dec, masks, ladders, args):
 # ---------------------------------------------------------------------------------------
 #   装模型与预处理（tools_track_console_loop.py 复用这两个函数，保证两个脚本看到的输入一致）
 
+def trained_axes(payload):
+    """检查点实际训练过哪几根前端轴。config 里 loss_weight 把 <轴>_cls 置 0 的没训过。"""
+    weights = {}
+    for item in payload["config"].get("loss_weight") or []:
+        if "=" in item:
+            name, value = item.split("=", 1)
+            try:
+                weights[name] = float(value)
+            except ValueError:
+                continue
+    return dict((axis, weights.get("%s_cls" % axis, 1.0) != 0.0) for axis, _, _ in AXES)
+
+
 def load_model(args):
     """按参数装模型，返回 (model, 后端检查点, 前端检查点, 说明文字)。"""
     if args.checkpoint:
@@ -381,8 +462,10 @@ def prepare_frames(capture_dirs, payload, args, emit):
     shape = payload["cache_shape"]
     rows, lines_out = int(shape["rows"]), int(shape["lines"])
 
-    cal_by_group = TG.load_calibration()
+    cal_path = args.calibration or CS.output_path(args.dataset, "calibration")
+    cal_by_group = TG.load_calibration(cal_path)
     G.floors_in_counts(cal_by_group)
+    emit("  dataset    %s, calibration %s" % (args.dataset, cal_path))
     per_mode = mode_ladders(args.labels, ladders)
     if per_mode:
         emit("  ladders    per imaging mode from %s" % args.labels)
@@ -396,7 +479,7 @@ def prepare_frames(capture_dirs, payload, args, emit):
         try:
             capture = load_capture(path)
             mode = S.capture_image_mode(capture)
-            session = session_name(path)
+            session = session_name(path, args.dataset)
             entry, used, borrowed = resolve_calibration(cal_by_group, session, mode, args.calibration_group)
             if entry["floor"] is None:
                 raise ValueError("the calibration group %s/%d has no noise floor" % used)
@@ -456,6 +539,10 @@ def format_suggestion(result, emit):
     emit("    front end (%s)" % order)
     for axis, _, unit in AXES:
         s = result["frontend"][axis]
+        if not s.get("trained", True):
+            emit("      %-10s keep %.1f %s (not trained in this checkpoint: the loss weight for this axis is 0)"
+                 % (axis, s["current"], unit))
+            continue
         if s["steps"] == 0:
             action = "keep %.1f %s" % (s["current"], unit)
         else:
@@ -582,7 +669,10 @@ def main(argv=None):
     model, payload, front_payload, model_text = load_model(args)
     ladders = payload["ladders"]
 
-    capture_dirs = find_capture_dirs(args.capture)
+    capture_dirs = find_capture_dirs(args.capture, args.dataset)
+    args.dataset = resolve_dataset(capture_dirs, args.dataset)
+    if args.labels is None:
+        args.labels = CS.output_path(args.dataset, "labels")
     if args.limit:
         capture_dirs = capture_dirs[:args.limit]
     if not capture_dirs:
@@ -598,10 +688,17 @@ def main(argv=None):
         self_check(args.self_check, args.labels, frames, emit)
         emit("")
 
+    trained = trained_axes(payload)
+    untrained = [axis for axis, ok in sorted(trained.items()) if not ok]
+    if untrained:
+        emit("  NOTE: %s %s not trained in this checkpoint (loss weight 0); the report repeats the current "
+             "value for %s" % (", ".join(untrained), "was" if len(untrained) == 1 else "were",
+                               "it" if len(untrained) == 1 else "them"))
+        emit("")
     results = []
     for s in range(0, len(frames), args.batch_size):
         results.extend(suggest_batch(model, builder, args.device, frames[s:s + args.batch_size],
-                                     ladders, per_mode, args))
+                                     ladders, per_mode, args, trained))
     for frame, result in zip(frames, results):
         result["session"] = frame["session"]
         result["calibration"] = frame["calibration"]
