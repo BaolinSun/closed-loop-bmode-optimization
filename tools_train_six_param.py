@@ -131,6 +131,18 @@ def parse_args(argv=None):
                         "focus_top1_near when depth and frequency are masked out of the loss")
     p.add_argument("--frontend-epoch", type=int, default=None,
                    help="with --fold none: also save frontend.pt at this epoch")
+    p.add_argument("--recorded-start-prob", type=float, default=0.0,
+                   help="training only: with this probability each frame keeps its recorded back-end start "
+                        "instead of a re-drawn one. The in-vivo console leaves TGC flat at 127 in 98.5%% of the "
+                        "frames, which sits at the edge of the re-draw distribution; invivo_bf_v1 scored "
+                        "TGC 0.237 dB from re-drawn starts but 0.569 dB from the recorded one")
+    p.add_argument("--gain-deadband-fraction", type=float, default=1.0,
+                   help="how much of the teacher's dead band the gain regression ignores. 1.0 is the old "
+                        "behaviour; the in-vivo dead band is 0.95 dB while repeat frames of one subject agree "
+                        "to 0.23 dB, so 1.0 discards real signal. Try 0.25 or 0")
+    p.add_argument("--near-optimum-weight", type=float, default=1.0,
+                   help="extra weight on front-end frames whose current step is within one step of the optimum, "
+                        "which is where the closed loop decides to stop")
     p.add_argument("--borderline-weight", type=float, default=0.5)
     p.add_argument("--uncertainty-weighting", action="store_true")
     p.add_argument("--loss-weight", action="append", default=[], metavar="TERM=VALUE",
@@ -273,10 +285,15 @@ def train_fold(args, data, fold, out_dir, report):
     criterion = SixParamLoss(class_weights, norm, parse_loss_weights(args.loss_weight),
                              borderline_weight=args.borderline_weight,
                              uncertainty_weighting=args.uncertainty_weighting,
-                             frontend_label_smoothing=args.frontend_label_smoothing).to(device)
+                             frontend_label_smoothing=args.frontend_label_smoothing,
+                             gain_deadband_fraction=args.gain_deadband_fraction,
+                             near_optimum_weight=args.near_optimum_weight).to(device)
     report("  model: input_mode=%s  backend_output=%s  frontend_dropout=%.2f  label_smoothing=%.2f  parameters=%.2f M"
            % (args.input_mode, args.backend_output, args.frontend_dropout, args.frontend_label_smoothing,
               count_parameters(model) / 1e6))
+    report("  starts: recorded with probability %.2f (the rest re-drawn); gain dead band x %.2f; "
+           "near-optimum front-end weight %.2f"
+           % (args.recorded_start_prob, args.gain_deadband_fraction, args.near_optimum_weight))
 
     params = [p for p in list(model.parameters()) + list(criterion.parameters()) if p.requires_grad]
     decay = [p for p in params if p.dim() >= 2]
@@ -320,7 +337,8 @@ def train_fold(args, data, fold, out_dir, report):
                 continue
             flip = (not args.no_flip) and rng.rand() < 0.5
             inputs, targets = make_batch(data, builder, batch_idx, start="label" if args.no_redraw else "redraw",
-                                         generator=generator, flip=flip)
+                                         generator=generator, flip=flip,
+                                         recorded_prob=args.recorded_start_prob)
             with torch.autocast(device_type=device.type, dtype=torch.float16, enabled=amp):
                 out = model(inputs)
             loss, logs = criterion(out, targets)

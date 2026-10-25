@@ -19,6 +19,7 @@
  11. 上机闭环记录 tools_track_console_loop.py 的实际动作判读与协议检查；停点测量
      tests/measure_loop_stop_points.py 的档差算术与轨迹文件发现。
  12. 人体数据的三处改动：档位表按容差去重、按受试者分组、按受试者划分训练 / 验证 / 测试。
+ 13. invivo_bf_v1 测试集分析后的两处改动：训练时按概率混入记录的起点、增益死区比例与近最优帧权重。
 
 用法：python tests/verify_six_param_model.py [--labels data/labels_fieldii.jsonl] [--skip-scripts]
 """
@@ -485,6 +486,66 @@ def check_near_metrics_and_hysteresis(data, builder, model, norm, val_idx, preds
           % (sorted(set(r["backend_moves"] for r in records)), without["frontend_moves_hist"]))
 
 
+def check_starts_and_deadband(data, builder, norm, cw, train_idx):
+    """起点混入、增益死区比例、近最优帧权重。"""
+    emit("  ----- starts, gain dead band, near-optimum weight -----")
+    from bmode_dl.losses import SixParamLoss
+
+    idx = train_idx[:16]
+    gen = lambda seed: torch.Generator().manual_seed(seed)
+    _, tg_label = make_batch(data, builder, idx)
+    _, tg_draw = make_batch(data, builder, idx, start="redraw", generator=gen(7))
+    _, tg_again = make_batch(data, builder, idx, start="redraw", generator=gen(7))
+    _, tg_all = make_batch(data, builder, idx, start="redraw", generator=gen(7), recorded_prob=1.0)
+    _, tg_half = make_batch(data, builder, idx, start="redraw", generator=gen(7), recorded_prob=0.5)
+    check("recorded_prob=1 puts every frame back on its recorded start",
+          bool(torch.allclose(tg_all["gain_db"], tg_label["gain_db"]))
+          and bool(torch.allclose(tg_all["tgc_levels"], tg_label["tgc_levels"])))
+    check("recorded_prob=0 leaves the re-drawn start untouched",
+          bool(torch.allclose(tg_draw["gain_db"], tg_again["gain_db"])))
+    mixed = (tg_half["gain_db"] - tg_label["gain_db"]).abs() < 1e-6
+    check("recorded_prob=0.5 mixes the two per frame, and the targets follow the start that was used",
+          0 < int(mixed.sum()) < len(idx)
+          and bool(torch.allclose(tg_half["delta_gain_db"],
+                                  tg_half["optimal_gain_db"] - tg_half["gain_db"], atol=1e-4)),
+          "%d / %d frames kept their recorded start" % (int(mixed.sum()), len(idx)))
+
+    # 死区比例：预测偏离教师最优 0.9 个死区时，1.0 完全不罚，0 要罚
+    model = model_from_config({"backend_output": "optimum"}, data.ladders, norm).eval()
+    inputs, tg = make_batch(data, builder, idx, start="redraw", generator=gen(11))
+    with torch.no_grad():
+        out = model(inputs)
+    inside = dict(out)
+    inside["gain_delta_db"] = tg["delta_gain_db"] + 0.9 * tg["gain_deadband_db"]
+    _, logs_full = SixParamLoss(cw, norm, {}, gain_deadband_fraction=1.0)(inside, tg)
+    _, logs_none = SixParamLoss(cw, norm, {}, gain_deadband_fraction=0.0)(inside, tg)
+    check("a prediction inside the dead band costs nothing at fraction 1.0 and something at 0",
+          abs(logs_full["gain_reg"]) < 1e-9 and logs_none["gain_reg"] > 1e-4,
+          "gain_reg %.3e vs %.3e" % (logs_full["gain_reg"], logs_none["gain_reg"]))
+
+    # 近最优帧权重：故意让近最优帧答错、远帧答对，权重调大后损失必须跟着上去
+    near = ((tg["optimal_focus_idx"] - tg["focus_idx"]).abs() <= 1) & (tg["focus_mask"] > 0)
+    far = (tg["focus_mask"] > 0) & ~near
+    if int(near.sum()) and int(far.sum()):
+        logits = torch.zeros_like(out["focus_logits"])
+        rows = torch.arange(logits.shape[0])
+        best = tg["optimal_focus_idx"].clamp(min=0)
+        logits[rows, best] = torch.where(near, torch.full_like(best, -8.0, dtype=logits.dtype),
+                                         torch.full_like(best, 8.0, dtype=logits.dtype))
+        skewed = dict(out)
+        skewed["focus_logits"] = logits
+        _, logs_plain = SixParamLoss(cw, norm, {}, near_optimum_weight=1.0)(skewed, tg)
+        _, logs_heavy = SixParamLoss(cw, norm, {}, near_optimum_weight=4.0)(skewed, tg)
+        check("weighting the near-optimum frames raises the loss when exactly those frames are wrong, "
+              "and leaves the back end alone",
+              logs_heavy["focus_cls"] > logs_plain["focus_cls"] + 0.1
+              and abs(logs_heavy["gain_reg"] - logs_plain["gain_reg"]) < 1e-9,
+              "focus_cls %.3f -> %.3f with %d near / %d far frames"
+              % (logs_plain["focus_cls"], logs_heavy["focus_cls"], int(near.sum()), int(far.sum())))
+    else:
+        emit("    skipped the near-optimum weight: this batch has no mix of near and far frames")
+
+
 def check_smoke(rows, skip_scripts):
     emit("=========== 4. synthetic end-to-end smoke test (CPU) ===========")
     groups = sorted(set(r["group_id"] for r in rows))
@@ -544,6 +605,7 @@ def check_smoke(rows, skip_scripts):
                 check("dynamic range loss is zero without labels", logs["dr_reg"] == 0.0 and logs["dr_dir"] == 0.0)
 
         check_backend_output_and_smoothing(data, norm, cw, inputs, tg)
+        check_starts_and_deadband(data, builder, norm, cw, train_idx)
 
         model = model_from_config(new_config, data.ladders, norm)
         with torch.no_grad():

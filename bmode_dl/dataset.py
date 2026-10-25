@@ -396,13 +396,21 @@ TARGET_KEYS = ("mode", "depth_idx", "frequency_idx", "focus_idx", "optimal_gain_
                "attenuation_db_cm_mhz", "electronic_noise_db", "aux_mask")
 
 
-def make_batch(data, builder, idx, start="label", generator=None, flip=False, state=None):
+def make_batch(data, builder, idx, start="label", generator=None, flip=False, state=None,
+               recorded_prob=0.0):
     """一个批次的 (inputs, targets)。
 
     start   "label"  用 jsonl 记录的起点
             "redraw" 重抽后端起点并重算后端标签（训练增强、固定种子的验证）
     state   闭环仿真时直接给定当前后端设置 {"gain_db", "tgc_levels"}，覆盖 start
     flip    左右翻转（所有标签不变）
+    recorded_prob  start="redraw" 时，按这个概率逐帧改用【记录的起点】。
+
+    为什么要混：人体颈动脉的 17545 帧里 98.5% 的 TGC 平直在 127，而最优 TGC 需要 -97 到 +120 级的
+    强倾斜，正好压在 draw_start 的倾斜振幅上限（110 级）处——训练几乎碰不到真实起点，而部署时
+    看到的就是它。invivo_bf_v1 的测试集上，重抽起点 TGC 误差 0.237 dB，记录起点 0.569 dB，
+    三个随机种子完全一致；0.237 已经低于标签自身的噪声底（同一受试者同一设置重复帧之间 0.33 dB），
+    所以这 0.33 dB 的差距全部来自起点分布，而不是网络不够准。
     """
     idx_t = torch.as_tensor(idx, device=data.device, dtype=torch.long)
     t = {k: v[idx_t] for k, v in data.t.items()}
@@ -414,6 +422,11 @@ def make_batch(data, builder, idx, start="label", generator=None, flip=False, st
         gain_db, tgc_levels = state["gain_db"].float(), state["tgc_levels"].float()
     elif start == "redraw":
         gain_db, tgc_levels = L.draw_start(t["optimal_gain_db"], t["optimal_tgc_levels"], t["mode"], generator)
+        if recorded_prob > 0:
+            keep = (torch.rand(len(idx_t), generator=generator, dtype=torch.float64)
+                    < float(recorded_prob)).to(device=data.device)
+            gain_db = torch.where(keep, t["gain_db"], gain_db)
+            tgc_levels = torch.where(keep[:, None], t["tgc_levels"], tgc_levels)
     else:
         gain_db, tgc_levels = t["gain_db"], t["tgc_levels"]
 

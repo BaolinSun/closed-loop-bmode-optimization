@@ -109,7 +109,8 @@ def invariance_loss(out_a, tg_a, out_b, tg_b):
 
 class SixParamLoss(nn.Module):
     def __init__(self, class_weights, norm, weights=None, borderline_weight=0.5,
-                 uncertainty_weighting=False, frontend_label_smoothing=0.0):
+                 uncertainty_weighting=False, frontend_label_smoothing=0.0,
+                 gain_deadband_fraction=1.0, near_optimum_weight=1.0):
         super().__init__()
         self.weights = dict(DEFAULT_WEIGHTS)
         if weights:
@@ -120,6 +121,15 @@ class SixParamLoss(nn.Module):
         self.borderline_weight = float(borderline_weight)
         self.smoothing = float(frontend_label_smoothing)
         self.uncertainty_weighting = bool(uncertainty_weighting)
+        # 增益回归的死区占教师死区的多少。1.0 是原行为：教师死区以内完全不罚。人体数据上
+        # 教师死区中位 0.95 dB，而同一受试者同一设置的重复帧之间最优增益只差 0.23 dB——
+        # 整条死区不罚等于把 4 倍于标签噪声的真实信号丢掉，invivo_bf_v1 的增益误差正好停在
+        # 1.41 dB（约等于死区加残差）。相比之下 TGC 回归没有死区，误差 0.237 dB，已经到标签
+        # 噪声底（0.33 dB）。0 表示完全不留死区。
+        self.gain_deadband_fraction = float(gain_deadband_fraction)
+        # 前端三轴里「当前设置离最优不超过一档」的帧的权重。闭环停点全都在这一带，而
+        # invivo_bf_v1 测试集上聚焦「教师说已经正确」的那一类只保持了 103/361 = 29%。
+        self.near_optimum_weight = float(near_optimum_weight)
         if self.uncertainty_weighting:
             self.log_vars = nn.ParameterDict({t: nn.Parameter(torch.zeros(())) for t in TASKS})
 
@@ -132,7 +142,7 @@ class SixParamLoss(nn.Module):
 
         # 增益
         err = (out["gain_delta_db"].float() - tg["delta_gain_db"]).abs()
-        insensitive = F.relu(err - tg["gain_deadband_db"])
+        insensitive = F.relu(err - self.gain_deadband_fraction * tg["gain_deadband_db"])
         terms["gain_reg"], counts["gain"] = masked_mean(huber(insensitive), backend)
         terms["gain_dir"], _ = weighted_ce(out["gain_dir"], tg["gain_dir"], backend, self.cw("gain_dir"))
 
@@ -152,10 +162,19 @@ class SixParamLoss(nn.Module):
         dir_mask = backend[:, None].expand(-1, groups).reshape(-1)
         terms["tgc_dir"], _ = weighted_ce(dir_logits, dir_target, dir_mask, self.cw("slider_dir"))
 
+        # 前端三轴：近最优帧（当前档与最优档相差不超过一档）的权重
+        def near_weight(axis):
+            mask = tg["%s_mask" % axis]
+            if self.near_optimum_weight == 1.0:
+                return mask
+            near = ((tg["optimal_%s_idx" % axis] - tg["%s_idx" % axis]).abs() <= 1).to(mask.dtype)
+            return mask * (1.0 + (self.near_optimum_weight - 1.0) * near)
+
         # 深度
+        depth_w = near_weight("depth")
         terms["depth_cls"], terms["depth_ord"], counts["depth"] = ladder_losses(
-            out["depth_logits"], tg["depth_valid"], tg["optimal_depth_idx"], tg["depth_mask"], self.smoothing)
-        terms["depth_dir"], _ = weighted_ce(out["depth_dir"], tg["depth_dir"], tg["depth_mask"], self.cw("depth_dir"),
+            out["depth_logits"], tg["depth_valid"], tg["optimal_depth_idx"], depth_w, self.smoothing)
+        terms["depth_dir"], _ = weighted_ce(out["depth_dir"], tg["depth_dir"], depth_w, self.cw("depth_dir"),
                                             self.smoothing)
 
         # 频率：可接受集合
@@ -166,16 +185,17 @@ class SixParamLoss(nn.Module):
             logp = F.log_softmax(f_logits, dim=1)
             uniform = smoothing_target(tg["frequency_valid"], self.smoothing)
             nll = (1.0 - self.smoothing) * nll - self.smoothing * (uniform * logp).sum(dim=1)
-        f_weight = (tg["frequency_mask"] * tg["frequency_weight"]
+        f_weight = (near_weight("frequency") * tg["frequency_weight"]
                     * (1.0 - tg["frequency_borderline"] * (1.0 - self.borderline_weight)))
         terms["frequency_cls"], counts["frequency"] = masked_mean(nll, f_weight)
-        terms["frequency_dir"], _ = weighted_ce(out["frequency_dir"], tg["frequency_dir"], tg["frequency_mask"],
-                                                self.cw("frequency_dir"), self.smoothing)
+        terms["frequency_dir"], _ = weighted_ce(out["frequency_dir"], tg["frequency_dir"],
+                                                near_weight("frequency"), self.cw("frequency_dir"), self.smoothing)
 
         # 聚焦
+        focus_w = near_weight("focus")
         terms["focus_cls"], terms["focus_ord"], counts["focus"] = ladder_losses(
-            out["focus_logits"], tg["focus_valid"], tg["optimal_focus_idx"], tg["focus_mask"], self.smoothing)
-        terms["focus_dir"], _ = weighted_ce(out["focus_dir"], tg["focus_dir"], tg["focus_mask"], self.cw("focus_dir"),
+            out["focus_logits"], tg["focus_valid"], tg["optimal_focus_idx"], focus_w, self.smoothing)
+        terms["focus_dir"], _ = weighted_ce(out["focus_dir"], tg["focus_dir"], focus_w, self.cw("focus_dir"),
                                             self.smoothing)
 
         # 动态范围（目前无定出的标签，两项恒为 0）
