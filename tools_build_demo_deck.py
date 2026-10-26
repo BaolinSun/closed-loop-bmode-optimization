@@ -1,5 +1,10 @@
 # -*- coding: utf-8 -*-
-"""汇报用的 PPT：九页，中文学术表达，演示视频内嵌在第 5 页。
+"""汇报用的 PPT：中文学术表达，演示视频内嵌并自动播放。
+
+    两种篇幅
+
+    brief（默认）  四页：封面与结论、演示视频、结果、结论与后续。用于口头汇报，细节交给视频与网页。
+    full           九页：另含研究背景、数据与划分、方法、以及结果的分页展开。用于预读或答辩。
 
     数字从哪来
 
@@ -62,8 +67,14 @@ def parse_args(argv=None):
     p.add_argument("--loop-trajectories",
                    default="runs/invivo_bf_v2/fold_0/closed_loop_trajectories_combined_bloop.jsonl")
     p.add_argument("--labels", default="data/labels_console_invivo_carotid_target.jsonl")
-    p.add_argument("--out", default="data/demo_invivo_carotid.pptx")
-    return p.parse_args(argv)
+    p.add_argument("--pages", choices=("brief", "full"), default="brief",
+                   help="brief = 4 pages for a talk; full = 9 pages with background and methods")
+    p.add_argument("--out", default=None, help="default: data/demo_invivo_carotid[_full].pptx")
+    args = p.parse_args(argv)
+    if args.out is None:
+        args.out = ("data/demo_invivo_carotid.pptx" if args.pages == "brief"
+                    else "data/demo_invivo_carotid_full.pptx")
+    return args
 
 
 # ---------------------------------------------------------------------------------------
@@ -147,6 +158,7 @@ def panel(slide, x, y, w, h, fill=PANEL, line=LINE):
     shape.text_frame.margin_right = Inches(0.22)
     shape.text_frame.margin_top = Inches(0.16)
     shape.text_frame.margin_bottom = Inches(0.16)
+    shape.text_frame.paragraphs[0].alignment = PP_ALIGN.LEFT
     return shape
 
 
@@ -154,11 +166,13 @@ def stat_panel(slide, x, y, w, h, value, label, colour=BLUE):
     shape = panel(slide, x, y, w, h)
     frame = shape.text_frame
     frame.paragraphs[0].space_after = Pt(2)
+    frame.paragraphs[0].alignment = PP_ALIGN.LEFT
     run = frame.paragraphs[0].add_run()
     run.text = value
     set_font(run, 30, colour, True, "Consolas")
     paragraph = frame.add_paragraph()
     paragraph.line_spacing = 1.2
+    paragraph.alignment = PP_ALIGN.LEFT
     run = paragraph.add_run()
     run.text = label
     set_font(run, 11.5, MUTED)
@@ -172,6 +186,169 @@ def figure(slide, path, x, y, w):
 
 def caption(slide, text, x, y, w):
     write(text_box(slide, x, y, w, 0.5), [(text, 11, MUTED, False)], space_after=0, line_spacing=1.25)
+
+
+AUTOPLAY_TIMING = (
+    '<p:timing><p:tnLst><p:par><p:cTn id="1" dur="indefinite" restart="never" nodeType="tmRoot">'
+    '<p:childTnLst><p:seq concurrent="1" nextAc="seek">'
+    '<p:cTn id="2" dur="indefinite" nodeType="mainSeq"><p:childTnLst>'
+    '<p:par><p:cTn id="3" fill="hold"><p:stCondLst><p:cond delay="indefinite"/></p:stCondLst>'
+    '<p:childTnLst><p:par><p:cTn id="4" fill="hold"><p:stCondLst><p:cond delay="0"/></p:stCondLst>'
+    '<p:childTnLst><p:par><p:cTn id="5" presetID="1" presetClass="mediacall" presetSubtype="0" '
+    'fill="hold" nodeType="withEffect"><p:stCondLst><p:cond delay="0"/></p:stCondLst>'
+    '<p:childTnLst><p:cmd type="call" cmd="playFrom(0.0)"><p:cBhvr>'
+    '<p:cTn id="6" dur="1" fill="hold"/><p:tgtEl><p:spTgt spid="%(spid)s"/></p:tgtEl>'
+    '</p:cBhvr></p:cmd></p:childTnLst></p:cTn></p:par></p:childTnLst></p:cTn></p:par>'
+    '</p:childTnLst></p:cTn></p:par></p:childTnLst></p:cTn>'
+    '<p:prevCondLst><p:cond evt="onPrev" delay="0"><p:tgtEl><p:sldTgt/></p:tgtEl></p:cond></p:prevCondLst>'
+    '<p:nextCondLst><p:cond evt="onNext" delay="0"><p:tgtEl><p:sldTgt/></p:tgtEl></p:cond></p:nextCondLst>'
+    '</p:seq><p:video><p:cMediaNode vol="80000"><p:cTn id="7" fill="hold" display="0">'
+    '<p:stCondLst><p:cond delay="indefinite"/></p:stCondLst></p:cTn>'
+    '<p:tgtEl><p:spTgt spid="%(spid)s"/></p:tgtEl></p:cMediaNode></p:video>'
+    '</p:childTnLst></p:cTn></p:par></p:tnLst></p:timing>')
+
+
+def set_autoplay(path, emit):
+    """把 add_movie 写出的「单击播放」改成「随幻灯片自动播放」。
+
+    python-pptx 只会写 <p:cond delay="indefinite"/>（单击触发）。PowerPoint 的「自动」是在
+    mainSeq 里挂一条 playFrom(0.0) 的 mediacall，这里按同一结构重写该页的 p:timing。
+    """
+    import re
+    import shutil
+    import zipfile
+
+    source = zipfile.ZipFile(path)
+    items = [(item, source.read(item.filename)) for item in source.infolist()]
+    source.close()
+    changed = 0
+    out = []
+    for item, data in items:
+        if item.filename.startswith("ppt/slides/slide") and item.filename.endswith(".xml"):
+            xml = data.decode("utf-8")
+            if "<p:video>" in xml and "playFrom" not in xml:
+                match = re.search(r'<p:spTgt spid="(\d+)"/>', xml)
+                if match:
+                    xml = re.sub(r"<p:timing>.*?</p:timing>", AUTOPLAY_TIMING % {"spid": match.group(1)},
+                                 xml, flags=re.S)
+                    data = xml.encode("utf-8")
+                    changed += 1
+        out.append((item, data))
+    target = path + ".tmp"
+    with zipfile.ZipFile(target, "w", zipfile.ZIP_DEFLATED) as handle:
+        for item, data in out:
+            handle.writestr(item, data)
+    shutil.move(target, path)
+    emit("  autoplay   rewrote the timing of %d slide(s) so the video starts with the slide" % changed)
+
+
+# ---------------------------------------------------------------------------------------
+#   精简版（四页）
+
+def brief_cover(deck, numbers):
+    slide = add_slide(deck)
+    write(text_box(slide, MARGIN, 1.5, 11.6, 0.4), [(u"在体颈动脉数据上的验证", 16, BLUE, False)],
+          space_after=0)
+    write(text_box(slide, MARGIN, 1.95, 11.6, 1.2), [(u"超声成像六参数闭环优化", 44, INK, True)],
+          space_after=0)
+    write(text_box(slide, MARGIN, 3.2, 11.0, 1.0),
+          [(u"模型由单帧图像预测增益、时间增益补偿与发射聚焦的最优值，并以闭环方式迭代至停止判据满足；"
+            u"在 29 位未参与训练的受试者上优于只看当前设置的查表基线。", 16, DIM, False)], space_after=0)
+    cards = [(numbers["tgc"] + " dB", u"时间增益补偿误差；基线 " + numbers["tgc_base"] + " dB", BLUE),
+             (numbers["gain"] + " dB", u"增益误差；基线 " + numbers["gain_base"] + " dB", BLUE),
+             (numbers["converged"] + "%", u"后端闭环收敛比例，2-3 次迭代", GREEN)]
+    for i, (value, label, colour) in enumerate(cards):
+        stat_panel(slide, MARGIN + i * 4.09, 4.75, 3.87, 1.35, value, label, colour)
+    write(text_box(slide, MARGIN, 6.45, 12.1, 0.5),
+          [(u"数据：17545 帧 / 189 位受试者 / 9 个采集日；按受试者划分训练 132 位、验证 28 位、"
+            u"留出测试 29 位", 13, MUTED, False)], space_after=0)
+
+
+def brief_video(deck, video, poster):
+    slide = add_slide(deck)
+    write(text_box(slide, MARGIN, 0.42, 11.0, 0.3), [(u"演示", 12, MUTED, False)], space_after=0)
+    write(text_box(slide, MARGIN, 0.72, 12.1, 0.6), [(u"一帧图像上的六参数闭环优化", 26, INK, True)],
+          space_after=0)
+    width = 10.2
+    height = width * 720.0 / 1280.0
+    x = (WIDE - width) / 2.0
+    slide.shapes.add_movie(video, Inches(x), Inches(1.4), Inches(width), Inches(height),
+                           poster_frame_image=poster, mime_type="video/mp4")
+    caption(slide, u"30 秒，五段：后端闭环迭代、发射聚焦判据、六位受试者同屏验证、误差分布形态、"
+                   u"留出测试集结果；各帧均由同一组原始回波数据精确重建", x, 1.4 + height + 0.16, width)
+
+
+def brief_results(deck, numbers, bias, figures):
+    slide = add_slide(deck)
+    title(slide, u"结果：优于设置查表基线，且闭环可收敛", u"结果")
+    write(text_box(slide, MARGIN, 1.74, 6.2, 0.4),
+          [(u"留出测试集（29 位未见过的受试者）", 14, MUTED, False)], space_after=0)
+    rows = [(u"时间增益补偿", numbers["tgc"] + " dB", numbers["tgc_base"] + " dB", u"优于基线 91%"),
+            (u"增益", numbers["gain"] + " dB", numbers["gain_base"] + " dB", u"优于基线 30%"),
+            (u"发射聚焦", numbers["focus"], numbers["focus_base"], u"略优于基线")]
+    header = (u"参数轴", u"本方法", u"查表基线", u"")
+    widths = (2.0, 1.35, 1.35, 1.6)
+    for j, name in enumerate(header):
+        write(text_box(slide, MARGIN + sum(widths[:j]), 2.2, widths[j], 0.3),
+              [(name, 12, MUTED, True)], space_after=0)
+    for i, row in enumerate(rows):
+        y = 2.62 + i * 0.62
+        for j, value in enumerate(row):
+            latin = "Consolas" if j in (1, 2) else LATIN
+            colour = BLUE if j == 1 else (GREEN if j == 3 else DIM)
+            write(text_box(slide, MARGIN + sum(widths[:j]), y, widths[j], 0.4),
+                  [(value, 16 if j == 1 else 14, colour, j == 1)], space_after=0, latin=latin)
+    write(text_box(slide, MARGIN, 4.65, 6.3, 0.9),
+          [(u"显示深度与发射频率的标签可由当前设置直接推得、不依赖图像，动态范围尚无判据，"
+            u"三者本阶段未参与训练。", 13.5, MUTED, False)], space_after=0)
+    panel(slide, MARGIN, 5.65, 6.3, 1.3)
+    write(text_box(slide, MARGIN + 0.26, 5.9, 5.8, 0.9),
+          [(u"闭环：" + numbers["converged"] + u"% 的轨迹在 2-3 次迭代内收敛；增益偏差 " +
+            numbers["loop_gain_start"] + u" → " + numbers["loop_gain_final"] + u" dB，时间增益补偿 " +
+            numbers["loop_tgc_start"] + u" → " + numbers["loop_tgc_final"] + u" dB，无正反馈发散。",
+            14, DIM, False)], space_after=0)
+    figure(slide, os.path.join(figures, "fig_bias.png"), 7.1, 1.74, 5.63)
+    write(text_box(slide, 7.1, 4.95, 5.63, 1.0),
+          [(u"残差以受试者为单位呈常数偏置", 15, BLUE, True),
+           (u"受试者内一致性 %.2f dB；%d / %d 位偏置在 ±1 dB 以内；平方误差中 %.0f%% 来自受试者间偏置，"
+            u"故一次人工校正即可修正整次检查。"
+            % (bias["sd_median"], bias["within_1db"], len(bias["subjects"]),
+               100 * bias["bias_share"]), 13.5, DIM, False)], space_after=5)
+
+
+def brief_conclusion(deck):
+    slide = add_slide(deck)
+    title(slide, u"结论与后续工作", u"小结")
+    blocks = [(u"可用", GREEN, u"增益与时间增益补偿：显著优于查表基线，闭环收敛且不发散；残差可由"
+                              u"一次人工校正消除。"),
+              (u"勉强可用", ORANGE, u"发射聚焦：略优于基线，但在训练集受试者上接近记忆，泛化有限。"),
+              (u"尚不可用", MUTED, u"显示深度、发射频率：标签不依赖图像；动态范围：尚无判据。")]
+    y = 1.85
+    for name, colour, body in blocks:
+        shape = panel(slide, MARGIN, y, 6.3, 1.35)
+        frame = shape.text_frame
+        frame.paragraphs[0].space_after = Pt(3)
+        frame.paragraphs[0].alignment = PP_ALIGN.LEFT
+        run = frame.paragraphs[0].add_run()
+        run.text = name
+        set_font(run, 14, colour, True)
+        paragraph = frame.add_paragraph()
+        paragraph.line_spacing = 1.3
+        paragraph.alignment = PP_ALIGN.LEFT
+        run = paragraph.add_run()
+        run.text = body
+        set_font(run, 13.5, DIM)
+        y += 1.52
+    write(text_box(slide, 7.1, 1.85, 5.63, 0.4), [(u"后续工作", 15, INK, True)], space_after=0)
+    steps = [u"一、上机闭环实测：按模型输出逐步调节并重新采集",
+             u"二、真实医生阅片：重建深度与频率的判据",
+             u"三、动态范围判据：成对偏好阅片，补齐第六个参数",
+             u"四、扩充受试者例数，抑制聚焦输出头的过拟合"]
+    write(text_box(slide, 7.1, 2.35, 5.63, 2.6), [(x, 14, DIM, False) for x in steps], space_after=14)
+    panel(slide, 7.1, 5.3, 5.63, 1.35)
+    write(text_box(slide, 7.36, 5.56, 5.1, 0.95),
+          [(u"局限：前端目标深度来自阶段性阅片结果；结论限于单一机型、单一探头与颈动脉切面。",
+            13, DIM, False)], space_after=0)
 
 
 # ---------------------------------------------------------------------------------------
@@ -238,10 +415,12 @@ def slide_data(deck):
         shape = panel(slide, x, 3.78, 3.87, 1.2, PANEL, BLUE if i == 2 else LINE)
         frame = shape.text_frame
         frame.paragraphs[0].space_after = Pt(3)
+        frame.paragraphs[0].alignment = PP_ALIGN.LEFT
         run = frame.paragraphs[0].add_run()
         run.text = name
         set_font(run, 15, BLUE if i == 2 else INK, True)
         paragraph = frame.add_paragraph()
+        paragraph.alignment = PP_ALIGN.LEFT
         run = paragraph.add_run()
         run.text = subjects + u" / " + frames
         set_font(run, 14, DIM)
@@ -426,22 +605,30 @@ def main(argv=None):
     emit("  figures    %s" % args.figures)
     emit("  video      %s (%.1f MB)" % (args.video, os.path.getsize(args.video) / 1e6))
 
+    poster = os.path.join(args.figures, "fig_loop_start.png")
     deck = new_deck()
-    slide_cover(deck, numbers)
-    slide_background(deck, numbers)
-    slide_data(deck)
-    slide_method(deck, args.figures)
-    slide_video(deck, args.video, os.path.join(args.figures, "fig_loop_start.png"))
-    slide_single_step(deck, numbers, args.figures)
-    slide_loop(deck, numbers, args.figures)
-    slide_bias(deck, bias, args.figures)
-    slide_conclusion(deck)
+    if args.pages == "brief":
+        brief_cover(deck, numbers)
+        brief_video(deck, args.video, poster)
+        brief_results(deck, numbers, bias, args.figures)
+        brief_conclusion(deck)
+    else:
+        slide_cover(deck, numbers)
+        slide_background(deck, numbers)
+        slide_data(deck)
+        slide_method(deck, args.figures)
+        slide_video(deck, args.video, poster)
+        slide_single_step(deck, numbers, args.figures)
+        slide_loop(deck, numbers, args.figures)
+        slide_bias(deck, bias, args.figures)
+        slide_conclusion(deck)
 
     directory = os.path.dirname(os.path.abspath(args.out))
     if directory and not os.path.isdir(directory):
         os.makedirs(directory)
     deck.save(args.out)
-    emit("  slides     %d" % len(deck.slides.__iter__.__self__._sldIdLst))
+    set_autoplay(args.out, emit)
+    emit("  slides     %d (%s)" % (len(deck.slides._sldIdLst), args.pages))
     emit("  wrote %s (%.1f MB)" % (args.out, os.path.getsize(args.out) / 1e6))
     emit("  done in %.0f s" % (time.time() - started))
 
