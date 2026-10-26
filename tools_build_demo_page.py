@@ -134,6 +134,7 @@ def backend_loop(model, builder, frame, row, ladders, per_mode, args, trained, w
     steps = []
     for step in range(int(args.max_steps) + 1):
         entry = {"step": step, "gain_level": int(state["gain_level"]), "gain_db": float(state["gain_db"]),
+                 "tgc_levels": [int(v) for v in np.asarray(state["tgc_levels"])],
                  "gain_error_db": optimal_gain - state["gain_db"],
                  "tgc_error_db": float(np.abs(optimal_levels
                                               - np.asarray(state["tgc_levels"], np.float64)).mean() * tgc_slope)}

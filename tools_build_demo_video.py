@@ -1,0 +1,541 @@
+# -*- coding: utf-8 -*-
+"""把 demo 做成一段视频：模型把旋钮拧过去，图像跟着变。
+
+    每一帧都是真的
+
+增益与 TGC 不改变 BC0、只改变渲染，所以从一个设置到另一个设置之间的【任意中间值】都能精确渲染
+出来——那正是操作者转旋钮时屏幕上会出现的画面。视频里的平滑过渡因此不是插值出来的假象，是同一帧
+原始数据在一串真实设置下的真实渲染。聚焦那一段不同：它改变 BC0 本身，所以用的是同一探头位置下
+真实采到的六帧，逐档切换。
+
+    四段
+
+  1. 后端闭环：起点 -> 模型建议 -> 再问一次 -> 停。左边动，中间是教师最优（静止参考），
+     右边是增益档位、离最优多少 dB、TGC 曲线。
+  2. 聚焦：六档真实采集逐档切换，另给远壁附近的放大图，标出教师与模型各选哪档。
+  3. 多位受试者：若干位测试集受试者各走一遍后端闭环，看这件事不是只在一帧上成立。
+  4. 数字卡：测试集指标与查表基线。
+
+    用法
+
+    python tools_build_demo_video.py
+    python tools_build_demo_video.py --language en --fps 30 --subjects 8
+    python tools_build_demo_video.py --out data/demo.mp4 --gif data/demo.gif
+
+写 MP4（优先 ffmpeg 的 libx264，PowerPoint 与浏览器都能放；没有 ffmpeg 时退回 OpenCV 的 mp4v）。
+--gif 另写一份动图。终端输出与写在脚本旁边的 tools_build_demo_video.txt 同内容（ASCII）。
+"""
+
+import argparse
+import io
+import os
+import shutil
+import subprocess
+import sys
+import tempfile
+import time
+
+sys.path.insert(0, "bmode_opt")
+import numpy as np
+from PIL import Image, ImageDraw, ImageFont
+
+import bmode_dl.constants as K
+import tools_build_demo_page as DP
+import tools_suggest_six_param as SG
+
+REPORT_PATH = "tools_build_demo_video.txt"
+WIDTH, HEIGHT = 1280, 720
+IMAGE_BOX = (392, 450)            # 单幅 B 超图的最大显示尺寸
+FONTS = {"body": "C:/Windows/Fonts/segoeui.ttf", "bold": "C:/Windows/Fonts/segoeuib.ttf",
+         "data": "C:/Windows/Fonts/consola.ttf",
+         "cjk": "C:/Windows/Fonts/msyh.ttc", "cjk_bold": "C:/Windows/Fonts/msyhbd.ttc"}
+INK = (238, 238, 232)
+INK_DIM = (150, 150, 142)
+BG = (18, 18, 17)
+PANEL = (26, 26, 25)
+BLUE = (57, 135, 229)
+ORANGE = (217, 89, 38)
+GREEN = (25, 158, 112)
+
+TEXT = {
+    "zh": {
+        "title": "超声六参数闭环优化",
+        "subtitle": "颈动脉活体数据，测试集受试者（未参与训练与选模）",
+        "scene1": "第 1 段 - 后端闭环：模型拧旋钮，图像跟着变",
+        "live": "当前画面（模型正在调）",
+        "teacher": "教师最优（静止参考）",
+        "gain": "增益档位",
+        "off": "离教师最优",
+        "tgc": "TGC 曲线（dB）",
+        "tgc_now": "当前",
+        "tgc_teacher": "教师",
+        "step": "第 %d 步",
+        "start": "起点：实机采下来的样子，TGC 平直 127",
+        "moving": "执行建议：增益 %+d 级，TGC 移动",
+        "stopped": "模型说可以了，停。",
+        "scene2": "第 2 段 - 发射聚焦：同一探头位置真实采到的六档",
+        "focus_label": "聚焦 %g mm",
+        "zoom": "远壁附近放大",
+        "pick_teacher": "教师选这一档",
+        "pick_model": "模型选这一档",
+        "scene3": "第 3 段 - 换人再看：%d 位测试集受试者各走一遍",
+        "subject": "受试者 %s",
+        "from_to": "增益离最优 %.2f dB  ->  %.2f dB",
+        "scene4": "第 4 段 - 测试集上的数字（29 位未见过的受试者）",
+        "net": "网络",
+        "base": "只看设置查表",
+        "row_tgc": "TGC 误差",
+        "row_gain": "增益误差",
+        "row_focus": "聚焦命中",
+        "lower": "越小越好", "higher": "越大越好",
+        "closing": "后端（增益、TGC）可用；聚焦勉强；深度、频率、动态范围尚未训练",
+        "note_render": "每一帧都由同一份原始回波数据精确渲染，不是示意图",
+    },
+    "en": {
+        "title": "Closed-loop B-mode optimisation",
+        "subtitle": "In-vivo carotid, held-out test subject",
+        "scene1": "1 - the back-end loop: the model turns the knobs",
+        "live": "live (the model is adjusting)",
+        "teacher": "teacher's optimum (reference)",
+        "gain": "gain level",
+        "off": "from the optimum",
+        "tgc": "TGC curve (dB)",
+        "tgc_now": "now",
+        "tgc_teacher": "teacher",
+        "step": "step %d",
+        "start": "start: as the operator captured it, TGC flat at 127",
+        "moving": "applying: gain %+d clicks, TGC moved",
+        "stopped": "the model stops here.",
+        "scene2": "2 - transmit focus: six real captures from one probe position",
+        "focus_label": "focus %g mm",
+        "zoom": "near the far wall",
+        "pick_teacher": "teacher picks this",
+        "pick_model": "model picks this",
+        "scene3": "3 - and again on %d other test subjects",
+        "subject": "subject %s",
+        "from_to": "gain from the optimum %.2f dB  ->  %.2f dB",
+        "scene4": "4 - on the test set (29 unseen subjects)",
+        "net": "network",
+        "base": "settings lookup",
+        "row_tgc": "TGC error",
+        "row_gain": "gain error",
+        "row_focus": "focus top-1",
+        "lower": "lower is better", "higher": "higher is better",
+        "closing": "gain and TGC work; focus is marginal; depth, frequency and dynamic range are not trained",
+        "note_render": "every frame is rendered from the same recorded envelope, not an illustration",
+    },
+}
+
+
+def parse_args(argv=None):
+    p = argparse.ArgumentParser(description="Render the six-parameter demo as a video")
+    p.add_argument("--family", default=None, help="scene for part 1 and 2 (default: the same median pick "
+                                                 "tools_build_demo_page.py makes)")
+    p.add_argument("--subjects", type=int, default=6, help="how many extra subjects in part 3")
+    p.add_argument("--language", choices=("zh", "en"), default="zh")
+    p.add_argument("--fps", type=int, default=25)
+    p.add_argument("--out", default="data/demo_invivo_carotid.mp4")
+    p.add_argument("--gif", default=None, help="also write an animated GIF here")
+    p.add_argument("--frontend", default=os.path.join(DP.DEFAULT_RUN, "frontend.pt"))
+    p.add_argument("--backend", default=os.path.join(DP.DEFAULT_RUN, "last.pt"))
+    p.add_argument("--checkpoint", default=None)
+    p.add_argument("--labels", default="data/labels_console_invivo_carotid_target.jsonl")
+    p.add_argument("--dataset", default="invivo", choices=("auto", "phantom", "invivo"))
+    p.add_argument("--calibration", default=None)
+    p.add_argument("--calibration-group", default=None)
+    p.add_argument("--device", default="cpu")
+    p.add_argument("--batch-size", type=int, default=8)
+    p.add_argument("--stop-deadband-levels", type=float, default=0.5)
+    p.add_argument("--max-gain-step-clicks", type=int, default=80)
+    p.add_argument("--max-steps", type=int, default=3)
+    p.add_argument("--candidates", type=int, default=16)
+    p.add_argument("--single-step-json", default="runs/invivo_bf_v2/fold_0/evaluation_combined_test_noloop.json")
+    p.add_argument("--limit", type=int, default=None)
+    return p.parse_args(argv)
+
+
+# ---------------------------------------------------------------------------------------
+#   画布
+
+def load_fonts(language):
+    body = FONTS["cjk"] if language == "zh" else FONTS["body"]
+    bold = FONTS["cjk_bold"] if language == "zh" else FONTS["bold"]
+    pick = lambda path, size: ImageFont.truetype(path, size)
+    return {"h1": pick(bold, 40), "h2": pick(bold, 24), "body": pick(body, 19), "small": pick(body, 16),
+            "data": pick(FONTS["data"], 20), "data_small": pick(FONTS["data"], 15),
+            "big": pick(FONTS["data"], 44)}
+
+
+def gray_to_image(gray, depth_mm, box=IMAGE_BOX):
+    """灰阶数组 -> 按物理比例缩放到 box 内的 RGB 图。"""
+    image = Image.fromarray(np.clip(gray, 0, 255).astype(np.uint8), mode="L").convert("RGB")
+    scale = min(box[0] / (DP.SCAN_WIDTH_MM * DP.PIXELS_PER_MM), box[1] / (depth_mm * DP.PIXELS_PER_MM))
+    size = (max(1, int(round(DP.SCAN_WIDTH_MM * DP.PIXELS_PER_MM * scale))),
+            max(1, int(round(depth_mm * DP.PIXELS_PER_MM * scale))))
+    return image.resize(size, Image.BILINEAR)
+
+
+def canvas(fonts, strings, header, caption=None):
+    """统一的底板：标题带 + 底部字幕带。"""
+    image = Image.new("RGB", (WIDTH, HEIGHT), BG)
+    draw = ImageDraw.Draw(image)
+    draw.rectangle([0, 0, WIDTH, 52], fill=PANEL)
+    draw.text((36, 14), header, font=fonts["h2"], fill=INK)
+    draw.line([0, 52, WIDTH, 52], fill=(54, 54, 52))
+    draw.line([0, HEIGHT - 58, WIDTH, HEIGHT - 58], fill=(54, 54, 52))
+    if caption:
+        draw.text((36, HEIGHT - 44), caption, font=fonts["body"], fill=INK_DIM)
+    return image, draw
+
+
+def paste_panel(image, draw, fonts, picture, x, y, label, accent=None):
+    """一幅图 + 上方小标题，带细边框。"""
+    draw.text((x, y - 26), label, font=fonts["small"], fill=INK_DIM)
+    image.paste(picture, (x, y))
+    box = [x - 1, y - 1, x + picture.size[0], y + picture.size[1]]
+    draw.rectangle(box, outline=accent or (70, 70, 66), width=2 if accent else 1)
+
+
+def draw_tgc_curve(draw, fonts, strings, x, y, w, h, now_levels, teacher_levels, slope):
+    """小幅 TGC 曲线：当前与教师两条。"""
+    draw.text((x, y - 24), strings["tgc"], font=fonts["small"], fill=INK_DIM)
+    draw.rectangle([x, y, x + w, y + h], fill=PANEL, outline=(54, 54, 52))
+    now = (np.asarray(now_levels, float) - K.TGC_CENTER_LEVEL) * slope
+    teacher = (np.asarray(teacher_levels, float) - K.TGC_CENTER_LEVEL) * slope
+    span = max(6.0, float(np.abs(np.concatenate([now, teacher])).max()) * 1.15)
+    bands = len(now)
+    px = lambda i: x + 14 + i * (w - 28) / (bands - 1.0)
+    py = lambda v: y + h / 2.0 - v / span * (h / 2.0 - 12)
+    draw.line([x + 10, py(0.0), x + w - 10, py(0.0)], fill=(74, 74, 70))
+    for values, colour in ((teacher, ORANGE), (now, BLUE)):
+        points = [(px(i), py(float(values[i]))) for i in range(bands)]
+        draw.line(points, fill=colour, width=3, joint="curve")
+        for point in points:
+            draw.ellipse([point[0] - 3, point[1] - 3, point[0] + 3, point[1] + 3], fill=colour)
+    draw.text((x + 12, y + h - 24), strings["tgc_now"], font=fonts["small"], fill=BLUE)
+    draw.text((x + 12 + 60, y + h - 24), strings["tgc_teacher"], font=fonts["small"], fill=ORANGE)
+
+
+def draw_readout(draw, fonts, strings, x, y, gain_level, gain_error, tgc_error):
+    """右栏的数字。"""
+    draw.text((x, y), strings["gain"], font=fonts["small"], fill=INK_DIM)
+    draw.text((x, y + 20), "%d" % gain_level, font=fonts["big"], fill=INK)
+    draw.text((x, y + 78), strings["off"], font=fonts["small"], fill=INK_DIM)
+    colour = GREEN if abs(gain_error) <= 1.0 else (ORANGE if abs(gain_error) <= 3.0 else (210, 90, 70))
+    draw.text((x, y + 98), "%+.2f dB" % gain_error, font=fonts["data"], fill=colour)
+    draw.text((x, y + 124), "TGC %.2f dB" % tgc_error, font=fonts["data"], fill=INK_DIM)
+
+
+# ---------------------------------------------------------------------------------------
+#   场景
+
+def interpolate(a, b, t):
+    return a + (b - a) * t
+
+
+def loop_timeline(steps, fps, hold_start=1.6, move=1.2, hold_mid=0.7, hold_end=2.2):
+    """闭环关键帧 -> 逐视频帧的 (gain_db, tgc_levels, 阶段, 第几步) 序列。"""
+    out = []
+    for i, step in enumerate(steps):
+        gain_a, tgc_a = step["gain_db"], np.asarray(step["tgc_levels"], float)
+        hold = hold_start if i == 0 else (hold_end if step["stopped"] else hold_mid)
+        for _ in range(int(round(hold * fps))):
+            out.append((gain_a, tgc_a, "hold", i))
+        if step["stopped"] or i + 1 >= len(steps):
+            break
+        gain_b = steps[i + 1]["gain_db"]
+        tgc_b = np.asarray(steps[i + 1]["tgc_levels"], float)
+        frames = int(round(move * fps))
+        for k in range(frames):
+            t = (k + 1) / float(frames)
+            smooth = t * t * (3 - 2 * t)                 # 缓入缓出，像手在拧旋钮
+            out.append((interpolate(gain_a, gain_b, smooth),
+                        np.round(interpolate(tgc_a, tgc_b, smooth)), "move", i))
+    return out
+
+
+def scene_backend(frame, row, steps, fonts, strings, fps, write):
+    """第 1 段：左边动、中间教师最优、右边数字与曲线。"""
+    slope = K.TGC_DB_PER_LEVEL[int(frame["mode"])]
+    optimal_gain = float(row["optimal_gain_db"])
+    optimal_levels = np.asarray(row["optimal_tgc_levels"], float)
+    teacher_picture = gray_to_image(DP.render_gray(frame, optimal_gain, optimal_levels), frame["max_depth_mm"])
+    for gain_db, tgc_levels, phase, index in loop_timeline(steps, fps):
+        image, draw = canvas(fonts, strings, strings["scene1"], strings["note_render"])
+        live = gray_to_image(DP.render_gray(frame, gain_db, tgc_levels), frame["max_depth_mm"])
+        paste_panel(image, draw, fonts, live, 48, 104, strings["live"], BLUE if phase == "move" else None)
+        paste_panel(image, draw, fonts, teacher_picture, 48 + IMAGE_BOX[0] + 48, 104, strings["teacher"])
+        right = 48 + 2 * (IMAGE_BOX[0] + 48)
+        gain_error = optimal_gain - gain_db
+        tgc_error = float(np.abs(optimal_levels - np.asarray(tgc_levels, float)).mean() * slope)
+        draw_readout(draw, fonts, strings, right, 104, int(round(frame["gain_level"]
+                                                                 + (gain_db - frame["gain_db"])
+                                                                 / K.GAIN_DB_PER_LEVEL[int(frame["mode"])])),
+                     gain_error, tgc_error)
+        draw_tgc_curve(draw, fonts, strings, right, 300, 300, 170, tgc_levels, optimal_levels, slope)
+        step = steps[index]
+        if index == 0 and phase == "hold":
+            note = strings["start"]
+        elif step["stopped"]:
+            note = strings["stopped"]
+        elif phase == "move":
+            note = strings["moving"] % step["suggestion"]["clicks"]
+        else:
+            note = strings["step"] % step["step"]
+        draw.text((right, 500), note if len(note) < 34 else note[:33] + "...", font=fonts["body"], fill=INK)
+        write(image)
+
+
+def scene_focus(frames, results, order, rows, fonts, strings, fps, hold=1.25):
+    """第 2 段：六档真实聚焦，另给远壁附近的放大图。"""
+    out = []
+    for i in order:
+        f = frames[i]
+        row = rows[f["frame_id"]]
+        gray = DP.render_gray(f, row["optimal_gain_db"], row["optimal_tgc_levels"])
+        picture = gray_to_image(gray, f["max_depth_mm"])
+        far_wall = row.get("far_wall_mm") or (f["max_depth_mm"] * 0.45)
+        rows_total = gray.shape[0]
+        centre = int(rows_total * far_wall / f["max_depth_mm"])
+        half = max(24, int(rows_total * 6.0 / f["max_depth_mm"]))
+        crop = gray[max(0, centre - half):min(rows_total, centre + half), :]
+        zoom = Image.fromarray(np.clip(crop, 0, 255).astype(np.uint8), mode="L").convert("RGB")
+        zoom = zoom.resize((IMAGE_BOX[0], int(IMAGE_BOX[0] * crop.shape[0] / float(crop.shape[1]) * 0.55)),
+                           Image.LANCZOS)
+        teacher = abs(float(row["optimal_focus_mm"]) - f["focus_mm"]) < 1e-6
+        model = results[i]["frontend"]["focus"]["steps"] == 0
+        for _ in range(int(round(hold * fps))):
+            image, draw = canvas(fonts, strings, strings["scene2"], strings["note_render"])
+            accent = ORANGE if teacher else (BLUE if model else None)
+            paste_panel(image, draw, fonts, picture, 48, 104, strings["focus_label"] % f["focus_mm"], accent)
+            paste_panel(image, draw, fonts, zoom, 48 + IMAGE_BOX[0] + 48, 104, strings["zoom"])
+            right = 48 + 2 * (IMAGE_BOX[0] + 48)
+            y = 104
+            if teacher:
+                draw.text((right, y), strings["pick_teacher"], font=fonts["body"], fill=ORANGE)
+                y += 34
+            if model:
+                draw.text((right, y), strings["pick_model"], font=fonts["body"], fill=BLUE)
+                y += 34
+            draw.text((right, 300), strings["focus_label"] % f["focus_mm"], font=fonts["body"], fill=INK)
+            y2 = 340
+            for other in order:
+                value = frames[other]["focus_mm"]
+                here = abs(value - f["focus_mm"]) < 1e-6
+                draw.text((right + (6 if here else 0), y2), "%g mm" % value, font=fonts["data_small"],
+                          fill=INK if here else (96, 96, 90))
+                if here:
+                    draw.rectangle([right - 6, y2 + 2, right - 3, y2 + 16], fill=BLUE)
+                y2 += 24
+            out.append(image)
+    return out
+
+
+def scene_subjects(stories, fonts, strings, fps, per=1.9):
+    """第 3 段：换人再看，每位走一遍闭环（起点 -> 建议）。"""
+    out = []
+    for story in stories:
+        frame = story["frames"][story["anchor"]]
+        row = story["row"]
+        slope = K.TGC_DB_PER_LEVEL[int(frame["mode"])]
+        optimal_gain = float(row["optimal_gain_db"])
+        optimal_levels = np.asarray(row["optimal_tgc_levels"], float)
+        first, last = story["steps"][0], story["steps"][-1]
+        frames_count = int(round(per * fps))
+        for k in range(frames_count):
+            t = min(1.0, k / float(max(1, frames_count - int(0.5 * fps))))
+            smooth = t * t * (3 - 2 * t)
+            gain_db = interpolate(first["gain_db"], last["gain_db"], smooth)
+            tgc = np.round(interpolate(np.asarray(first["tgc_levels"], float),
+                                       np.asarray(last["tgc_levels"], float), smooth))
+            image, draw = canvas(fonts, strings, strings["scene3"] % len(stories), strings["note_render"])
+            live = gray_to_image(DP.render_gray(frame, gain_db, tgc), frame["max_depth_mm"])
+            teacher = gray_to_image(DP.render_gray(frame, optimal_gain, optimal_levels), frame["max_depth_mm"])
+            paste_panel(image, draw, fonts, live, 48, 104, strings["live"], BLUE)
+            paste_panel(image, draw, fonts, teacher, 48 + IMAGE_BOX[0] + 48, 104, strings["teacher"])
+            right = 48 + 2 * (IMAGE_BOX[0] + 48)
+            draw.text((right, 104), strings["subject"] % story["family"].rsplit("/", 1)[0][:13],
+                      font=fonts["body"], fill=INK)
+            draw_readout(draw, fonts, strings, right, 160,
+                         int(round(frame["gain_level"] + (gain_db - frame["gain_db"])
+                                   / K.GAIN_DB_PER_LEVEL[int(frame["mode"])])),
+                         optimal_gain - gain_db,
+                         float(np.abs(optimal_levels - tgc).mean() * slope))
+            draw.text((right, 340), strings["from_to"] % (story["start_gain"], story["final_gain"]),
+                      font=fonts["small"], fill=INK_DIM)
+            out.append(image)
+    return out
+
+
+def scene_numbers(net, base, fonts, strings, fps, hold=4.0):
+    """第 4 段：数字卡。"""
+    pairs = [(strings["row_tgc"], net.get("tgc_mae_db"), base.get("tgc_mae_db"), "%.2f dB", "lower"),
+             (strings["row_gain"], net.get("gain_mae_db"), base.get("gain_mae_db"), "%.2f dB", "lower"),
+             (strings["row_focus"], net.get("focus_top1"), base.get("focus_top1"), "%.3f", "higher")]
+    image, draw = canvas(fonts, strings, strings["scene4"], strings["closing"])
+    draw.text((64, 112), strings["net"], font=fonts["small"], fill=BLUE)
+    draw.text((64 + 180, 112), strings["base"], font=fonts["small"], fill=INK_DIM)
+    y = 160
+    for name, a, b, unit, direction in pairs:
+        if a is None or b is None:
+            continue
+        draw.text((64, y), name, font=fonts["body"], fill=INK)
+        draw.text((64, y + 28), strings[direction], font=fonts["small"], fill=(110, 110, 104))
+        draw.text((64 + 180, y - 6), unit % a, font=fonts["big"], fill=BLUE)
+        draw.text((64 + 420, y + 4), unit % b, font=fonts["data"], fill=INK_DIM)
+        high = max(a, b) * 1.25
+        for j, (value, colour) in enumerate(((a, BLUE), (b, (92, 92, 86)))):
+            w = (WIDTH - 700) * value / high
+            draw.rectangle([640, y + 2 + j * 20, 640 + max(3, w), y + 16 + j * 20], fill=colour)
+        y += 140
+    return [image] * int(round(hold * fps))
+
+
+def scene_title(fonts, strings, fps, hold=2.4):
+    image = Image.new("RGB", (WIDTH, HEIGHT), BG)
+    draw = ImageDraw.Draw(image)
+    draw.text((64, 280), strings["title"], font=fonts["h1"], fill=INK)
+    draw.text((64, 346), strings["subtitle"], font=fonts["body"], fill=INK_DIM)
+    draw.line([64, 262, 300, 262], fill=BLUE, width=3)
+    return [image] * int(round(hold * fps))
+
+
+# ---------------------------------------------------------------------------------------
+#   写文件
+
+def write_video(frames_dir, count, out_path, fps, emit):
+    """优先 ffmpeg 的 libx264（到处都能放），没有就退回 OpenCV 的 mp4v。"""
+    pattern = os.path.join(frames_dir, "%06d.png")
+    ffmpeg = shutil.which("ffmpeg")
+    if ffmpeg:
+        command = [ffmpeg, "-y", "-loglevel", "error", "-framerate", str(fps), "-i", pattern,
+                   "-c:v", "libx264", "-pix_fmt", "yuv420p", "-crf", "20", "-movflags", "+faststart",
+                   out_path]
+        result = subprocess.run(command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+        if result.returncode == 0:
+            emit("  encoder    ffmpeg libx264")
+            return True
+        emit("  ffmpeg failed: %s" % result.stdout.decode("utf-8", "replace").strip()[:200])
+    import cv2
+
+    first = cv2.imread(pattern % 0)
+    writer = cv2.VideoWriter(out_path, cv2.VideoWriter_fourcc(*"mp4v"), fps,
+                             (first.shape[1], first.shape[0]))
+    for i in range(count):
+        writer.write(cv2.imread(pattern % i))
+    writer.release()
+    emit("  encoder    OpenCV mp4v (ffmpeg not available; H.264 is more portable)")
+    return True
+
+
+def main(argv=None):
+    args = parse_args(argv)
+    started = time.time()
+    lines = []
+
+    def emit(text=""):
+        lines.append(text)
+
+    strings = TEXT[args.language]
+    fonts = load_fonts(args.language)
+    quiet = lambda text="": None
+
+    import tools_track_console_loop as TR
+    rows = TR.teacher_rows(args.labels)
+    by_family = {}
+    for row in rows.values():
+        by_family.setdefault(row.get("family_id"), []).append(row)
+    candidates = []
+    for name, group in sorted(by_family.items()):
+        if not name or any(r.get("split") != "test" for r in group):
+            continue
+        if len(set(r["focus_mm"] for r in group if r.get("focus_determined"))) >= 5:
+            candidates.append((name, len(group)))
+
+    emit("=========== demo video ===========")
+    emit("  language   %s, %d fps, %dx%d" % (args.language, args.fps, WIDTH, HEIGHT))
+    model, payload, front_payload, model_text = SG.load_model(args)
+    trained = SG.trained_axes(payload)
+    emit("  model      %s" % model_text)
+
+    stories = []
+    for name, _ in candidates[:max(args.candidates, args.subjects + 1)]:
+        group = [r for r in by_family.get(name, []) if r.get("focus_determined")]
+        try:
+            story = DP.scene_story(name, group, model, payload, trained, args, quiet, with_images=False)
+        except Exception as error:
+            emit("    scene %s skipped (%s)" % (name, error))
+            continue
+        if story:
+            stories.append(story)
+    if not stories:
+        raise SystemExit("no test-set scene could be prepared")
+    starts = sorted(s["start_gain"] for s in stories)
+    median_start = starts[len(starts) // 2]
+    main_story = (next(s for s in stories if s["family"] == args.family) if args.family
+                  else min(stories, key=lambda s: abs(s["start_gain"] - median_start)))
+    emit("  scene      %s (start %.2f dB, median of %d candidates %.2f dB)"
+         % (main_story["family"], main_story["start_gain"], len(stories), median_start))
+
+    # 第 1、2 段要图像，重跑一次拿到完整的 steps
+    group = [r for r in by_family.get(main_story["family"], []) if r.get("focus_determined")]
+    main_story = DP.scene_story(main_story["family"], group, model, payload, trained, args, quiet,
+                               with_images=False)
+    frame = main_story["frames"][main_story["anchor"]]
+    emit("  anchor     %s, loop %d step(s), gain %.2f -> %.2f dB, TGC %.2f -> %.2f dB"
+         % (frame["frame_id"], len(main_story["steps"]) - 1, main_story["start_gain"],
+            main_story["final_gain"], main_story["start_tgc"], main_story["final_tgc"]))
+
+    others = [s for s in stories if s["family"] != main_story["family"]]
+    others = sorted(others, key=lambda s: s["family"])[:args.subjects]
+    emit("  part 3     %d further subjects" % len(others))
+
+    single = DP.read_metrics(args.single_step_json)
+    net = single.get("network_recorded_start", {})
+    base = single.get("settings_lookup_baseline", {})
+
+    temp = tempfile.mkdtemp(prefix="demo_video_")
+    count = [0]
+
+    def write(image):
+        image.save(os.path.join(temp, "%06d.png" % count[0]))
+        count[0] += 1
+
+    try:
+        for image in scene_title(fonts, strings, args.fps):
+            write(image)
+        scene_backend(frame, main_story["row"], main_story["steps"], fonts, strings, args.fps, write)
+        for image in scene_focus(main_story["frames"], main_story["results"], main_story["order"],
+                                 main_story["rows"], fonts, strings, args.fps):
+            write(image)
+        if others:
+            for image in scene_subjects(others, fonts, strings, args.fps):
+                write(image)
+        for image in scene_numbers(net, base, fonts, strings, args.fps):
+            write(image)
+        emit("  frames     %d (%.1f s)" % (count[0], count[0] / float(args.fps)))
+        directory = os.path.dirname(os.path.abspath(args.out))
+        if directory and not os.path.isdir(directory):
+            os.makedirs(directory)
+        write_video(temp, count[0], args.out, args.fps, emit)
+        emit("  wrote %s (%.1f MB)" % (args.out, os.path.getsize(args.out) / 1e6))
+        if args.gif:
+            step = max(1, args.fps // 10)
+            pictures = [Image.open(os.path.join(temp, "%06d.png" % i)).convert("P", palette=Image.ADAPTIVE,
+                                                                               colors=128)
+                        for i in range(0, count[0], step)]
+            pictures[0].save(args.gif, save_all=True, append_images=pictures[1:],
+                             duration=int(1000 * step / float(args.fps)), loop=0, optimize=True)
+            emit("  wrote %s (%.1f MB)" % (args.gif, os.path.getsize(args.gif) / 1e6))
+    finally:
+        shutil.rmtree(temp, ignore_errors=True)
+    emit("  done in %.0f s" % (time.time() - started))
+
+    text = "\n".join(lines)
+    io.open(REPORT_PATH, "w", encoding="utf-8").write(text + "\n")
+    print(text)
+    return args.out
+
+
+if __name__ == "__main__":
+    main()
