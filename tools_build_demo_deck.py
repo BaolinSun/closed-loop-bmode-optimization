@@ -33,7 +33,7 @@ import time
 
 from pptx import Presentation
 from pptx.dml.color import RGBColor
-from pptx.enum.shapes import MSO_SHAPE
+from pptx.enum.shapes import MSO_CONNECTOR, MSO_SHAPE
 from pptx.enum.text import PP_ALIGN, MSO_ANCHOR
 from pptx.oxml.ns import qn
 from pptx.util import Emu, Inches, Pt
@@ -46,6 +46,7 @@ CJK = u"微软雅黑"
 LATIN = "Calibri"
 
 BG = RGBColor(0x12, 0x12, 0x11)
+STAGE = RGBColor(0x16, 0x16, 0x15)
 PANEL = RGBColor(0x1A, 0x1A, 0x19)
 LINE = RGBColor(0x33, 0x33, 0x31)
 INK = RGBColor(0xF0, 0xEF, 0xEC)
@@ -210,6 +211,69 @@ def arrow(slide, x, y, w=0.34, h=0.2, colour=MUTED):
     return shape
 
 
+def tint(colour, t):
+    """颜色往背景色方向淡化：t=1 为原色，t=0 为背景色。"""
+    return RGBColor(*[int(round(BG[i] + (colour[i] - BG[i]) * t)) for i in range(3)])
+
+
+def stack(slide, x, y, w, h, colour, offset=0.055):
+    """特征图：先画一层暗的作背影，再画亮的在前，看上去是一叠。"""
+    back = slide.shapes.add_shape(MSO_SHAPE.ROUNDED_RECTANGLE, Inches(x + offset),
+                                  Inches(y - offset), Inches(w), Inches(h))
+    front = slide.shapes.add_shape(MSO_SHAPE.ROUNDED_RECTANGLE, Inches(x), Inches(y),
+                                   Inches(w), Inches(h))
+    for shape, fill in ((back, tint(colour, 0.35)), (front, colour)):
+        shape.adjustments[0] = 0.16
+        shape.fill.solid()
+        shape.fill.fore_color.rgb = fill
+        shape.line.fill.background()
+        shape.shadow.inherit = False
+        shape.text_frame.text = ""
+    return front
+
+
+def cell(slide, x, y, w, h, colour, radius=0.22):
+    shape = slide.shapes.add_shape(MSO_SHAPE.ROUNDED_RECTANGLE, Inches(x), Inches(y),
+                                   Inches(w), Inches(h))
+    shape.adjustments[0] = radius
+    shape.fill.solid()
+    shape.fill.fore_color.rgb = colour
+    shape.line.fill.background()
+    shape.shadow.inherit = False
+    shape.text_frame.text = ""
+    return shape
+
+
+def hairline(slide, x1, y1, x2, y2, colour, width=0.75):
+    shape = slide.shapes.add_connector(MSO_CONNECTOR.STRAIGHT, Inches(x1), Inches(y1),
+                                       Inches(x2), Inches(y2))
+    shape.line.color.rgb = colour
+    shape.line.width = Pt(width)
+    shape.shadow.inherit = False
+    return shape
+
+
+def badge(slide, x, y, text, colour, d=0.26):
+    shape = slide.shapes.add_shape(MSO_SHAPE.OVAL, Inches(x), Inches(y), Inches(d), Inches(d))
+    shape.fill.solid()
+    shape.fill.fore_color.rgb = colour
+    shape.line.fill.background()
+    shape.shadow.inherit = False
+    frame = shape.text_frame
+    frame.margin_left = frame.margin_right = frame.margin_top = frame.margin_bottom = 0
+    frame.vertical_anchor = MSO_ANCHOR.MIDDLE
+    frame.paragraphs[0].alignment = PP_ALIGN.CENTER
+    run = frame.paragraphs[0].add_run()
+    run.text = text
+    set_font(run, 11, BG, True)
+    return shape
+
+
+def tag(slide, x, y, w, text, size=9.5, colour=MUTED, latin="Consolas"):
+    write(text_box(slide, x, y, w, 0.24, PP_ALIGN.CENTER), [(text, size, colour, False)],
+          space_after=0, latin=latin)
+
+
 def figure(slide, path, x, y, w):
     picture = slide.shapes.add_picture(path, Inches(x), Inches(y), width=Inches(w))
     return picture
@@ -293,6 +357,101 @@ def brief_cover(deck, numbers):
     write(text_box(slide, MARGIN, 6.45, 12.1, 0.5),
           [(u"数据：17545 帧 / 189 位受试者 / 9 个采集日；按受试者划分训练 132 位、验证 28 位、"
             u"留出测试 29 位", 13, MUTED, False)], space_after=0)
+
+
+def brief_architecture(deck):
+    slide = add_slide(deck)
+    title(slide, u"网络架构：双分支编码、参数调制与深度方向自注意力", u"方法")
+
+    top, bottom = 1.56, 6.24
+    bands = [(u"输入", 0.62, 2.02), (u"编码", 2.94, 3.30),
+             (u"深度序列自注意力", 6.54, 2.62), (u"主干与输出头", 9.46, 3.25)]
+    for i, (name, x, w) in enumerate(bands):
+        panel(slide, x, top, w, bottom - top, STAGE, LINE)
+        badge(slide, x + 0.14, 1.70, u"①②③④"[i], BLUE if i < 3 else GREEN)
+        write(text_box(slide, x + 0.46, 1.72, w - 0.56, 0.26), [(name, 12.5, INK, True)],
+              space_after=0)
+    for x in (2.68, 6.28, 9.20):
+        arrow(slide, x, 3.80, 0.24, 0.2, tint(MUTED, 0.8))
+
+    # ① 输入
+    block(slide, 0.74, 2.10, 1.78, 1.30, u"图像", [u"3 × 512 × 128", u"渲染灰阶", u"绝对 dB 图",
+                                                   u"物理深度"], BLUE, 12.5, 10.5)
+    block(slide, 0.74, 3.54, 1.78, 1.02, u"深度剖面", [u"5 × 512", u"逐行亮度统计"], BLUE, 12.5, 10.5)
+    block(slide, 0.74, 4.70, 1.78, 1.30, u"标量", [u"17 维", u"当前六参数", u"参考电平、噪声底",
+                                                   u"成像模式"], ORANGE, 12.5, 10.5)
+
+    # ② 编码：图像四级、剖面两级，宽度不变、高度随分辨率收缩
+    write(text_box(slide, 3.06, 2.06, 3.06, 0.26), [(u"二维残差编码器", 11.5, INK, True)],
+          space_after=0)
+    centre, bw, gap = 2.84, 0.56, 0.19
+    x0 = 3.06 + (3.06 - (4 * bw + 3 * gap)) / 2.0
+    for i, (h, channels, size) in enumerate([(0.92, "32", u"128×128"), (0.74, "64", u"64×64"),
+                                             (0.60, "128", u"64×32"), (0.46, "256", u"32×16")]):
+        x = x0 + i * (bw + gap)
+        stack(slide, x, centre - h / 2.0, bw, h, tint(BLUE, 0.34 + 0.21 * i))
+        tag(slide, x - 0.06, 3.32, bw + 0.12, channels)
+        tag(slide, x - 0.10, 3.52, bw + 0.20, size, 8.5, tint(MUTED, 0.85), LATIN)
+
+    write(text_box(slide, 3.06, 3.82, 3.06, 0.26), [(u"一维残差编码器", 11.5, INK, True)],
+          space_after=0)
+    centre1 = 4.40
+    x1 = 3.06 + (3.06 - (3 * bw + 2 * gap)) / 2.0
+    for i, (h, channels, size) in enumerate([(0.56, "64", "128"), (0.44, "64", "64"),
+                                             (0.34, "128", "32")]):
+        x = x1 + i * (bw + gap)
+        stack(slide, x, centre1 - h / 2.0, bw, h, tint(GREEN, 0.34 + 0.26 * i))
+        tag(slide, x - 0.06, 4.70, bw + 0.12, channels)
+        tag(slide, x - 0.10, 4.89, bw + 0.20, size, 8.5, tint(MUTED, 0.85), LATIN)
+
+    tag(slide, 3.06, 5.12, 3.06, u"图像横向取均值后与剖面特征拼接：32 × 384", 10, MUTED, LATIN)
+    for x in (3.30, 5.68):
+        shape = slide.shapes.add_shape(MSO_SHAPE.UP_ARROW, Inches(x), Inches(5.34),
+                                       Inches(0.22), Inches(0.24))
+        shape.fill.solid()
+        shape.fill.fore_color.rgb = tint(ORANGE, 0.9)
+        shape.line.fill.background()
+        shape.shadow.inherit = False
+        shape.text_frame.text = ""
+    block(slide, 3.06, 5.58, 3.06, 0.64, u"参数编码与 FiLM 调制",
+          [u"17 → 256，逐级给出 γ 与 β"], ORANGE, 12, 10.5)
+
+    # ③ 自注意力：左右两列标记 + 中间的连线
+    tag(slide, 6.54, 2.12, 1.00, u"输入标记", 10, MUTED, LATIN)
+    tag(slide, 8.18, 2.12, 1.00, u"交互之后", 10, MUTED, LATIN)
+    xl, xr, cw, ch, cg, y0 = 6.78, 8.42, 0.52, 0.32, 0.05, 2.44
+    rows = 9
+    left, right = [], []
+    for i in range(rows):
+        y = y0 + i * (ch + cg)
+        colour = ORANGE if i == 0 else tint(BLUE, 0.42 + 0.06 * i)
+        cell(slide, xl, y, cw, ch, tint(colour, 0.85))
+        cell(slide, xr, y, cw, ch, colour)
+        left.append(y + ch / 2.0)
+        right.append(y + ch / 2.0)
+    for i in range(rows):
+        for j in set([0, max(0, i - 1), i, min(rows - 1, i + 1)]):
+            colour = tint(ORANGE, 0.42) if j == 0 else tint(BLUE, 0.32)
+            hairline(slide, xl + cw, left[j], xr, right[i], colour, 0.75)
+    tag(slide, 6.66, 5.80, 2.38, u"33 个标记 = 1 参数 + 32 深度", 10.5, DIM, LATIN)
+    tag(slide, 6.66, 5.98, 2.38, u"Transformer 2 层 · 8 头 · d = 256", 10, MUTED, LATIN)
+
+    # ④ 主干与输出头
+    block(slide, 9.58, 2.10, 3.01, 0.92, u"共享主干",
+          [u"参数标记 ⊕ 深度均值（512 维）", u"两层全连接 + GELU → h ∈ R²⁵⁶"], BLUE, 12.5, 10.5)
+    heads = [(3.14, 0.78, u"增益", [u"最优值回归 + 调节方向"]),
+             (4.02, 0.92, u"时间增益补偿", [u"8 段逐段回归，每段读取", u"对应深度的标记与当前档位"]),
+             (5.04, 0.78, u"发射聚焦", [u"档位分类，可选集合掩码"])]
+    for y, h, head, lines in heads:
+        block(slide, 9.58, y, 3.01, h, head, lines, GREEN, 12.5, 10.5)
+    write(text_box(slide, 9.58, 5.92, 3.01, 0.26),
+          [(u"显示深度、发射频率、动态范围：本阶段未训练", 10, MUTED, False)], space_after=0)
+
+    panel(slide, MARGIN, 6.40, 12.09, 0.80)
+    write(text_box(slide, MARGIN + 0.3, 6.58, 11.5, 0.5),
+          [(u"合计 4.96 M 参数，输入为单帧、不依赖时序。增益与时间增益补偿的输出头给出的是最优值而非"
+            u"修正量：修正量 = 最优值 − 当前值，在网络外做减法，因此同一帧在任意当前设置下的预测自洽。",
+            12.5, DIM, False)], space_after=0, line_spacing=1.3)
 
 
 def brief_video(deck, video, poster):
@@ -687,6 +846,7 @@ def main(argv=None):
     if args.pages == "brief":
         brief_cover(deck, numbers)
         brief_method(deck)
+        brief_architecture(deck)
         brief_video(deck, args.video, poster)
         brief_results(deck, numbers, bias, args.figures)
         brief_conclusion(deck)
