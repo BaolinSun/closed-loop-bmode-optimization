@@ -11,7 +11,8 @@
      前端标签平滑、前后端分开的检查点与组合模型、metrics.csv 保留全部验证指标。
   6. fieldii_v2 日志分析后的改动：近最优帧指标与期望档决策、闭环的滞回与打转冻结、逐步路径记录。
   7. 实机微调：按探头摆放分组（_GEN/_THI 目录合并）、缓存覆盖标签行的参考与底噪、标量按数据标准化、
-     预训练权重部分装入（档位不同的输出层重新初始化、新域标准化保留）、冻结范围、结构跟随预训练。
+     预训练权重部分装入（档位不同的输出层重新初始化、新域标准化保留）、冻结范围、结构跟随预训练；
+     实机数据默认跑只动后端的闭环，--closed-loop grid 则说明自己为什么跑不了。
   8. 增益正反馈的防护：levels 标量刻度、预测最优不随起点变的不变性损失、正反馈斜率指标、
      闭环单步与累计限幅、运行目录防覆盖。
   9. 标签自带 train / val / test 划分时的分折；--fold none 不含测试集。
@@ -853,8 +854,15 @@ def check_finetune(fieldii_rows, console_path, skip_scripts):
                      "--device", "cpu", "--redraw-seeds", "1"])
             report_path = [f for f in os.listdir(fold_dir) if f.startswith("evaluation_report_combined")]
             text = io.open(os.path.join(fold_dir, report_path[0]), encoding="utf-8").read() if report_path else ""
-            check("evaluation on console data runs and skips the closed loop",
-                  "closed loop skipped" in text and "settings " in text, str(report_path))
+            check("evaluation on console data runs the back-end-only loop by default",
+                  "back end only, front end pinned" in text and "settings " in text
+                  and "frontend_moves_hist            {0:" in text, str(report_path))
+            TE.main(["--run", os.path.join(runs, "ft"), "--cache", cache_dir, "--labels", console_path,
+                     "--device", "cpu", "--redraw-seeds", "0", "--closed-loop", "grid"])
+            grid_text = io.open(os.path.join(fold_dir, "evaluation_report_combined_m000_rev_frz_c80-255.txt"),
+                                encoding="utf-8").read()
+            check("--closed-loop grid on console data says why it cannot run",
+                  "closed loop skipped" in grid_text and "needs a full depth x frequency x focus grid" in grid_text)
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
     emit("")

@@ -13,6 +13,16 @@
 闭环默认是 argmax + 打转后冻结前端，轨迹记录含逐步路径；滞回默认关闭（--frontend-margin 0），
 fieldii_v3 的四组对照显示它与冻结相比贡献为零。--no-freeze-on-revisit 是 fieldii_v2 的行为。
 
+    --closed-loop 的四种取值
+
+    auto     默认。Field II 跑完整闭环；实机与人体数据跑 backend（见下）。
+    grid     完整闭环：前端改档要跳到该设置真实采到的那一帧，需要每个场景有完整的
+             深度 x 频率 x 聚焦 网格——只有 Field II 有。
+    backend  只跑后端那一半：前端按住不动，增益与 TGC 反复「建议 -> 执行 -> 重新观测」直到停下。
+             增益与 TGC 不改变 BC0、只改变渲染，所以这一圈在已有的帧上就能精确走完，不需要
+             新采集；实机与人体数据因此也能回答「闭环停不停得下来、停在哪」。
+    off      不跑（旧的 --no-closed-loop）。
+
 写出 <折目录>/evaluation_report_<选择>_<设置>.txt、evaluation_<选择>_<设置>.json、
 closed_loop_trajectories_<选择>_<设置>.jsonl，--run 时另写 runs/<name>/evaluation_summary_<选择>_<设置>.txt。
 <设置> 默认编码闭环参数（如 m010_rev_frz = 余量 0.10、只拦回头、打转冻结），所以不同设置的对照
@@ -68,7 +78,10 @@ def parse_args(argv=None):
     p.add_argument("--margin-mode", choices=MARGIN_MODES, default="revisit",
                    help="only meaningful with --frontend-margin > 0: revisit = hold only when the loop is about to "
                         "return to a setting it has already visited; always = every front-end change (fieldii_v3)")
-    p.add_argument("--no-closed-loop", action="store_true")
+    p.add_argument("--closed-loop", choices=("auto", "grid", "backend", "off"), default="auto",
+                   help="auto = grid for Field II and backend for console/in-vivo data; backend pins the front "
+                        "end and loops only gain/TGC, which needs no new captures; off skips it")
+    p.add_argument("--no-closed-loop", action="store_true", help="deprecated alias for --closed-loop off")
     p.add_argument("--max-gain-step-clicks", type=int, default=80,
                    help="closed loop: largest gain correction per step, in console clicks (0 = no limit)")
     p.add_argument("--max-gain-total-clicks", type=int, default=255,
@@ -92,6 +105,14 @@ class Report(object):
             handle.write("\n".join(self.lines) + "\n")
 
 
+def loop_mode(args, source):
+    """这次评估实际跑哪种闭环。"""
+    mode = "off" if args.no_closed_loop else args.closed_loop
+    if mode == "auto":
+        mode = "backend" if source == "console" else "grid"
+    return mode
+
+
 def output_tag(args):
     """输出文件名的后缀：默认编码闭环设置。
 
@@ -100,10 +121,13 @@ def output_tag(args):
     """
     if args.tag:
         return args.tag
+    mode = "off" if args.no_closed_loop else args.closed_loop
     if args.groups != "val":
-        return "%s_%s" % (args.groups, "noloop" if args.no_closed_loop else "loop")
-    if args.no_closed_loop:
+        return "%s_%s" % (args.groups, {"off": "noloop", "backend": "bloop"}.get(mode, "loop"))
+    if mode == "off":
         return "noloop"
+    if mode == "backend":
+        return "bloop"
     parts = ["m%03d" % int(round(args.frontend_margin * 100)),
              {"revisit": "rev", "always": "alw"}[args.margin_mode],
              "nofrz" if args.no_freeze_on_revisit else "frz",
@@ -228,19 +252,33 @@ def evaluate_checkpoint(path, args, data_cache, frontend_path=None, label=None):
     report("")
 
     trajectories = []
-    if not args.no_closed_loop and data.source == "console":
-        report("----- closed loop skipped: console data has no full depth x frequency x focus grid per scene -----")
+    mode = loop_mode(args, data.source)
+    if mode == "off":
+        pass
+    elif mode == "grid" and data.source == "console":
+        report("----- closed loop skipped: --closed-loop grid needs a full depth x frequency x focus grid per "
+               "scene, which console data does not have. Use --closed-loop backend -----")
         report("")
-    elif not args.no_closed_loop:
-        report("----- closed loop (max %d steps, stop deadband %.2f gain levels, hysteresis %.2f on %s, "
+    else:
+        # backend：余量给到 1.0 并且每次换档都要余量，前端就永远不动（概率差不可能达到 1.0）
+        pinned = mode == "backend"
+        margin = 1.0 if pinned else args.frontend_margin
+        margin_mode = "always" if pinned else args.margin_mode
+        report("----- closed loop, %s (max %d steps, stop deadband %.2f gain levels, hysteresis %.2f on %s, "
                "freeze on revisit %s, %s decision) -----"
-               % (args.max_steps, args.stop_deadband_levels, args.frontend_margin, args.margin_mode,
+               % ("back end only, front end pinned" if pinned else "full grid",
+                  args.max_steps, args.stop_deadband_levels, margin, margin_mode,
                   not args.no_freeze_on_revisit, args.decision))
+        if pinned:
+            report("  the gain and the TGC do not change the BC0, only the render, so this loop is exact on the "
+                   "frames at hand; the front-end half still needs the machine")
+            report("  final_<axis>_correct below is the STARTING front-end setting (it was never changed), "
+                   "not a result of the loop")
         summary, trajectories = run_closed_loop(model, data, builder, eval_idx, max_steps=args.max_steps,
                                                 amp=amp, stop_deadband_levels=args.stop_deadband_levels,
-                                                frontend_margin=args.frontend_margin,
+                                                frontend_margin=margin,
                                                 freeze_on_revisit=not args.no_freeze_on_revisit,
-                                                decision=args.decision, margin_mode=args.margin_mode,
+                                                decision=args.decision, margin_mode=margin_mode,
                                                 max_gain_step_clicks=args.max_gain_step_clicks,
                                                 max_gain_total_clicks=args.max_gain_total_clicks)
         results["closed_loop"] = summary
@@ -290,8 +328,8 @@ def main(argv=None):
                       if isinstance(r[section].get(key), float) and np.isfinite(r[section][key])]
             if values:
                 report("    %-34s %.4f +- %.4f" % (key, np.mean(values), np.std(values)))
-    # 实机数据没有闭环（每个场景没有完整的设置网格），各折结果里就没有 closed_loop
-    if not args.no_closed_loop and all("closed_loop" in r for r in all_results):
+    # 没跑闭环（--closed-loop off，或 grid 碰上实机数据）的折里就没有 closed_loop
+    if all("closed_loop" in r for r in all_results):
         report("  closed_loop")
         keys = [k for k, v in all_results[0]["closed_loop"].items() if isinstance(v, float)]
         for key in keys:
