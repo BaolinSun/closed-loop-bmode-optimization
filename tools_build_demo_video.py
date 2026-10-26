@@ -67,11 +67,14 @@ TEXT = {
         "gain": "增益档位",
         "off": "与最优解偏差",
         "tgc": "时间增益补偿曲线（dB）",
+        "profile": "逐行亮度剖面（灰阶中位数）",
+        "profile_axis": "深度（mm）",
         "tgc_now": "当前",
         "tgc_teacher": "最优解",
         "step": "第 %d 次迭代",
         "start": "初始状态：主机采集设置，时间增益补偿各段均为 127",
         "moving": "执行模型输出：增益 %+d 档，时间增益补偿曲线更新",
+        "moving_tgc": "执行模型输出：增益保持，时间增益补偿曲线更新",
         "stopped": "停止判据满足，迭代终止",
         "scene2": "二、发射聚焦：六档实采图像与判据",
         "widths": "侧向散斑宽度（mm）——数值越低分辨率越高",
@@ -86,9 +89,10 @@ TEXT = {
         "zoom": "远壁区域局部放大",
         "pick_teacher": "求解器最优档",
         "pick_model": "模型输出档",
-        "scene3": "三、跨受试者验证：另 %d 位留出测试集受试者",
+        "scene3": "三、跨受试者验证：%d 位留出测试集受试者同屏演示",
         "subject": "受试者 %s",
         "from_to": "增益与最优解偏差 %.2f dB -> %.2f dB",
+        "grid_note": "六位按收敛结果均匀取秩：最好、中间各档与最差各一位，故最差一例一并在列",
         "scene4": "五、留出测试集评估结果（29 位受试者）",
         "net": "本方法",
         "base": "设置查表基线",
@@ -110,11 +114,14 @@ TEXT = {
         "gain": "gain level",
         "off": "deviation from the optimum",
         "tgc": "time-gain compensation curve (dB)",
+        "profile": "depth brightness profile (median grey)",
+        "profile_axis": "depth (mm)",
         "tgc_now": "current",
         "tgc_teacher": "optimum",
         "step": "iteration %d",
         "start": "initial state: console acquisition setting, all TGC bands at 127",
         "moving": "applying the prediction: gain %+d levels, TGC curve updated",
+        "moving_tgc": "applying the prediction: gain unchanged, TGC curve updated",
         "stopped": "stopping criterion met; iteration terminated",
         "scene2": "2. Transmit focus: six acquisitions and the criterion behind the label",
         "widths": "lateral speckle width (mm) - lower means finer resolution",
@@ -130,9 +137,11 @@ TEXT = {
         "zoom": "far-wall region, magnified",
         "pick_teacher": "solver optimum",
         "pick_model": "model prediction",
-        "scene3": "3. Cross-subject validation: %d further held-out test subjects",
+        "scene3": "3. Cross-subject validation: %d held-out test subjects in parallel",
         "subject": "subject %s",
         "from_to": "deviation from the optimum %.2f dB -> %.2f dB",
+        "grid_note": "the six are taken at even ranks of the converged deviation - best, intermediate and "
+                     "worst - so the worst case is deliberately included",
         "scene4": "5. Evaluation on the held-out test set (29 subjects)",
         "net": "proposed method",
         "base": "settings-lookup baseline",
@@ -297,8 +306,7 @@ def draw_series_chart(draw, fonts, x, y, w, h, series, title, axis_label, mark_x
             r = 4 if strong else 2
             draw.ellipse([px(a) - r, py(b) - r, px(a) + r, py(b) + r], fill=colour)
         if strong and label:
-            draw.text((px(pts[-1][0]) - 30, py(pts[-1][1]) - 24), label, font=fonts["data_small"],
-                      fill=colour)
+            draw.text((px(pts[-1][0]) - 34, py(pts[-1][1]) - 26), label, font=fonts["small"], fill=colour)
 
 
 def draw_probability_bars(draw, fonts, x, y, w, h, ladder, probabilities, current, teacher, title):
@@ -360,35 +368,56 @@ def loop_timeline(steps, fps, hold_start=1.6, move=1.2, hold_mid=0.7, hold_end=2
     return out
 
 
+def row_profile(gray, depth_mm, points=56):
+    """逐行灰阶中位数 vs 深度（降采样）。"""
+    median = np.median(np.asarray(gray, float), axis=1)
+    rows = len(median)
+    edges = np.linspace(0, rows, points + 1).round().astype(int)
+    out = []
+    for i in range(points):
+        lo, hi = edges[i], max(edges[i] + 1, edges[i + 1])
+        out.append((float((lo + hi) / 2.0 / rows * depth_mm), float(median[lo:hi].mean())))
+    return out
+
+
 def scene_backend(frame, row, steps, fonts, strings, fps, write):
     """第 1 段：左边动、中间教师最优、右边数字与曲线。"""
     slope = K.TGC_DB_PER_LEVEL[int(frame["mode"])]
     optimal_gain = float(row["optimal_gain_db"])
     optimal_levels = np.asarray(row["optimal_tgc_levels"], float)
-    teacher_picture = gray_to_image(DP.render_gray(frame, optimal_gain, optimal_levels), frame["max_depth_mm"])
+    teacher_gray = DP.render_gray(frame, optimal_gain, optimal_levels)
+    teacher_picture = gray_to_image(teacher_gray, frame["max_depth_mm"], box=(336, 400))
+    teacher_profile = row_profile(teacher_gray, frame["max_depth_mm"])
     for gain_db, tgc_levels, phase, index in loop_timeline(steps, fps):
         image, draw = canvas(fonts, strings, strings["scene1"], strings["note_render"])
-        live = gray_to_image(DP.render_gray(frame, gain_db, tgc_levels), frame["max_depth_mm"])
+        gray = DP.render_gray(frame, gain_db, tgc_levels)
+        live = gray_to_image(gray, frame["max_depth_mm"], box=(336, 400))
         paste_panel(image, draw, fonts, live, 48, 104, strings["live"], BLUE if phase == "move" else None)
-        paste_panel(image, draw, fonts, teacher_picture, 48 + IMAGE_BOX[0] + 48, 104, strings["teacher"])
-        right = 48 + 2 * (IMAGE_BOX[0] + 48)
+        paste_panel(image, draw, fonts, teacher_picture, 48 + 336 + 40, 104, strings["teacher"])
+        right = 48 + 2 * (336 + 40)
         gain_error = optimal_gain - gain_db
         tgc_error = float(np.abs(optimal_levels - np.asarray(tgc_levels, float)).mean() * slope)
         draw_readout(draw, fonts, strings, right, 104, int(round(frame["gain_level"]
                                                                  + (gain_db - frame["gain_db"])
                                                                  / K.GAIN_DB_PER_LEVEL[int(frame["mode"])])),
                      gain_error, tgc_error)
-        draw_tgc_curve(draw, fonts, strings, right, 300, 300, 170, tgc_levels, optimal_levels, slope)
+        draw_tgc_curve(draw, fonts, strings, right, 290, WIDTH - right - 48, 150, tgc_levels,
+                       optimal_levels, slope)
+        draw_series_chart(draw, fonts, right, 486, WIDTH - right - 48, 150,
+                          [(strings["tgc_teacher"], teacher_profile, ORANGE, False),
+                           (strings["tgc_now"], row_profile(gray, frame["max_depth_mm"]), BLUE, True)],
+                          strings["profile"], strings["profile_axis"])
         step = steps[index]
         if index == 0 and phase == "hold":
             note = strings["start"]
         elif step["stopped"]:
             note = strings["stopped"]
         elif phase == "move":
-            note = strings["moving"] % step["suggestion"]["clicks"]
+            note = (strings["moving"] % step["suggestion"]["clicks"] if step["suggestion"]["clicks"]
+                    else strings["moving_tgc"])
         else:
             note = strings["step"] % step["step"]
-        draw_wrapped(draw, fonts["body"], note, right, 496, WIDTH - right - 40, INK)
+        draw_wrapped(draw, fonts["body"], note, 48, 104 + 400 + 36, WIDTH - 96, INK)
         write(image)
 
 
@@ -474,39 +503,52 @@ def scene_focus(frames, results, order, rows, fonts, strings, fps, args, hold=1.
     return out
 
 
-def scene_subjects(stories, fonts, strings, fps, per=1.9):
-    """第 3 段：换人再看，每位走一遍闭环（起点 -> 建议）。"""
+def scene_subjects(stories, fonts, strings, fps, per=5.2):
+    """\u7b2c 3 \u6bb5\uff1a2x3 \u5bab\u683c\uff0c\u516d\u4f4d\u53d7\u8bd5\u8005\u540c\u5c4f\u4ece\u91c7\u96c6\u8bbe\u7f6e\u8d70\u5230\u6a21\u578b\u8f93\u51fa\u3002"""
     out = []
-    for story in stories:
+    columns, rows_count = 3, 2
+    cells = stories[:columns * rows_count]
+    if not cells:
+        return out
+    gap_x, gap_y = 24, 18
+    cell_w = (WIDTH - 96 - (columns - 1) * gap_x) // columns
+    cell_h = (HEIGHT - 52 - 58 - 40 - (rows_count - 1) * gap_y) // rows_count
+    box = (cell_w, cell_h - 46)
+    prepared = []
+    for index, story in enumerate(cells):
         frame = story["frames"][story["anchor"]]
         row = story["row"]
-        slope = K.TGC_DB_PER_LEVEL[int(frame["mode"])]
-        optimal_gain = float(row["optimal_gain_db"])
-        optimal_levels = np.asarray(row["optimal_tgc_levels"], float)
         first, last = story["steps"][0], story["steps"][-1]
-        frames_count = int(round(per * fps))
-        for k in range(frames_count):
-            t = min(1.0, k / float(max(1, frames_count - int(0.5 * fps))))
-            smooth = t * t * (3 - 2 * t)
-            gain_db = interpolate(first["gain_db"], last["gain_db"], smooth)
-            tgc = np.round(interpolate(np.asarray(first["tgc_levels"], float),
-                                       np.asarray(last["tgc_levels"], float), smooth))
-            image, draw = canvas(fonts, strings, strings["scene3"] % len(stories), strings["note_render"])
-            live = gray_to_image(DP.render_gray(frame, gain_db, tgc), frame["max_depth_mm"])
-            teacher = gray_to_image(DP.render_gray(frame, optimal_gain, optimal_levels), frame["max_depth_mm"])
-            paste_panel(image, draw, fonts, live, 48, 104, strings["live"], BLUE)
-            paste_panel(image, draw, fonts, teacher, 48 + IMAGE_BOX[0] + 48, 104, strings["teacher"])
-            right = 48 + 2 * (IMAGE_BOX[0] + 48)
-            draw.text((right, 104), strings["subject"] % story["family"].rsplit("/", 1)[0][:13],
-                      font=fonts["body"], fill=INK)
-            draw_readout(draw, fonts, strings, right, 160,
-                         int(round(frame["gain_level"] + (gain_db - frame["gain_db"])
-                                   / K.GAIN_DB_PER_LEVEL[int(frame["mode"])])),
-                         optimal_gain - gain_db,
-                         float(np.abs(optimal_levels - tgc).mean() * slope))
-            draw.text((right, 340), strings["from_to"] % (story["start_gain"], story["final_gain"]),
+        prepared.append({
+            "frame": frame, "row": row,
+            "gain_a": first["gain_db"], "gain_b": last["gain_db"],
+            "tgc_a": np.asarray(first["tgc_levels"], float), "tgc_b": np.asarray(last["tgc_levels"], float),
+            "optimal_gain": float(row["optimal_gain_db"]),
+            "optimal_levels": np.asarray(row["optimal_tgc_levels"], float),
+            "subject": "S%02d" % (index + 1),
+            "start": story["start_gain"], "final": story["final_gain"]})
+    total = int(round(per * fps))
+    settle = int(0.8 * fps)
+    for k in range(total):
+        t = min(1.0, max(0.0, (k - settle) / float(max(1, total - 2 * settle))))
+        smooth = t * t * (3 - 2 * t)
+        image, draw = canvas(fonts, strings, strings["scene3"] % len(cells), strings["grid_note"])
+        for index, item in enumerate(prepared):
+            cx = 48 + (index % columns) * (cell_w + gap_x)
+            cy = 92 + (index // columns) * (cell_h + gap_y)
+            gain_db = interpolate(item["gain_a"], item["gain_b"], smooth)
+            tgc = np.round(interpolate(item["tgc_a"], item["tgc_b"], smooth))
+            picture = gray_to_image(DP.render_gray(item["frame"], gain_db, tgc),
+                                    item["frame"]["max_depth_mm"], box=box)
+            image.paste(picture, (cx, cy))
+            draw.rectangle([cx - 1, cy - 1, cx + picture.size[0], cy + picture.size[1]],
+                           outline=BLUE if 0.0 < t < 1.0 else (70, 70, 66), width=1)
+            error = item["optimal_gain"] - gain_db
+            colour = GREEN if abs(error) <= 1.0 else (ORANGE if abs(error) <= 3.0 else (210, 90, 70))
+            draw.text((cx, cy + picture.size[1] + 6), strings["subject"] % item["subject"],
                       font=fonts["small"], fill=INK_DIM)
-            out.append(image)
+            draw.text((cx, cy + picture.size[1] + 26), "%+.2f dB" % error, font=fonts["data"], fill=colour)
+        out.append(image)
     return out
 
 
@@ -663,9 +705,24 @@ def main(argv=None):
          % (frame["frame_id"], len(main_story["steps"]) - 1, main_story["start_gain"],
             main_story["final_gain"], main_story["start_tgc"], main_story["final_tgc"]))
 
-    others = [s for s in stories if s["family"] != main_story["family"]]
-    others = sorted(others, key=lambda s: s["family"])[:args.subjects]
-    emit("  part 3     %d further subjects" % len(others))
+    main_subject = main_story["family"].rsplit("/", 1)[0]
+    pool, seen = [], {main_subject}
+    for story in sorted(stories, key=lambda x: x["family"]):
+        subject = story["family"].rsplit("/", 1)[0]
+        if subject in seen:
+            continue
+        seen.add(subject)
+        pool.append(story)
+    # 宫格里的六位按收敛结果均匀取秩（最好、最差与中间各档），而不是取名字靠前的六位——
+    # 任意一段都会偶然落进好的一批或差的一批，均匀取秩才是这批受试者的真实跨度
+    pool.sort(key=lambda x: x["final_gain"])
+    if len(pool) > args.subjects and args.subjects > 1:
+        ranks = [int(round(i * (len(pool) - 1) / float(args.subjects - 1))) for i in range(args.subjects)]
+        others = [pool[r] for r in sorted(set(ranks))]
+    else:
+        others = pool[:args.subjects]
+    emit("  part 3     %d further subjects (one scene each): %s"
+         % (len(others), ", ".join(x["family"] for x in others)))
 
     single = DP.read_metrics(args.single_step_json)
     net = single.get("network_recorded_start", {})
