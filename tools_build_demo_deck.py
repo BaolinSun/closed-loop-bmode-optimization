@@ -33,6 +33,7 @@ import time
 
 from pptx import Presentation
 from pptx.dml.color import RGBColor
+from pptx.enum.shapes import MSO_SHAPE
 from pptx.enum.text import PP_ALIGN, MSO_ANCHOR
 from pptx.oxml.ns import qn
 from pptx.util import Emu, Inches, Pt
@@ -144,8 +145,6 @@ def title(slide, text, eyebrow=None):
 
 
 def panel(slide, x, y, w, h, fill=PANEL, line=LINE):
-    from pptx.enum.shapes import MSO_SHAPE
-
     shape = slide.shapes.add_shape(MSO_SHAPE.ROUNDED_RECTANGLE, Inches(x), Inches(y), Inches(w), Inches(h))
     shape.adjustments[0] = 0.06
     shape.fill.solid()
@@ -179,13 +178,45 @@ def stat_panel(slide, x, y, w, h, value, label, colour=BLUE):
     return shape
 
 
+def block(slide, x, y, w, h, head, lines=(), accent=BLUE, head_size=13, body_size=11.5):
+    """框图里的一个方块：标题一行 + 若干说明行。"""
+    shape = panel(slide, x, y, w, h, PANEL, accent)
+    frame = shape.text_frame
+    frame.margin_left = frame.margin_right = Inches(0.14)
+    frame.margin_top = frame.margin_bottom = Inches(0.10)
+    frame.paragraphs[0].space_after = Pt(3)
+    frame.paragraphs[0].alignment = PP_ALIGN.LEFT
+    run = frame.paragraphs[0].add_run()
+    run.text = head
+    set_font(run, head_size, accent, True)
+    for line in lines:
+        paragraph = frame.add_paragraph()
+        paragraph.alignment = PP_ALIGN.LEFT
+        paragraph.line_spacing = 1.25
+        paragraph.space_after = Pt(1)
+        run = paragraph.add_run()
+        run.text = line
+        set_font(run, body_size, DIM)
+    return shape
+
+
+def arrow(slide, x, y, w=0.34, h=0.2, colour=MUTED):
+    shape = slide.shapes.add_shape(MSO_SHAPE.RIGHT_ARROW, Inches(x), Inches(y), Inches(w), Inches(h))
+    shape.fill.solid()
+    shape.fill.fore_color.rgb = colour
+    shape.line.fill.background()
+    shape.shadow.inherit = False
+    shape.text_frame.text = ""
+    return shape
+
+
 def figure(slide, path, x, y, w):
     picture = slide.shapes.add_picture(path, Inches(x), Inches(y), width=Inches(w))
     return picture
 
 
-def caption(slide, text, x, y, w):
-    write(text_box(slide, x, y, w, 0.5), [(text, 11, MUTED, False)], space_after=0, line_spacing=1.25)
+def caption(slide, text, x, y, w, h=0.5):
+    write(text_box(slide, x, y, w, h), [(text, 11, MUTED, False)], space_after=0, line_spacing=1.25)
 
 
 AUTOPLAY_TIMING = (
@@ -269,13 +300,59 @@ def brief_video(deck, video, poster):
     write(text_box(slide, MARGIN, 0.42, 11.0, 0.3), [(u"演示", 12, MUTED, False)], space_after=0)
     write(text_box(slide, MARGIN, 0.72, 12.1, 0.6), [(u"一帧图像上的六参数闭环优化", 26, INK, True)],
           space_after=0)
-    width = 10.2
+    width = 9.9
     height = width * 720.0 / 1280.0
     x = (WIDE - width) / 2.0
-    slide.shapes.add_movie(video, Inches(x), Inches(1.4), Inches(width), Inches(height),
+    slide.shapes.add_movie(video, Inches(x), Inches(1.36), Inches(width), Inches(height),
                            poster_frame_image=poster, mime_type="video/mp4")
     caption(slide, u"30 秒，五段：后端闭环迭代、发射聚焦判据、六位受试者同屏验证、误差分布形态、"
-                   u"留出测试集结果；各帧均由同一组原始回波数据精确重建", x, 1.4 + height + 0.16, width)
+                   u"留出测试集结果；各帧均由同一组原始回波数据精确重建", x, 1.36 + height + 0.1, width, 0.34)
+
+
+def brief_method(deck):
+    slide = add_slide(deck)
+    title(slide, u"方法：网络结构与闭环协议", u"方法")
+
+    y, h, w = 1.78, 1.92, 2.69
+    step = w + 0.44
+    block(slide, MARGIN, y, w, h, u"输入",
+          [u"渲染灰阶、绝对 dB 图、", u"物理深度（3 × 512 × 128）",
+           u"逐行深度剖面（5 × 512）", u"当前六参数等 17 个标量"], BLUE)
+    arrow(slide, MARGIN + w + 0.05, y + h / 2 - 0.1)
+    block(slide, MARGIN + step, y, w, h, u"编码",
+          [u"二维残差编码器（图像）", u"一维残差编码器（剖面）",
+           u"参数嵌入经 FiLM 逐级调制特征"], BLUE)
+    arrow(slide, MARGIN + step + w + 0.05, y + h / 2 - 0.1)
+    block(slide, MARGIN + 2 * step, y, w, h, u"融合",
+          [u"沿深度方向的 Transformer", u"（2 层，33 个标记）", u"全局池化 + 共享主干",
+           u"合计 4.96 M 参数"], BLUE)
+    arrow(slide, MARGIN + 2 * step + w + 0.05, y + h / 2 - 0.1)
+    block(slide, MARGIN + 3 * step, y, w, h, u"输出",
+          [u"增益最优值", u"时间增益补偿曲线（8 段）", u"发射聚焦档位",
+           u"（深度、频率、动态范围未训练）"], GREEN)
+
+    write(text_box(slide, MARGIN, 3.86, 12.1, 0.4),
+          [(u"FiLM 调制是必要的：同一组回波数据可对应任意当前设置，「偏暗还是偏亮」只有与当前设置"
+            u"一并给出时才有定义。", 12.5, MUTED, False)], space_after=0)
+
+    y2, h2 = 4.5, 1.25
+    write(text_box(slide, MARGIN, 4.22, 6.0, 0.3), [(u"闭环协议", 14, INK, True)], space_after=0)
+    steps = [(u"① 观测", [u"当前图像与当前设置"]),
+             (u"② 预测", [u"网络给出各参数最优值"]),
+             (u"③ 修正", [u"修正量 = 最优值 − 当前值"]),
+             (u"④ 执行", [u"调节后重新观测，直至", u"停止判据满足"])]
+    w2 = 2.86
+    for i, (head, lines) in enumerate(steps):
+        x = MARGIN + i * (w2 + 0.22)
+        block(slide, x, y2, w2, h2, head, lines, BLUE if i < 3 else GREEN, 13, 11.5)
+        if i < len(steps) - 1:
+            arrow(slide, x + w2 + 0.01, y2 + h2 / 2 - 0.1, 0.2, 0.2)
+
+    panel(slide, MARGIN, 6.05, 12.11, 1.0)
+    write(text_box(slide, MARGIN + 0.3, 6.26, 11.5, 0.65),
+          [(u"标签由教师求解器逐帧给出：后端以本场次操作者所接受的组织亮度为目标，前端以血管远壁覆盖、"
+            u"穿透余量与逐深度带侧向散斑宽度为判据。增益与时间增益补偿不改变回波数据，因此闭环可在"
+            u"已记录的帧上精确复现。", 13, DIM, False)], space_after=0)
 
 
 def brief_results(deck, numbers, bias, figures):
@@ -458,14 +535,14 @@ def slide_method(deck, figures):
 def slide_video(deck, video, poster):
     slide = add_slide(deck)
     title(slide, u"演示：一帧图像上的六参数闭环优化", u"演示视频")
-    width = 9.6
+    width = 9.3
     height = width * 720.0 / 1280.0
     x = (WIDE - width) / 2.0
-    slide.shapes.add_movie(video, Inches(x), Inches(1.72), Inches(width), Inches(height),
+    slide.shapes.add_movie(video, Inches(x), Inches(1.6), Inches(width), Inches(height),
                            poster_frame_image=poster, mime_type="video/mp4")
     caption(slide, u"视频时长 30 秒，共五段：后端闭环迭代、发射聚焦判据、六位受试者同屏验证、"
                    u"误差分布形态、留出测试集结果。各帧均由同一组原始回波数据经后端渲染模型精确重建。",
-            x, 1.72 + height + 0.22, width)
+            x, 1.6 + height + 0.12, width, 0.42)
 
 
 def slide_single_step(deck, numbers, figures):
@@ -609,6 +686,7 @@ def main(argv=None):
     deck = new_deck()
     if args.pages == "brief":
         brief_cover(deck, numbers)
+        brief_method(deck)
         brief_video(deck, args.video, poster)
         brief_results(deck, numbers, bias, args.figures)
         brief_conclusion(deck)
