@@ -73,7 +73,15 @@ TEXT = {
         "start": "初始状态：主机采集设置，时间增益补偿各段均为 127",
         "moving": "执行模型输出：增益 %+d 档，时间增益补偿曲线更新",
         "stopped": "停止判据满足，迭代终止",
-        "scene2": "二、发射聚焦：同一探头位置的六档实采图像",
+        "scene2": "二、发射聚焦：六档实采图像与判据",
+        "widths": "侧向散斑宽度（mm）——数值越低分辨率越高",
+        "widths_axis": "深度（mm）",
+        "probs": "模型对各档的输出概率",
+        "far_wall_mark": "远壁 %.1f mm",
+        "scene_bias": "四、误差的分布形态：增益残差以受试者为单位呈常数偏置",
+        "bias_axis": "验证集各受试者（按偏置排序）",
+        "bias_unit": "与最优解的偏置（dB，带符号）",
+        "bias_note": "受试者内一致性 %.2f dB；%d / %d 位在 ±1 dB 以内；平方误差中 %.0f%% 来自受试者间偏置",
         "focus_label": "发射聚焦 %g mm",
         "zoom": "远壁区域局部放大",
         "pick_teacher": "求解器最优档",
@@ -81,7 +89,7 @@ TEXT = {
         "scene3": "三、跨受试者验证：另 %d 位留出测试集受试者",
         "subject": "受试者 %s",
         "from_to": "增益与最优解偏差 %.2f dB -> %.2f dB",
-        "scene4": "四、留出测试集评估结果（29 位受试者）",
+        "scene4": "五、留出测试集评估结果（29 位受试者）",
         "net": "本方法",
         "base": "设置查表基线",
         "row_tgc": "时间增益补偿\n平均绝对误差",
@@ -108,7 +116,16 @@ TEXT = {
         "start": "initial state: console acquisition setting, all TGC bands at 127",
         "moving": "applying the prediction: gain %+d levels, TGC curve updated",
         "stopped": "stopping criterion met; iteration terminated",
-        "scene2": "2. Transmit focus: six acquired depths at a single probe position",
+        "scene2": "2. Transmit focus: six acquisitions and the criterion behind the label",
+        "widths": "lateral speckle width (mm) - lower means finer resolution",
+        "widths_axis": "depth (mm)",
+        "probs": "model probability per step",
+        "far_wall_mark": "far wall %.1f mm",
+        "scene_bias": "4. Structure of the error: the gain residual is a constant offset per subject",
+        "bias_axis": "validation subjects, sorted by bias",
+        "bias_unit": "signed deviation from the optimum (dB)",
+        "bias_note": "within-subject consistency %.2f dB; %d of %d inside +-1 dB; %.0f%% of the squared "
+                     "error is between-subject bias",
         "focus_label": "transmit focus %g mm",
         "zoom": "far-wall region, magnified",
         "pick_teacher": "solver optimum",
@@ -116,7 +133,7 @@ TEXT = {
         "scene3": "3. Cross-subject validation: %d further held-out test subjects",
         "subject": "subject %s",
         "from_to": "deviation from the optimum %.2f dB -> %.2f dB",
-        "scene4": "4. Evaluation on the held-out test set (29 subjects)",
+        "scene4": "5. Evaluation on the held-out test set (29 subjects)",
         "net": "proposed method",
         "base": "settings-lookup baseline",
         "row_tgc": "TGC mean\nabsolute error",
@@ -155,6 +172,8 @@ def parse_args(argv=None):
     p.add_argument("--max-steps", type=int, default=3)
     p.add_argument("--candidates", type=int, default=16)
     p.add_argument("--single-step-json", default="runs/invivo_bf_v2/fold_0/evaluation_combined_test_noloop.json")
+    p.add_argument("--loop-trajectories",
+                   default="runs/invivo_bf_v2/fold_0/closed_loop_trajectories_combined_bloop.jsonl")
     p.add_argument("--limit", type=int, default=None)
     return p.parse_args(argv)
 
@@ -243,6 +262,66 @@ def draw_wrapped(draw, font, text, x, y, width, fill, line_height=27):
     return len(lines[:3])
 
 
+def draw_series_chart(draw, fonts, x, y, w, h, series, title, axis_label, mark_x=None, mark_label=None):
+    """小幅折线图。series = [(标签, [(x, y), ...], 颜色, 是否高亮)]。"""
+    draw.text((x, y - 24), title, font=fonts["small"], fill=INK_DIM)
+    draw.rectangle([x, y, x + w, y + h], fill=PANEL, outline=(54, 54, 52))
+    points = [p for _, pts, _, _ in series for p in pts]
+    if not points:
+        draw.text((x + 12, y + h / 2 - 10), "-", font=fonts["small"], fill=INK_DIM)
+        return
+    xs = [p[0] for p in points]
+    ys = [p[1] for p in points]
+    x0, x1 = min(xs), max(xs)
+    y0, y1 = min(ys), max(ys)
+    if x1 - x0 < 1e-6:
+        x1 = x0 + 1.0
+    pad = (y1 - y0) * 0.25 + 1e-6
+    y0, y1 = max(0.0, y0 - pad), y1 + pad
+    px = lambda v: x + 44 + (v - x0) / (x1 - x0) * (w - 60)
+    py = lambda v: y + h - 30 - (v - y0) / (y1 - y0) * (h - 48)
+    draw.text((x + 6, py(y1) - 7), "%.1f" % y1, font=fonts["data_small"], fill=INK_DIM)
+    draw.text((x + 6, py(y0) - 7), "%.1f" % y0, font=fonts["data_small"], fill=INK_DIM)
+    draw.text((x + 44, y + h - 18), "%.0f" % x0, font=fonts["data_small"], fill=INK_DIM)
+    draw.text((x + w - 70, y + h - 18), "%.0f" % x1, font=fonts["data_small"], fill=INK_DIM)
+    draw.text((x + w / 2 - 28, y + h - 18), axis_label, font=fonts["small"], fill=INK_DIM)
+    if mark_x is not None and x0 <= mark_x <= x1:
+        draw.line([px(mark_x), y + 10, px(mark_x), y + h - 24], fill=ORANGE, width=1)
+        if mark_label:
+            draw.text((px(mark_x) + 4, y + 8), mark_label, font=fonts["small"], fill=ORANGE)
+    for label, pts, colour, strong in series:
+        if len(pts) >= 2:
+            draw.line([(px(a), py(b)) for a, b in pts], fill=colour, width=3 if strong else 1,
+                      joint="curve")
+        for a, b in pts:
+            r = 4 if strong else 2
+            draw.ellipse([px(a) - r, py(b) - r, px(a) + r, py(b) + r], fill=colour)
+        if strong and label:
+            draw.text((px(pts[-1][0]) - 30, py(pts[-1][1]) - 24), label, font=fonts["data_small"],
+                      fill=colour)
+
+
+def draw_probability_bars(draw, fonts, x, y, w, h, ladder, probabilities, current, teacher, title):
+    """模型对各档的概率：当前档填蓝，求解器最优档加橙框。"""
+    draw.text((x, y - 24), title, font=fonts["small"], fill=INK_DIM)
+    draw.rectangle([x, y, x + w, y + h], fill=PANEL, outline=(54, 54, 52))
+    if not ladder:
+        return
+    high = max(max(probabilities), 1e-6)
+    slot = (w - 24) / float(len(ladder))
+    for i, (value, probability) in enumerate(zip(ladder, probabilities)):
+        bx = x + 12 + i * slot
+        bar = (h - 44) * probability / high
+        here = abs(value - current) < 1e-6
+        best = abs(value - teacher) < 1e-6
+        draw.rectangle([bx + 4, y + h - 26 - bar, bx + slot - 8, y + h - 26],
+                       fill=BLUE if here else (74, 74, 70))
+        if best:
+            draw.rectangle([bx + 2, y + h - 28 - bar, bx + slot - 6, y + h - 24], outline=ORANGE, width=2)
+        draw.text((bx + 4, y + h - 22), "%g" % value, font=fonts["data_small"], fill=INK if here else INK_DIM)
+    draw.text((x + w - 54, y + 8), "%.2f" % high, font=fonts["data_small"], fill=INK_DIM)
+
+
 def draw_readout(draw, fonts, strings, x, y, gain_level, gain_error, tgc_error):
     """右栏的数字。"""
     draw.text((x, y), strings["gain"], font=fonts["small"], fill=INK_DIM)
@@ -313,47 +392,84 @@ def scene_backend(frame, row, steps, fonts, strings, fps, write):
         write(image)
 
 
-def scene_focus(frames, results, order, rows, fonts, strings, fps, hold=1.25):
-    """第 2 段：六档真实聚焦，另给远壁附近的放大图。"""
+def focus_sharpness(frames, args):
+    """每档聚焦的逐深度带侧向散斑宽度——聚焦标签正是按这个量定的。"""
+    import console_sessions as CS
+    import tools_generate_console_labels as G
+    import tools_generate_labels as TG
+    from hisense_loader import load_capture
+
+    cal_by_group = TG.load_calibration(args.calibration or CS.output_path(args.dataset, "calibration"))
+    G.floors_in_counts(cal_by_group)
     out = []
-    for i in order:
+    for frame in frames:
+        try:
+            session, mode = frame["calibration"]["group"].rsplit("/", 1)
+            entry = cal_by_group[(session, int(mode))]
+            widths = G.measure_frame(load_capture(frame["path"]), entry["cal"], entry["floor"])["widths"]
+            out.append(sorted((float(d), float(v)) for d, v in widths.items()))
+        except Exception:
+            out.append([])
+    return out
+
+
+def scene_focus(frames, results, order, rows, fonts, strings, fps, args, hold=1.5):
+    """第 2 段：图像 + 远壁放大 + 侧向散斑宽度曲线 + 模型概率。"""
+    widths = focus_sharpness([frames[i] for i in order], args)
+    out = []
+    for position, i in enumerate(order):
         f = frames[i]
         row = rows[f["frame_id"]]
         gray = DP.render_gray(f, row["optimal_gain_db"], row["optimal_tgc_levels"])
-        picture = gray_to_image(gray, f["max_depth_mm"])
-        far_wall = row.get("far_wall_mm") or (f["max_depth_mm"] * 0.45)
+        picture = gray_to_image(gray, f["max_depth_mm"], box=(300, 450))
+        far_wall = row.get("far_wall_mm")
         rows_total = gray.shape[0]
-        centre = int(rows_total * far_wall / f["max_depth_mm"])
+        centre = int(rows_total * (far_wall or f["max_depth_mm"] * 0.45) / f["max_depth_mm"])
         half = max(24, int(rows_total * 6.0 / f["max_depth_mm"]))
         crop = gray[max(0, centre - half):min(rows_total, centre + half), :]
         zoom = Image.fromarray(np.clip(crop, 0, 255).astype(np.uint8), mode="L").convert("RGB")
-        zoom = zoom.resize((IMAGE_BOX[0], int(IMAGE_BOX[0] * crop.shape[0] / float(crop.shape[1]) * 0.55)),
+        zoom = zoom.resize((300, max(60, int(300 * crop.shape[0] / float(crop.shape[1]) * 0.55))),
                            Image.LANCZOS)
-        teacher = abs(float(row["optimal_focus_mm"]) - f["focus_mm"]) < 1e-6
-        model = results[i]["frontend"]["focus"]["steps"] == 0
+        teacher_focus = round(float(row["optimal_focus_mm"]), 1)
+        focus_axis = results[i]["frontend"]["focus"]
+        ladder = [v for v, p in zip(focus_axis.get("ladder", []), focus_axis.get("probabilities", []))
+                  if any(abs(v - s) < 1e-6 for s in focus_axis.get("selectable", []))]
+        probabilities = [p for v, p in zip(focus_axis.get("ladder", []), focus_axis.get("probabilities", []))
+                         if any(abs(v - s) < 1e-6 for s in focus_axis.get("selectable", []))]
+        series = []
+        for k, other in enumerate(order):
+            strong = other == i
+            series.append(("%g mm" % frames[other]["focus_mm"], widths[k], BLUE if strong else (70, 70, 66),
+                           strong))
+        series.sort(key=lambda item: item[3])
         for _ in range(int(round(hold * fps))):
             image, draw = canvas(fonts, strings, strings["scene2"], strings["note_render"])
-            accent = ORANGE if teacher else (BLUE if model else None)
+            accent = ORANGE if abs(teacher_focus - f["focus_mm"]) < 1e-6 else (
+                BLUE if focus_axis["steps"] == 0 else None)
             paste_panel(image, draw, fonts, picture, 48, 104, strings["focus_label"] % f["focus_mm"], accent)
-            paste_panel(image, draw, fonts, zoom, 48 + IMAGE_BOX[0] + 48, 104, strings["zoom"])
-            right = 48 + 2 * (IMAGE_BOX[0] + 48)
-            y = 104
-            if teacher:
-                draw.text((right, y), strings["pick_teacher"], font=fonts["body"], fill=ORANGE)
-                y += 34
-            if model:
-                draw.text((right, y), strings["pick_model"], font=fonts["body"], fill=BLUE)
-                y += 34
-            draw.text((right, 300), strings["focus_label"] % f["focus_mm"], font=fonts["body"], fill=INK)
-            y2 = 340
-            for other in order:
-                value = frames[other]["focus_mm"]
-                here = abs(value - f["focus_mm"]) < 1e-6
-                draw.text((right + (6 if here else 0), y2), "%g mm" % value, font=fonts["data_small"],
-                          fill=INK if here else (96, 96, 90))
-                if here:
-                    draw.rectangle([right - 6, y2 + 2, right - 3, y2 + 16], fill=BLUE)
-                y2 += 24
+            if far_wall:
+                yline = 104 + int(picture.size[1] * far_wall / f["max_depth_mm"])
+                draw.line([48, yline, 48 + picture.size[0], yline], fill=ORANGE, width=1)
+                label = strings["far_wall_mark"] % far_wall
+                tw = draw.textlength(label, font=fonts["small"])
+                draw.rectangle([50, yline + 2, 50 + tw + 10, yline + 26], fill=(14, 14, 13))
+                draw.text((55, yline + 4), label, font=fonts["small"], fill=ORANGE)
+            middle = 48 + 300 + 36
+            paste_panel(image, draw, fonts, zoom, middle, 104, strings["zoom"])
+            draw_series_chart(draw, fonts, middle, 104 + zoom.size[1] + 58, 300, 182, series,
+                              strings["widths"], strings["widths_axis"],
+                              mark_x=far_wall, mark_label=strings["far_wall_mark"] % far_wall
+                              if far_wall else None)
+            far = 48 + 2 * (300 + 36)
+            width_right = WIDTH - far - 48
+            draw_probability_bars(draw, fonts, far, 104, width_right, 182, ladder, probabilities,
+                                  f["focus_mm"], teacher_focus, strings["probs"])
+            y = 104 + 182 + 28
+            if abs(teacher_focus - f["focus_mm"]) < 1e-6:
+                draw.text((far, y), strings["pick_teacher"], font=fonts["body"], fill=ORANGE)
+                y += 32
+            if focus_axis["steps"] == 0:
+                draw.text((far, y), strings["pick_model"], font=fonts["body"], fill=BLUE)
             out.append(image)
     return out
 
@@ -391,6 +507,40 @@ def scene_subjects(stories, fonts, strings, fps, per=1.9):
             draw.text((right, 340), strings["from_to"] % (story["start_gain"], story["final_gain"]),
                       font=fonts["small"], fill=INK_DIM)
             out.append(image)
+    return out
+
+
+def scene_bias(bias, fonts, strings, fps, hold=4.5):
+    """第 4 段：每位受试者一个点，点逐个出现。"""
+    out = []
+    subjects = bias["subjects"]
+    total = int(round(hold * fps))
+    appear = int(total * 0.6)
+    span = max(5.0, max(abs(s["bias"]) for s in subjects) * 1.12)
+    left, right, top, bottom = 90, 80, 120, 150
+    width, height = WIDTH - left - right, HEIGHT - top - bottom
+    for k in range(total):
+        shown = len(subjects) if k >= appear else max(1, int(len(subjects) * (k + 1) / float(appear)))
+        image, draw = canvas(fonts, strings, strings["scene_bias"], strings["note_render"])
+        px = lambda i: left + i * width / max(1.0, len(subjects) - 1.0)
+        py = lambda v: top + (span - v) * height / (2 * span)
+        draw.rectangle([left, py(1.0), left + width, py(-1.0)], fill=(24, 42, 34))
+        draw.line([left, py(0.0), left + width, py(0.0)], fill=(74, 74, 70))
+        for value in (-4, -2, 0, 2, 4):
+            if abs(value) <= span:
+                draw.text((left - 42, py(value) - 10), "%+d" % value, font=fonts["data_small"], fill=INK_DIM)
+        for i, subject in enumerate(subjects[:shown]):
+            colour = ORANGE if abs(subject["bias"]) > 1.0 else BLUE
+            draw.line([px(i), py(0.0), px(i), py(subject["bias"])], fill=colour, width=2)
+            draw.ellipse([px(i) - 5, py(subject["bias"]) - 5, px(i) + 5, py(subject["bias"]) + 5],
+                         fill=colour)
+        draw.text((left, HEIGHT - 148), strings["bias_axis"], font=fonts["small"], fill=INK_DIM)
+        draw.text((left, HEIGHT - 124), strings["bias_unit"], font=fonts["small"], fill=INK_DIM)
+        draw.text((left, HEIGHT - 94),
+                  strings["bias_note"] % (bias["sd_median"], bias["within_1db"], len(subjects),
+                                          100 * bias["bias_share"]),
+                  font=fonts["body"], fill=INK)
+        out.append(image)
     return out
 
 
@@ -520,6 +670,10 @@ def main(argv=None):
     single = DP.read_metrics(args.single_step_json)
     net = single.get("network_recorded_start", {})
     base = single.get("settings_lookup_baseline", {})
+    bias = DP.subject_bias(args.loop_trajectories, rows)
+    if bias:
+        emit("  bias       %d subjects, within-subject sd %.2f dB, %d within +-1 dB"
+             % (len(bias["subjects"]), bias["sd_median"], bias["within_1db"]))
 
     temp = tempfile.mkdtemp(prefix="demo_video_")
     count = [0]
@@ -533,10 +687,13 @@ def main(argv=None):
             write(image)
         scene_backend(frame, main_story["row"], main_story["steps"], fonts, strings, args.fps, write)
         for image in scene_focus(main_story["frames"], main_story["results"], main_story["order"],
-                                 main_story["rows"], fonts, strings, args.fps):
+                                 main_story["rows"], fonts, strings, args.fps, args):
             write(image)
         if others:
             for image in scene_subjects(others, fonts, strings, args.fps):
+                write(image)
+        if bias:
+            for image in scene_bias(bias, fonts, strings, args.fps):
                 write(image)
         for image in scene_numbers(net, base, fonts, strings, args.fps):
             write(image)

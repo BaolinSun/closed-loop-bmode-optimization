@@ -378,6 +378,12 @@ def one_suggestion(f, j, dec, masks, ladders, args, trained=None):
             "expected_step": float(ladders[key][int(dec["%s_idx_expected" % axis][j])]),
             "current_on_ladder": bool(f["_%s_exact" % axis]),
             "selectable": [float(v) for v, m in zip(ladders[key], mask) if m > 0],
+            # 整条概率（按档位表顺序）：画「模型在各档之间怎么分配信念」时要用
+            "probabilities": [float(p) for p in prob],
+            "ladder": [float(v) for v in ladders[key]],
+            # 整条概率（按档位表顺序）：画「模型在各档之间怎么分配信念」时要用
+            "probabilities": [float(p) for p in prob],
+            "ladder": [float(v) for v in ladders[key]],
         }
 
     delta_db = float(dec["gain_delta_db"][j])
