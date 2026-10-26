@@ -59,70 +59,75 @@ GREEN = (25, 158, 112)
 
 TEXT = {
     "zh": {
-        "title": "超声六参数闭环优化",
-        "subtitle": "颈动脉活体数据，测试集受试者（未参与训练与选模）",
-        "scene1": "第 1 段 - 后端闭环：模型拧旋钮，图像跟着变",
-        "live": "当前画面（模型正在调）",
-        "teacher": "教师最优（静止参考）",
+        "title": "超声成像六参数闭环优化",
+        "subtitle": "颈动脉在体数据；受试者取自留出测试集，未参与训练与模型选择",
+        "scene1": "一、后端参数闭环迭代：增益与时间增益补偿",
+        "live": "模型输出参数下的渲染结果",
+        "teacher": "求解器最优解（参考基准）",
         "gain": "增益档位",
-        "off": "离教师最优",
-        "tgc": "TGC 曲线（dB）",
+        "off": "与最优解偏差",
+        "tgc": "时间增益补偿曲线（dB）",
         "tgc_now": "当前",
-        "tgc_teacher": "教师",
-        "step": "第 %d 步",
-        "start": "起点：实机采下来的样子，TGC 平直 127",
-        "moving": "执行建议：增益 %+d 级，TGC 移动",
-        "stopped": "模型说可以了，停。",
-        "scene2": "第 2 段 - 发射聚焦：同一探头位置真实采到的六档",
-        "focus_label": "聚焦 %g mm",
-        "zoom": "远壁附近放大",
-        "pick_teacher": "教师选这一档",
-        "pick_model": "模型选这一档",
-        "scene3": "第 3 段 - 换人再看：%d 位测试集受试者各走一遍",
+        "tgc_teacher": "最优解",
+        "step": "第 %d 次迭代",
+        "start": "初始状态：主机采集设置，时间增益补偿各段均为 127",
+        "moving": "执行模型输出：增益 %+d 档，时间增益补偿曲线更新",
+        "stopped": "停止判据满足，迭代终止",
+        "scene2": "二、发射聚焦：同一探头位置的六档实采图像",
+        "focus_label": "发射聚焦 %g mm",
+        "zoom": "远壁区域局部放大",
+        "pick_teacher": "求解器最优档",
+        "pick_model": "模型输出档",
+        "scene3": "三、跨受试者验证：另 %d 位留出测试集受试者",
         "subject": "受试者 %s",
-        "from_to": "增益离最优 %.2f dB  ->  %.2f dB",
-        "scene4": "第 4 段 - 测试集上的数字（29 位未见过的受试者）",
-        "net": "网络",
-        "base": "只看设置查表",
-        "row_tgc": "TGC 误差",
-        "row_gain": "增益误差",
-        "row_focus": "聚焦命中",
-        "lower": "越小越好", "higher": "越大越好",
-        "closing": "后端（增益、TGC）可用；聚焦勉强；深度、频率、动态范围尚未训练",
-        "note_render": "每一帧都由同一份原始回波数据精确渲染，不是示意图",
+        "from_to": "增益与最优解偏差 %.2f dB -> %.2f dB",
+        "scene4": "四、留出测试集评估结果（29 位受试者）",
+        "net": "本方法",
+        "base": "设置查表基线",
+        "row_tgc": "时间增益补偿\n平均绝对误差",
+        "row_gain": "增益平均绝对误差",
+        "row_focus": "发射聚焦\n首选命中率",
+        "lower": "数值越低越优",
+        "higher": "数值越高越优",
+        "closing": "增益与时间增益补偿已达可用精度；发射聚焦略优于基线；显示深度、发射频率与动态范围尚未训练",
+        "note_render": "各帧均由同一组原始回波数据经后端渲染模型精确重建，非示意图",
     },
     "en": {
-        "title": "Closed-loop B-mode optimisation",
-        "subtitle": "In-vivo carotid, held-out test subject",
-        "scene1": "1 - the back-end loop: the model turns the knobs",
-        "live": "live (the model is adjusting)",
-        "teacher": "teacher's optimum (reference)",
+        "title": "Closed-loop optimisation of six B-mode parameters",
+        "subtitle": "In-vivo carotid data; subject drawn from the held-out test set, unseen in training "
+                    "and model selection",
+        "scene1": "1. Closed-loop iteration of the back-end parameters: gain and time-gain compensation",
+        "live": "render under the model's predicted parameters",
+        "teacher": "solver optimum (reference)",
         "gain": "gain level",
-        "off": "from the optimum",
-        "tgc": "TGC curve (dB)",
-        "tgc_now": "now",
-        "tgc_teacher": "teacher",
-        "step": "step %d",
-        "start": "start: as the operator captured it, TGC flat at 127",
-        "moving": "applying: gain %+d clicks, TGC moved",
-        "stopped": "the model stops here.",
-        "scene2": "2 - transmit focus: six real captures from one probe position",
-        "focus_label": "focus %g mm",
-        "zoom": "near the far wall",
-        "pick_teacher": "teacher picks this",
-        "pick_model": "model picks this",
-        "scene3": "3 - and again on %d other test subjects",
+        "off": "deviation from the optimum",
+        "tgc": "time-gain compensation curve (dB)",
+        "tgc_now": "current",
+        "tgc_teacher": "optimum",
+        "step": "iteration %d",
+        "start": "initial state: console acquisition setting, all TGC bands at 127",
+        "moving": "applying the prediction: gain %+d levels, TGC curve updated",
+        "stopped": "stopping criterion met; iteration terminated",
+        "scene2": "2. Transmit focus: six acquired depths at a single probe position",
+        "focus_label": "transmit focus %g mm",
+        "zoom": "far-wall region, magnified",
+        "pick_teacher": "solver optimum",
+        "pick_model": "model prediction",
+        "scene3": "3. Cross-subject validation: %d further held-out test subjects",
         "subject": "subject %s",
-        "from_to": "gain from the optimum %.2f dB  ->  %.2f dB",
-        "scene4": "4 - on the test set (29 unseen subjects)",
-        "net": "network",
-        "base": "settings lookup",
-        "row_tgc": "TGC error",
-        "row_gain": "gain error",
-        "row_focus": "focus top-1",
-        "lower": "lower is better", "higher": "higher is better",
-        "closing": "gain and TGC work; focus is marginal; depth, frequency and dynamic range are not trained",
-        "note_render": "every frame is rendered from the same recorded envelope, not an illustration",
+        "from_to": "deviation from the optimum %.2f dB -> %.2f dB",
+        "scene4": "4. Evaluation on the held-out test set (29 subjects)",
+        "net": "proposed method",
+        "base": "settings-lookup baseline",
+        "row_tgc": "TGC mean\nabsolute error",
+        "row_gain": "gain mean\nabsolute error",
+        "row_focus": "transmit focus\ntop-1 accuracy",
+        "lower": "lower is better",
+        "higher": "higher is better",
+        "closing": "gain and TGC reach usable accuracy; transmit focus marginally exceeds the baseline; "
+                   "display depth, transmit frequency and dynamic range are not yet trained",
+        "note_render": "every frame is reconstructed exactly from the same recorded envelope through the "
+                       "back-end render model; none is an illustration",
     },
 }
 
@@ -216,6 +221,28 @@ def draw_tgc_curve(draw, fonts, strings, x, y, w, h, now_levels, teacher_levels,
     draw.text((x + 12 + 60, y + h - 24), strings["tgc_teacher"], font=fonts["small"], fill=ORANGE)
 
 
+def draw_wrapped(draw, font, text, x, y, width, fill, line_height=27):
+    """按像素宽度断行。学术表达比口语长，截断会丢信息。中文逐字断，西文按空格断。"""
+    lines = []
+    for paragraph in text.split("\n"):
+        words = paragraph.split(" ") if " " in paragraph else list(paragraph)
+        joiner = " " if " " in paragraph else ""
+        line = ""
+        for word in words:
+            candidate = (line + joiner + word) if line else word
+            if draw.textlength(candidate, font=font) <= width:
+                line = candidate
+            else:
+                if line:
+                    lines.append(line)
+                line = word
+        if line:
+            lines.append(line)
+    for i, one in enumerate(lines[:3]):
+        draw.text((x, y + i * line_height), one, font=font, fill=fill)
+    return len(lines[:3])
+
+
 def draw_readout(draw, fonts, strings, x, y, gain_level, gain_error, tgc_error):
     """右栏的数字。"""
     draw.text((x, y), strings["gain"], font=fonts["small"], fill=INK_DIM)
@@ -282,7 +309,7 @@ def scene_backend(frame, row, steps, fonts, strings, fps, write):
             note = strings["moving"] % step["suggestion"]["clicks"]
         else:
             note = strings["step"] % step["step"]
-        draw.text((right, 500), note if len(note) < 34 else note[:33] + "...", font=fonts["body"], fill=INK)
+        draw_wrapped(draw, fonts["body"], note, right, 496, WIDTH - right - 40, INK)
         write(image)
 
 
@@ -379,8 +406,8 @@ def scene_numbers(net, base, fonts, strings, fps, hold=4.0):
     for name, a, b, unit, direction in pairs:
         if a is None or b is None:
             continue
-        draw.text((64, y), name, font=fonts["body"], fill=INK)
-        draw.text((64, y + 28), strings[direction], font=fonts["small"], fill=(110, 110, 104))
+        used = draw_wrapped(draw, fonts["body"], name, 64, y, 170, INK, line_height=24)
+        draw.text((64, y + 6 + used * 24), strings[direction], font=fonts["small"], fill=(110, 110, 104))
         draw.text((64 + 180, y - 6), unit % a, font=fonts["big"], fill=BLUE)
         draw.text((64 + 420, y + 4), unit % b, font=fonts["data"], fill=INK_DIM)
         high = max(a, b) * 1.25
