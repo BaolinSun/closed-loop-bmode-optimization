@@ -274,6 +274,27 @@ def tag(slide, x, y, w, text, size=9.5, colour=MUTED, latin="Consolas"):
           space_after=0, latin=latin)
 
 
+def chip(slide, x, y, text, accent=BLUE, size=11):
+    """关键词胶囊，返回自身宽度，便于一个接一个排过去。"""
+    w = 0.155 * len(text) + 0.34
+    shape = slide.shapes.add_shape(MSO_SHAPE.ROUNDED_RECTANGLE, Inches(x), Inches(y),
+                                   Inches(w), Inches(0.34))
+    shape.adjustments[0] = 0.5
+    shape.fill.solid()
+    shape.fill.fore_color.rgb = tint(accent, 0.22)
+    shape.line.color.rgb = tint(accent, 0.62)
+    shape.line.width = Pt(1)
+    shape.shadow.inherit = False
+    frame = shape.text_frame
+    frame.margin_left = frame.margin_right = frame.margin_top = frame.margin_bottom = 0
+    frame.vertical_anchor = MSO_ANCHOR.MIDDLE
+    frame.paragraphs[0].alignment = PP_ALIGN.CENTER
+    run = frame.paragraphs[0].add_run()
+    run.text = text
+    set_font(run, size, accent, True)
+    return w
+
+
 def figure(slide, path, x, y, w):
     picture = slide.shapes.add_picture(path, Inches(x), Inches(y), width=Inches(w))
     return picture
@@ -342,13 +363,18 @@ def set_autoplay(path, emit):
 
 def brief_cover(deck, numbers):
     slide = add_slide(deck)
-    write(text_box(slide, MARGIN, 1.5, 11.6, 0.4), [(u"在体颈动脉数据上的验证", 16, BLUE, False)],
+    write(text_box(slide, MARGIN, 1.38, 11.6, 0.4),
+          [(u"面向可穿戴超声的成像参数自整定", 16, BLUE, False)], space_after=0)
+    write(text_box(slide, MARGIN, 1.82, 11.6, 1.2), [(u"超声成像六参数闭环控制", 44, INK, True)],
           space_after=0)
-    write(text_box(slide, MARGIN, 1.95, 11.6, 1.2), [(u"超声成像六参数闭环优化", 44, INK, True)],
-          space_after=0)
-    write(text_box(slide, MARGIN, 3.2, 11.0, 1.0),
-          [(u"模型由单帧图像预测增益、时间增益补偿与发射聚焦的最优值，并以闭环方式迭代至停止判据满足；"
-            u"在 29 位未参与训练的受试者上优于只看当前设置的查表基线。", 16, DIM, False)], space_after=0)
+    write(text_box(slide, MARGIN, 3.04, 11.4, 1.1),
+          [(u"可穿戴超声贴附之后无人在旁调节，成像参数必须由设备自行整定。本工作从单帧图像预测增益、"
+            u"时间增益补偿与发射聚焦的最优值，闭环迭代至停止判据满足；在 29 位未参与"
+            u"训练的受试者上优于查表基线。", 16, DIM, False)], space_after=0)
+    x = MARGIN
+    for text, accent in [(u"可穿戴超声", GREEN), (u"参数闭环控制", GREEN), (u"增益与时间增益补偿", BLUE),
+                         (u"发射聚焦", BLUE), (u"单帧图像预测", BLUE), (u"在体颈动脉验证", BLUE)]:
+        x += chip(slide, x, 4.24, text, accent) + 0.16
     cards = [(numbers["tgc"] + " dB", u"时间增益补偿误差；基线 " + numbers["tgc_base"] + " dB", BLUE),
              (numbers["gain"] + " dB", u"增益误差；基线 " + numbers["gain_base"] + " dB", BLUE),
              (numbers["converged"] + "%", u"后端闭环收敛比例，2-3 次迭代", GREEN)]
@@ -468,50 +494,71 @@ def brief_video(deck, video, poster):
                    u"留出测试集结果；各帧均由同一组原始回波数据精确重建", x, 1.36 + height + 0.1, width, 0.34)
 
 
-def brief_method(deck):
+def brief_scenario(deck):
     slide = add_slide(deck)
-    title(slide, u"方法：网络结构与闭环协议", u"方法")
+    title(slide, u"应用场景：可穿戴超声为什么需要参数闭环控制", u"场景")
 
-    y, h, w = 1.78, 1.92, 2.69
-    step = w + 0.44
-    block(slide, MARGIN, y, w, h, u"输入",
-          [u"渲染灰阶、绝对 dB 图、", u"物理深度（3 × 512 × 128）",
-           u"逐行深度剖面（5 × 512）", u"当前六参数等 17 个标量"], BLUE)
-    arrow(slide, MARGIN + w + 0.05, y + h / 2 - 0.1)
-    block(slide, MARGIN + step, y, w, h, u"编码",
-          [u"二维残差编码器（图像）", u"一维残差编码器（剖面）",
-           u"参数嵌入经 FiLM 逐级调制特征"], BLUE)
-    arrow(slide, MARGIN + step + w + 0.05, y + h / 2 - 0.1)
-    block(slide, MARGIN + 2 * step, y, w, h, u"融合",
-          [u"沿深度方向的 Transformer", u"（2 层，33 个标记）", u"全局池化 + 共享主干",
-           u"合计 4.96 M 参数"], BLUE)
-    arrow(slide, MARGIN + 2 * step + w + 0.05, y + h / 2 - 0.1)
-    block(slide, MARGIN + 3 * step, y, w, h, u"输出",
-          [u"增益最优值", u"时间增益补偿曲线（8 段）", u"发射聚焦档位",
-           u"（深度、频率、动态范围未训练）"], GREEN)
+    items = [(u"无人在旁调节",
+              u"贴附式探头长时间连续成像，没有医生实时调节增益与时间增益补偿；参数一旦不当，"
+              u"整段记录都不可用。"),
+             (u"佩戴期间条件在漂移",
+              u"耦合状态、体位、呼吸与组织厚度随时间变化，出厂时固定的一组参数覆盖不了全程。"),
+             (u"佩戴者之间差异大",
+              u"同一组参数在不同人身上的组织亮度相差数 dB，预设值无法逐人适配。")]
+    y = 1.85
+    for name, body in items:
+        block(slide, MARGIN, y, 6.3, 1.45, name, [body], GREEN, 14.5, 13.5)
+        y += 1.62
 
-    write(text_box(slide, MARGIN, 3.86, 12.1, 0.4),
-          [(u"FiLM 调制是必要的：同一组回波数据可对应任意当前设置，「偏暗还是偏亮」只有与当前设置"
-            u"一并给出时才有定义。", 12.5, MUTED, False)], space_after=0)
+    write(text_box(slide, 7.1, 1.85, 5.63, 0.32), [(u"本工作的定位", 15, INK, True)], space_after=0)
+    write(text_box(slide, 7.1, 2.30, 5.63, 0.9),
+          [(u"算法先在台式设备上做成：同一机型、同一探头、同一颈动脉切面，189 位受试者的在体数据，"
+            u"按受试者划分训练与留出测试。此处验证的是参数闭环控制本身。", 13.5, DIM, False)],
+          space_after=0)
+    write(text_box(slide, 7.1, 3.34, 5.63, 0.32), [(u"可直接迁移的部分", 15, GREEN, True)], space_after=0)
+    write(text_box(slide, 7.1, 3.76, 5.63, 1.1),
+          [(u"一、闭环协议：观测 → 预测 → 修正 → 执行，与硬件无关", 13.5, DIM, False),
+           (u"二、增益与时间增益补偿只改渲染、不改回波，设备端可自洽迭代", 13.5, DIM, False),
+           (u"三、按受试者划分的验证，对应换人佩戴时的泛化", 13.5, DIM, False)], space_after=6)
+    panel(slide, 7.1, 5.10, 5.63, 1.5)
+    write(text_box(slide, 7.36, 5.32, 5.1, 1.1),
+          [(u"须在目标硬件上重做的部分", 14, ORANGE, True),
+           (u"可穿戴阵列的孔径、中心频率与贴附条件与手持探头不同：渲染校准、发射聚焦档位与前端判据"
+            u"须在目标硬件上重新标定，长时程佩戴下的漂移也需要连续采集来刻画。", 13, DIM, False)],
+          space_after=6)
 
-    y2, h2 = 4.5, 1.25
-    write(text_box(slide, MARGIN, 4.22, 6.0, 0.3), [(u"闭环协议", 14, INK, True)], space_after=0)
-    steps = [(u"① 观测", [u"当前图像与当前设置"]),
-             (u"② 预测", [u"网络给出各参数最优值"]),
-             (u"③ 修正", [u"修正量 = 最优值 − 当前值"]),
-             (u"④ 执行", [u"调节后重新观测，直至", u"停止判据满足"])]
-    w2 = 2.86
+
+def brief_method(deck, numbers):
+    slide = add_slide(deck)
+    title(slide, u"方法：成像参数的闭环控制协议", u"方法")
+
+    y, h, w = 1.78, 1.52, 2.86
+    steps = [(u"① 观测", [u"取当前帧的图像与当前", u"六参数，一并送入网络"]),
+             (u"② 预测", [u"网络给出各参数的最优值", u"而非修正量"]),
+             (u"③ 修正", [u"修正量 = 最优值 − 当前值", u"按设备档位取整"]),
+             (u"④ 执行", [u"设备自行调节并重新观测", u"直至停止判据满足"])]
     for i, (head, lines) in enumerate(steps):
-        x = MARGIN + i * (w2 + 0.22)
-        block(slide, x, y2, w2, h2, head, lines, BLUE if i < 3 else GREEN, 13, 11.5)
+        x = MARGIN + i * (w + 0.22)
+        block(slide, x, y, w, h, head, lines, BLUE if i < 3 else GREEN, 14.5, 12)
         if i < len(steps) - 1:
-            arrow(slide, x + w2 + 0.01, y2 + h2 / 2 - 0.1, 0.2, 0.2)
+            arrow(slide, x + w + 0.01, y + h / 2 - 0.1, 0.2, 0.2)
+    write(text_box(slide, MARGIN, 3.46, 12.1, 0.3),
+          [(u"整个回路由设备自己跑完，不需要人在旁边看图调旋钮。", 12.5, MUTED, False)], space_after=0)
 
-    panel(slide, MARGIN, 6.05, 12.11, 1.0)
-    write(text_box(slide, MARGIN + 0.3, 6.26, 11.5, 0.65),
-          [(u"标签由教师求解器逐帧给出：后端以本场次操作者所接受的组织亮度为目标，前端以血管远壁覆盖、"
-            u"穿透余量与逐深度带侧向散斑宽度为判据。增益与时间增益补偿不改变回波数据，因此闭环可在"
-            u"已记录的帧上精确复现。", 13, DIM, False)], space_after=0)
+    block(slide, MARGIN, 3.88, 6.3, 1.45, u"为什么可以离线精确复现",
+          [u"增益与时间增益补偿只作用于渲染、不改变回波数据，闭环的每一步都能在同一帧"
+           u"原始数据上精确重建；发射聚焦改变发射本身，须重新采集。"],
+          BLUE, 14.5, 13)
+    block(slide, 7.1, 3.88, 5.63, 1.45, u"停止判据与收敛",
+          [u"各参数的修正量小于设备档位死区即停止；" + numbers["converged"] +
+           u"% 的轨迹在 2-3 次迭代内收敛，增益偏差 " + numbers["loop_gain_start"] +
+           u" → " + numbers["loop_gain_final"] + u" dB，未见正反馈发散。"], GREEN, 14.5, 13)
+
+    panel(slide, MARGIN, 5.58, 12.09, 1.15)
+    write(text_box(slide, MARGIN + 0.3, 5.82, 11.5, 0.7),
+          [(u"控制目标从何而来：标签由教师求解器逐帧给出，后端以本场次操作者所接受的组织亮度为目标，"
+            u"前端以血管远壁覆盖、穿透余量与逐深度带侧向散斑宽度为判据；网络学的是这套判据，"
+            u"而不是某一次人工调节的结果。", 13, DIM, False)], space_after=0)
 
 
 def brief_results(deck, numbers, bias, figures):
@@ -544,10 +591,10 @@ def brief_results(deck, numbers, bias, figures):
             numbers["loop_tgc_start"] + u" → " + numbers["loop_tgc_final"] + u" dB，无正反馈发散。",
             14, DIM, False)], space_after=0)
     figure(slide, os.path.join(figures, "fig_bias.png"), 7.1, 1.74, 5.63)
-    write(text_box(slide, 7.1, 4.95, 5.63, 1.0),
+    write(text_box(slide, 7.1, 4.95, 5.63, 1.3),
           [(u"残差以受试者为单位呈常数偏置", 15, BLUE, True),
            (u"受试者内一致性 %.2f dB；%d / %d 位偏置在 ±1 dB 以内；平方误差中 %.0f%% 来自受试者间偏置，"
-            u"故一次人工校正即可修正整次检查。"
+            u"故一次校正即可修正整次检查；对应到可穿戴场景，即每次佩戴只需校正一次，整段监测沿用。"
             % (bias["sd_median"], bias["within_1db"], len(bias["subjects"]),
                100 * bias["bias_share"]), 13.5, DIM, False)], space_after=5)
 
@@ -579,12 +626,13 @@ def brief_conclusion(deck):
     steps = [u"一、上机闭环实测：按模型输出逐步调节并重新采集",
              u"二、真实医生阅片：重建深度与频率的判据",
              u"三、动态范围判据：成对偏好阅片，补齐第六个参数",
-             u"四、扩充受试者例数，抑制聚焦输出头的过拟合"]
+             u"四、扩充受试者例数，抑制聚焦输出头的过拟合",
+             u"五、迁移到可穿戴贴片探头：目标硬件重标定与长时程佩戴验证"]
     write(text_box(slide, 7.1, 2.35, 5.63, 2.6), [(x, 14, DIM, False) for x in steps], space_after=14)
     panel(slide, 7.1, 5.3, 5.63, 1.35)
     write(text_box(slide, 7.36, 5.56, 5.1, 0.95),
-          [(u"局限：前端目标深度来自阶段性阅片结果；结论限于单一机型、单一探头与颈动脉切面。",
-            13, DIM, False)], space_after=0)
+          [(u"局限：前端目标深度来自阶段性阅片结果；结论限于单一机型、单一探头与颈动脉切面，"
+            u"可穿戴硬件上尚未验证。", 13, DIM, False)], space_after=0)
 
 
 # ---------------------------------------------------------------------------------------
@@ -845,7 +893,8 @@ def main(argv=None):
     deck = new_deck()
     if args.pages == "brief":
         brief_cover(deck, numbers)
-        brief_method(deck)
+        brief_scenario(deck)
+        brief_method(deck, numbers)
         brief_architecture(deck)
         brief_video(deck, args.video, poster)
         brief_results(deck, numbers, bias, args.figures)
