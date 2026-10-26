@@ -162,20 +162,20 @@ def panel(slide, x, y, w, h, fill=PANEL, line=LINE):
     return shape
 
 
-def stat_panel(slide, x, y, w, h, value, label, colour=BLUE):
+def stat_panel(slide, x, y, w, h, value, label, colour=BLUE, size=30, label_size=11.5):
     shape = panel(slide, x, y, w, h)
     frame = shape.text_frame
     frame.paragraphs[0].space_after = Pt(2)
     frame.paragraphs[0].alignment = PP_ALIGN.LEFT
     run = frame.paragraphs[0].add_run()
     run.text = value
-    set_font(run, 30, colour, True, "Consolas")
+    set_font(run, size, colour, True, "Consolas")
     paragraph = frame.add_paragraph()
     paragraph.line_spacing = 1.2
     paragraph.alignment = PP_ALIGN.LEFT
     run = paragraph.add_run()
     run.text = label
-    set_font(run, 11.5, MUTED)
+    set_font(run, label_size, MUTED)
     return shape
 
 
@@ -480,18 +480,41 @@ def brief_architecture(deck):
             12.5, DIM, False)], space_after=0, line_spacing=1.3)
 
 
-def brief_video(deck, video, poster):
+def brief_video(deck, video, poster, numbers):
     slide = add_slide(deck)
-    write(text_box(slide, MARGIN, 0.42, 11.0, 0.3), [(u"演示", 12, MUTED, False)], space_after=0)
-    write(text_box(slide, MARGIN, 0.72, 12.1, 0.6), [(u"一帧图像上的六参数闭环优化", 26, INK, True)],
-          space_after=0)
-    width = 9.9
+    title(slide, u"演示：一帧图像上的六参数闭环控制", u"演示")
+
+    width = 8.0
     height = width * 720.0 / 1280.0
-    x = (WIDE - width) / 2.0
-    slide.shapes.add_movie(video, Inches(x), Inches(1.36), Inches(width), Inches(height),
+    slide.shapes.add_movie(video, Inches(MARGIN), Inches(1.52), Inches(width), Inches(height),
                            poster_frame_image=poster, mime_type="video/mp4")
-    caption(slide, u"30 秒，五段：后端闭环迭代、发射聚焦判据、六位受试者同屏验证、误差分布形态、"
-                   u"留出测试集结果；各帧均由同一组原始回波数据精确重建", x, 1.36 + height + 0.1, width, 0.34)
+
+    cards = [(numbers["loop_tgc_start"] + u" → " + numbers["loop_tgc_final"], u"时间增益补偿误差（dB）"),
+             (numbers["converged"] + "%", u"2-3 次迭代内收敛"),
+             (u"29 / 2682", u"留出测试受试者 / 帧")]
+    cw = (width - 2 * 0.22) / 3.0
+    for i, (value, label) in enumerate(cards):
+        stat_panel(slide, MARGIN + i * (cw + 0.22), 6.20, cw, 0.84, value, label,
+                   GREEN if i == 1 else BLUE, 19, 10.5)
+
+    caption(slide, u"画面左为模型输出参数下的渲染结果，右为教师求解器的最优解，"
+                   u"同源于一帧原始回波；视频随本页自动播放。", MARGIN, 7.14, width, 0.3)
+
+    rx, rw = 8.84, 3.87
+    write(text_box(slide, rx, 1.52, rw, 0.3), [(u"分段目录 · 30 秒", 13, INK, True)], space_after=0)
+    chapters = [(u"一、后端参数闭环迭代", u"增益与时间增益补偿逐步逼近目标，右侧逐行亮度剖面同步变化"),
+                (u"二、发射聚焦", u"同一探头位置的六档实采图像，与远壁覆盖、侧向散斑宽度判据"),
+                (u"三、跨受试者验证", u"六位留出测试集受试者同屏，按收敛偏差的秩取样"),
+                (u"四、误差的分布形态", u"增益残差以受试者为单位呈常数偏置"),
+                (u"五、留出测试集结果", u"三条参数轴与设置查表基线逐项对照")]
+    y = 1.92
+    for i, (head, body) in enumerate(chapters):
+        block(slide, rx, y, rw, 0.80, head, [body], GREEN if i == 0 else BLUE, 12, 10.5)
+        y += 0.88
+    panel(slide, rx, 6.36, rw, 0.95)
+    write(text_box(slide, rx + 0.22, 6.56, rw - 0.44, 0.6),
+          [(u"前两段对应两类参数：只改渲染的后端参数可离线复现，改变发射的聚焦须重新采集。",
+            11, DIM, False)], space_after=0, line_spacing=1.3)
 
 
 def brief_scenario(deck):
@@ -896,7 +919,7 @@ def main(argv=None):
         brief_scenario(deck)
         brief_method(deck, numbers)
         brief_architecture(deck)
-        brief_video(deck, args.video, poster)
+        brief_video(deck, args.video, poster, numbers)
         brief_results(deck, numbers, bias, args.figures)
         brief_conclusion(deck)
     else:
