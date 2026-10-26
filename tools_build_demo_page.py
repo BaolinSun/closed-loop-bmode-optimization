@@ -78,6 +78,8 @@ def parse_args(argv=None):
     p.add_argument("--loop-json", default="runs/invivo_bf_v2/fold_0/evaluation_combined_bloop.json")
     p.add_argument("--loop-trajectories",
                    default="runs/invivo_bf_v2/fold_0/closed_loop_trajectories_combined_bloop.jsonl")
+    p.add_argument("--language", choices=("zh", "en"), default="zh",
+                   help="page language; the Chinese page uses local CJK fonts and needs no network")
     p.add_argument("--out", default="data/demo_invivo_carotid.html")
     p.add_argument("--limit", type=int, default=None)
     return p.parse_args(argv)
@@ -484,7 +486,8 @@ def main(argv=None):
     emit("  metrics    %s + %s" % (args.single_step_json, args.loop_json))
 
     html = build_html(story["family"], frame, row, result, panel, steps, focus_cards, teacher_pick,
-                      model_pick, far_wall, net, base, loop, slope, payload, front_payload, survey, bias)
+                      model_pick, far_wall, net, base, loop, slope, payload, front_payload, survey, bias,
+                      args.language)
     directory = os.path.dirname(os.path.abspath(args.out))
     if directory and not os.path.isdir(directory):
         os.makedirs(directory)
@@ -498,8 +501,28 @@ def main(argv=None):
     return args.out
 
 
+PAGE_TITLE = {"zh": u"\u9888\u52a8\u8109\u516d\u53c2\u6570\u95ed\u73af\u4f18\u5316",
+              "en": u"Carotid Six-Parameter Demo"}
+VERDICT = {"zh": (u"\u4e24\u8005\u4e00\u81f4", u"\u4e24\u8005\u4e0d\u4e00\u81f4"),
+           "en": ("the model picks the same step", "they disagree here")}
+SURVEY = {
+    "zh": u"\u672c\u573a\u666f\u7684\u9009\u53d6\u4f9d\u636e\u662f\u8d77\u70b9\u7684\u5178\u578b"
+          u"\u6027\uff1a\u5176\u8d77\u59cb\u589e\u76ca\u504f\u5dee\u5904\u4e8e\u626b\u8fc7\u805a"
+          u"\u7126\u7684 %d \u4e2a\u6d4b\u8bd5\u96c6\u573a\u666f\u7684\u4e2d\u4f4d\u6570\uff08"
+          u"%.2f dB\uff09\uff0c\u4e14\u5728\u89c2\u5bdf\u7ed3\u679c\u4e4b\u524d\u5373\u5df2\u786e"
+          u"\u5b9a\u3002\u8be5\u7ec4\u573a\u666f\u7684\u95ed\u73af\u7ec8\u70b9\u4ecb\u4e8e %.2f "
+          u"\u4e0e %.2f dB \u4e4b\u95f4\uff0c\u4e2d\u4f4d\u6570 %.2f dB\uff1b\u5176\u4e2d %d \u4e2a"
+          u"\u573a\u666f\u7684\u6a21\u578b\u8f93\u51fa\u4e0e\u6c42\u89e3\u5668\u6700\u4f18\u805a"
+          u"\u7126\u6863\u4e00\u81f4\u3002",
+    "en": "This scene was selected for the typicality of its starting point: its initial gain deviation is "
+          "the median of the %d test-set scenes that swept the focus (%.2f dB), fixed before the outcome was "
+          "examined. Across those scenes the loop terminates between %.2f and %.2f dB, median %.2f dB, and "
+          "the model matches the solver's optimal focus step in %d of them.",
+}
+
+
 def build_html(family, frame, row, result, panel, steps, focus_cards, teacher_pick, model_pick,
-               far_wall, net, base, loop, slope, payload, front_payload, survey, bias):
+               far_wall, net, base, loop, slope, payload, front_payload, survey, bias, language="zh"):
     gain, tgc = result["backend"]["gain"], result["backend"]["tgc"]
     f = lambda key: float(net.get(key, float("nan")))
     b = lambda key: float(base.get(key, float("nan")))
@@ -563,7 +586,7 @@ def build_html(family, frame, row, result, panel, steps, focus_cards, teacher_pi
         "focus_swept": ", ".join("%g" % c["focus_mm"] for c in focus_cards),
         "focus_teacher": ", ".join("%g" % v for v in teacher_pick),
         "focus_model": ", ".join("%g" % v for v in model_pick),
-        "focus_verdict": ("the model picks the same step" if agree else "they disagree here"),
+        "focus_verdict": VERDICT[language][0 if agree else 1],
         "metrics": svg_metrics([("gain MAE", f("gain_mae_db"), b("gain_mae_db")),
                                 ("TGC MAE", f("tgc_mae_db"), b("tgc_mae_db"))], "%.2f dB"),
         "scores": svg_metrics([("gain direction F1", f("gain_dir_f1_derived"), b("gain_dir_f1_derived")),
@@ -586,22 +609,20 @@ def build_html(family, frame, row, result, panel, steps, focus_cards, teacher_pi
         "bias_within": ("%d" % bias["within_1db"]) if bias else "?",
         "bias_total": ("%d" % len(bias["subjects"])) if bias else "?",
         "bias_worst": ("%.1f" % bias["worst"]) if bias else "?",
-        "survey": ("" if not survey else
-                   "This scene was picked because its starting gain sits at the median of the %d test-set "
-                   "scenes that swept the focus (%.2f dB from the teacher&#8217;s optimum), chosen before "
-                   "looking at the outcome. Across those scenes the loop ends between %.2f and %.2f dB, "
-                   "median %.2f dB, and the model matches the teacher&#8217;s focus step in %d of them."
+        "survey": ("" if not survey else SURVEY[language]
                    % (survey["n"], survey["start_median"], survey["gain_best"], survey["gain_worst"],
                       survey["gain_median"], survey["focus_match"])),
         "epoch": str(payload.get("epoch")), "front_epoch": str(front_payload.get("epoch")),
     }
-    return Template(TEMPLATE).substitute(fields)
+    font = FONTS[language]
+    style = Template(STYLE).substitute({"display_font": font["display"], "body_font": font["body"]})
+    body = Template(BODY[language]).substitute(fields)
+    return Template(DOC).substitute({"lang": language, "page_title": PAGE_TITLE[language],
+                                     "font_link": font["link"], "style": style, "body": body})
 
 
-TEMPLATE = u"""<title>Carotid Six-Parameter Demo</title>
-<meta name="claude:viewport-fit-sides" content="cover">
-<style>
-/* 版式：一条窄栏讲一帧的故事，图像并排，数字跟在图下面 */
+STYLE = u"""<style>
+/* 版式：一条窄栏讲一帧的过程，图像并排，数字跟在图下面 */
 :root {
   color-scheme: light;
   --bg: #f5f5f2;
@@ -613,8 +634,8 @@ TEMPLATE = u"""<title>Carotid Six-Parameter Demo</title>
   --series-1: #2a78d6;
   --series-2: #eb6834;
   --series-3: #1baf7a;
-  --font-display: "Spectral", Georgia, serif;
-  --font-body: "Source Sans 3", "Segoe UI", system-ui, sans-serif;
+  --font-display: ${display_font};
+  --font-body: ${body_font};
   --font-data: ui-monospace, "SFMono-Regular", Consolas, monospace;
 }
 @media (prefers-color-scheme: dark) {
@@ -631,19 +652,21 @@ TEMPLATE = u"""<title>Carotid Six-Parameter Demo</title>
   --text-primary: #f0efec; --text-secondary: #c3c2b7; --text-muted: #8d8c83;
   --series-1: #3987e5; --series-2: #d95926; --series-3: #199e70;
 }
-body { background: var(--bg); color: var(--text-primary); font-family: var(--font-body); line-height: 1.55; }
+* { box-sizing: border-box; }
+body { background: var(--bg); color: var(--text-primary); font-family: var(--font-body);
+       line-height: 1.6; margin: 0; }
+img { max-width: 100%; }
 .wrap { max-width: 61rem; margin: 0 auto;
         padding-left: max(16px, env(safe-area-inset-left, 0px));
         padding-right: max(16px, env(safe-area-inset-right, 0px));
         padding-block: 2.5rem 4rem; }
-h1 { font-family: var(--font-display); font-size: clamp(1.7rem, 4.4vw, 2.5rem); line-height: 1.15;
-     margin: 0 0 .6rem; text-wrap: balance; font-weight: 600; }
-h2 { font-family: var(--font-display); font-size: 1.35rem; font-weight: 600; margin: 0 0 .4rem;
+h1 { font-family: var(--font-display); font-size: clamp(1.6rem, 4vw, 2.3rem); line-height: 1.25;
+     margin: 0 0 .7rem; text-wrap: balance; font-weight: 600; }
+h2 { font-family: var(--font-display); font-size: 1.3rem; font-weight: 600; margin: 0 0 .5rem;
      text-wrap: balance; }
 h3 { font-size: .9rem; margin: 0 0 .5rem; font-weight: 600; }
-.eyebrow { font-size: .72rem; letter-spacing: .14em; text-transform: uppercase; color: var(--text-muted);
-           margin: 0 0 .5rem; }
-.lede { font-size: 1.04rem; color: var(--text-secondary); max-width: 62ch; margin: 0 0 1.6rem; }
+.eyebrow { font-size: .74rem; letter-spacing: .12em; color: var(--text-muted); margin: 0 0 .5rem; }
+.lede { font-size: 1.02rem; color: var(--text-secondary); max-width: 62ch; margin: 0 0 1.6rem; }
 section { border-top: 1px solid var(--line); padding-block: 2rem 0; margin-top: 2.2rem; }
 section > p { color: var(--text-secondary); max-width: 66ch; }
 .hero-stats { display: grid; grid-template-columns: repeat(auto-fit, minmax(10.5rem, 1fr)); gap: 1px;
@@ -651,7 +674,7 @@ section > p { color: var(--text-secondary); max-width: 66ch; }
 .hero-stats div { background: var(--surface-1); padding: .85rem 1rem; min-width: 0; }
 .hero-stats b { display: block; font-family: var(--font-data); font-size: 1.5rem;
                 font-variant-numeric: tabular-nums; }
-.hero-stats span { font-size: .8rem; color: var(--text-muted); }
+.hero-stats span { font-size: .8rem; color: var(--text-muted); line-height: 1.45; }
 .triptych { display: grid; grid-template-columns: repeat(auto-fit, minmax(13rem, 1fr)); gap: 1rem;
             margin-top: 1.2rem; }
 .steps { display: grid; grid-template-columns: repeat(auto-fit, minmax(11rem, 1fr)); gap: 1rem;
@@ -660,15 +683,14 @@ section > p { color: var(--text-secondary); max-width: 66ch; }
              margin-top: 1.2rem; }
 figure { margin: 0; background: var(--surface-1); border: 1px solid var(--line); border-radius: 10px;
          padding: .7rem; min-width: 0; }
-figure img { display: block; width: 100%; max-width: 100%; border-radius: 4px; background: #000; }
-figcaption { font-size: .8rem; color: var(--text-secondary); margin-top: .55rem; display: grid; gap: .12rem; }
+figure img { display: block; width: 100%; border-radius: 4px; background: #000; }
+figcaption { font-size: .8rem; color: var(--text-secondary); margin-top: .55rem; display: grid; gap: .14rem; }
 figcaption b { color: var(--text-primary); font-size: .88rem; }
 figcaption span { font-family: var(--font-data); font-variant-numeric: tabular-nums; font-size: .76rem;
                   color: var(--text-muted); }
 .focus.picked { border-color: var(--series-1); }
-.mark { display: inline-block; font-family: var(--font-body); font-size: .68rem; letter-spacing: .06em;
-        text-transform: uppercase; border-radius: 999px; padding: .08rem .45rem; margin: .2rem .3rem 0 0;
-        border: 1px solid currentColor; }
+.mark { display: inline-block; font-family: var(--font-body); font-size: .7rem; letter-spacing: .04em;
+        border-radius: 999px; padding: .08rem .5rem; margin: .25rem .3rem 0 0; border: 1px solid currentColor; }
 .mark.model { color: var(--series-1); }
 .mark.teacher { color: var(--series-2); }
 .charts { display: grid; grid-template-columns: repeat(auto-fit, minmax(16rem, 1fr)); gap: 1rem;
@@ -682,126 +704,158 @@ figcaption span { font-family: var(--font-data); font-variant-numeric: tabular-n
 .series-label, .point-label { font-size: 11px; font-family: var(--font-data); fill: var(--text-secondary); }
 .series-label { font-weight: 600; }
 table { border-collapse: collapse; width: 100%; font-size: .88rem; margin-top: 1rem; }
-th, td { text-align: left; padding: .45rem .6rem; border-bottom: 1px solid var(--line); }
+th, td { text-align: left; padding: .5rem .6rem; border-bottom: 1px solid var(--line); }
 td.num { font-family: var(--font-data); font-variant-numeric: tabular-nums; text-align: right; }
-th { font-size: .74rem; letter-spacing: .08em; text-transform: uppercase; color: var(--text-muted);
-     font-weight: 600; }
+th { font-size: .76rem; letter-spacing: .06em; color: var(--text-muted); font-weight: 600; }
 .scroll { overflow-x: auto; }
 .note { font-size: .84rem; color: var(--text-muted); max-width: 68ch; margin: 0; }
 .off td { color: var(--text-muted); }
 footer { border-top: 1px solid var(--line); margin-top: 2.5rem; padding-top: 1.2rem; font-size: .82rem;
          color: var(--text-muted); }
 footer p { max-width: 72ch; }
-</style>
-<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Spectral:wght@500;600&family=Source+Sans+3:wght@400;600&display=swap">
-<div class="wrap">
+</style>"""
+
+
+FONTS = {
+    "en": {"link": '<link rel="stylesheet" href="https://fonts.googleapis.com/css2?'
+                   'family=Spectral:wght@500;600&family=Source+Sans+3:wght@400;600&display=swap">',
+           "display": '"Spectral", Georgia, serif',
+           "body": '"Source Sans 3", "Segoe UI", system-ui, sans-serif'},
+    # 中文页不依赖网络字体：本地字体栈在离线与异机上都能用
+    "zh": {"link": "",
+           "display": '"Source Han Serif SC", "Noto Serif CJK SC", "Songti SC", "SimSun", serif',
+           "body": '"Microsoft YaHei", "PingFang SC", "Noto Sans CJK SC", "Hiragino Sans GB", sans-serif'},
+}
+
+
+DOC = u"""<!doctype html>
+<html lang="${lang}">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>${page_title}</title>
+${font_link}
+${style}
+</head>
+<body>
+${body}
+</body>
+</html>
+"""
+
+
+BODY = {}
+
+BODY["en"] = u"""<div class="wrap">
   <p class="eyebrow">In-vivo carotid &middot; scene ${family} &middot; held-out test set</p>
-  <h1>One frame, six knobs, and what the network does with them</h1>
-  <p class="lede">Every image here is rendered from the same recorded envelope the console captured. Gain and
-  TGC do not change that envelope, only how it maps to grey, so what the model suggests can be shown exactly
-  rather than illustrated. This subject took no part in training or in model selection.</p>
+  <h1>One frame, six parameters, and what the network does with them</h1>
+  <p class="lede">Every image on this page is rendered from the same recorded envelope the console captured.
+  Gain and time-gain compensation do not change that envelope, only how it maps to grey, so the image under
+  the model&rsquo;s predicted parameters can be reconstructed exactly rather than illustrated. This subject
+  took no part in training or in model selection.</p>
   <div class="hero-stats">
-    <div><b>${net_tgc} dB</b><span>TGC error on 29 unseen subjects &mdash; lookup baseline ${base_tgc}</span></div>
-    <div><b>${net_gain} dB</b><span>gain error &mdash; lookup baseline ${base_gain}</span></div>
-    <div><b>${converged}%</b><span>back-end loops that stop, in 2&ndash;3 steps</span></div>
+    <div><b>${net_tgc} dB</b><span>TGC error on 29 unseen subjects &mdash; settings-lookup baseline ${base_tgc}</span></div>
+    <div><b>${net_gain} dB</b><span>gain error &mdash; settings-lookup baseline ${base_gain}</span></div>
+    <div><b>${converged}%</b><span>back-end loops that converge, in 2&ndash;3 iterations</span></div>
   </div>
 
   <section>
-    <p class="eyebrow">1 &middot; the suggestion</p>
-    <h2>Current setting, the model&rsquo;s suggestion, the teacher&rsquo;s optimum</h2>
-    <p>Frame ${frame}: ${depth} mm display depth, ${frequency} MHz harmonic, focus ${focus} mm, gain level
-    ${gain_level}, dynamic range ${dr}. The vessel&rsquo;s far wall sits at ${far_wall}. The console was left
-    with a flat TGC at 127, which is how 98.5% of these captures arrive.</p>
+    <p class="eyebrow">1 &middot; the prediction</p>
+    <h2>Acquisition setting, model prediction, solver optimum</h2>
+    <p>Frame ${frame}: ${depth} mm display depth, ${frequency} MHz harmonic, transmit focus ${focus} mm, gain
+    level ${gain_level}, dynamic range ${dr}. The vessel&rsquo;s far wall lies at ${far_wall}. All TGC bands
+    were at 127 on acquisition, as in 98.5% of this dataset.</p>
     <div class="triptych">
-      <figure><img src="${current_img}" alt="frame as captured"/><figcaption><b>As captured</b>
-        <span>gain level ${gain_level} &middot; TGC flat 127</span></figcaption></figure>
-      <figure><img src="${model_img}" alt="frame with the model's suggestion applied"/>
-        <figcaption><b>Model&rsquo;s suggestion</b>
-        <span>gain ${gain_clicks} clicks: ${gain_from} &rarr; ${gain_to} (${gain_db} dB)</span>
+      <figure><img src="${current_img}" alt="frame as acquired"/><figcaption><b>As acquired</b>
+        <span>gain level ${gain_level} &middot; TGC flat at 127</span></figcaption></figure>
+      <figure><img src="${model_img}" alt="frame under the model's prediction"/>
+        <figcaption><b>Model prediction</b>
+        <span>gain ${gain_clicks} levels: ${gain_from} &rarr; ${gain_to} (${gain_db} dB)</span>
         <span>TGC near ${tgc_near} &middot; mid ${tgc_mid} &middot; far ${tgc_far} levels</span></figcaption></figure>
-      <figure><img src="${teacher_img}" alt="frame with the teacher's optimum applied"/>
-        <figcaption><b>Teacher&rsquo;s optimum</b><span>gain ${teacher_gain_db} dB from the captured setting</span>
+      <figure><img src="${teacher_img}" alt="frame under the solver optimum"/>
+        <figcaption><b>Solver optimum</b><span>gain ${teacher_gain_db} dB from the acquired setting</span>
         <span>solved on this frame, not predicted</span></figcaption></figure>
     </div>
     <div class="charts">
-      <div class="card"><h3>TGC curves, in dB about the mid level</h3>${curves}</div>
-      <div class="card"><h3>Why the far field has to lift</h3>
-        <p class="note">Tissue attenuates, so the deep bands need more gain than the shallow ones. The teacher
-        solves for the curve that brings every depth to the brightness this operator accepted; the network
-        predicts that curve from the frame&rsquo;s own depth profile. That is why it transfers almost unchanged
-        to new people: 0.23 dB on subjects it trained on, ${net_tgc} dB on these.</p></div>
+      <div class="card"><h3>TGC curve, dB about the mid level</h3>${curves}</div>
+      <div class="card"><h3>Why the far field has to be lifted</h3>
+        <p class="note">Attenuation accumulates with depth, so the deep bands require more gain than the
+        shallow ones. The solver finds the curve that brings every depth to the brightness the operator
+        accepted in that session; the network predicts that curve from the frame&rsquo;s own depth profile,
+        which is why it transfers almost unchanged to new subjects: 0.23 dB on subjects used in training,
+        ${net_tgc} dB here.</p></div>
     </div>
   </section>
 
   <section>
     <p class="eyebrow">2 &middot; the loop</p>
-    <h2>Suggest, apply, look again &mdash; until it stops</h2>
-    <p>The back-end half of the closed loop runs exactly on a recorded frame: gain and TGC change the render,
-    not the envelope, so the model can be asked again about the image it just produced. This trajectory took
-    ${loop_steps} step(s).</p>
+    <h2>Predict, apply, observe again &mdash; until the criterion is met</h2>
+    <p>The back-end loop can be reproduced exactly on a recorded frame: gain and TGC change the render, not
+    the envelope, so the model can be queried again on the image it has just produced. This trajectory took
+    ${loop_steps} iteration(s).</p>
     <div class="steps">${steps}</div>
     <div class="charts">
-      <div class="card"><h3>Gain, dB from the teacher&rsquo;s optimum</h3>${gain_chart}</div>
-      <div class="card"><h3>TGC, dB from the teacher&rsquo;s optimum</h3>${tgc_chart}</div>
+      <div class="card"><h3>Gain, dB from the solver optimum</h3>${gain_chart}</div>
+      <div class="card"><h3>TGC, dB from the solver optimum</h3>${tgc_chart}</div>
     </div>
-    <p class="note">Over all 2631 frames of the 28 validation subjects, ${converged1}% of the loops stop; gain
-    error falls ${loop_gain_start} &rarr; ${loop_gain_final} dB and TGC ${loop_tgc_start} &rarr;
-    ${loop_tgc_final} dB. The stopping point lands on the single-step accuracy, so nothing accumulates around
-    the loop.</p>
+    <p class="note">Over all 2631 frames of the 28 validation subjects, ${converged1}% of the trajectories
+    converge; the gain deviation falls ${loop_gain_start} &rarr; ${loop_gain_final} dB and TGC
+    ${loop_tgc_start} &rarr; ${loop_tgc_final} dB. The stopping point coincides with the single-step accuracy,
+    so no error accumulates around the loop.</p>
   </section>
 
   <section>
     <p class="eyebrow">3 &middot; the front end</p>
-    <h2>Transmit focus: six real captures from one probe position</h2>
-    <p>Focus changes the envelope itself, so these are six separate captures from the same probe position,
-    each rendered at its own solved back end so that what differs is the focus and not the brightness. Swept:
-    ${focus_swept} mm. The teacher picks ${focus_teacher} mm, the model picks ${focus_model} mm &mdash;
-    ${focus_verdict}.</p>
+    <h2>Transmit focus: six acquisitions at one probe position</h2>
+    <p>Transmit focus changes the envelope itself, so these are six separate acquisitions at the same probe
+    position, each rendered under its own solved back end so that the difference comes from the focus alone.
+    Swept: ${focus_swept} mm. The solver optimum is ${focus_teacher} mm and the model predicts
+    ${focus_model} mm &mdash; ${focus_verdict}.</p>
     <div class="focus-row">${focus_cards}</div>
-    <p class="note">Focus is the weakest of the three working axes: ${net_focus} exact hits against the lookup
-    baseline&rsquo;s ${base_focus} on the test subjects, but about 0.99 on subjects it trained on, so most of
-    that head is memorising rather than generalising. Depth, frequency and dynamic range are switched off
-    entirely &mdash; their labels can be guessed from the current setting without looking at the image, so
-    there is nothing for the network to learn from them yet.</p>
+    <p class="note">Transmit focus is the weakest of the three working axes: ${net_focus} top-1 accuracy
+    against the settings-lookup baseline&rsquo;s ${base_focus} on the test subjects, but about 0.99 on
+    subjects used in training, so that head is largely memorising rather than generalising. Display depth,
+    transmit frequency and dynamic range are excluded from training: their labels follow from the current
+    setting without reference to the image, leaving nothing for the network to learn.</p>
   </section>
 
   <section>
-    <p class="eyebrow">4 &middot; where the error lives</p>
-    <h2>The gain residual is one number per subject</h2>
-    <p>Averaged over frames the gain lands ${loop_gain_final} dB from the teacher, but that average hides the
-    shape of the error. Within one subject the model is consistent to ${bias_sd} dB; what varies is a constant
-    offset for that subject, in either direction. ${bias_share}% of the squared error is this per-subject bias
-    rather than frame-to-frame scatter.</p>
+    <p class="eyebrow">4 &middot; the structure of the error</p>
+    <h2>The gain residual is a constant offset per subject</h2>
+    <p>Averaged over frames the gain converges to ${loop_gain_final} dB from the solver optimum, but that
+    average hides the structure of the error. Within one subject the model is consistent to ${bias_sd} dB;
+    what varies is a constant offset for that subject, in either direction. ${bias_share}% of the squared
+    error is this between-subject bias rather than frame-to-frame scatter.</p>
     <div class="charts">
       <div class="card"><h3>Gain bias per validation subject</h3>${bias_strip}</div>
-      <div class="card"><h3>What that means on the machine</h3>
-        <p class="note">${bias_within} of ${bias_total} subjects land inside &plusmn;1 dB. The rest are off by
-        up to ${bias_worst} dB &mdash; every frame of that subject by the same amount, so a single correction
-        by the operator fixes the whole examination. This is the part of the target a single image cannot
-        carry: the teacher&rsquo;s brightness target was measured from the frames this operator accepted in
-        that session, and some sessions ran brighter or darker than that operator&rsquo;s own average.</p></div>
+      <div class="card"><h3>What this implies in use</h3>
+        <p class="note">${bias_within} of ${bias_total} subjects lie within &plusmn;1 dB. The remainder
+        deviate by up to ${bias_worst} dB, and every frame of such a subject deviates by the same amount, so
+        a single manual correction restores the whole examination. This is the component a single image
+        cannot carry: the solver&rsquo;s brightness target was measured from the frames the operator accepted
+        in that session, and sessions differ in their overall brightness.</p></div>
     </div>
   </section>
 
   <section>
-    <p class="eyebrow">5 &middot; the numbers</p>
-    <h2>Against &ldquo;just remember the setting&rdquo;</h2>
-    <p>The baseline is the honest one: for each combination of imaging mode, depth, frequency and focus, the
-    median optimum of the training subjects, applied to the test subjects. Beating it is the whole question &mdash;
-    on phantom data the network could not.</p>
+    <p class="eyebrow">5 &middot; the comparison</p>
+    <h2>Against the settings-lookup baseline</h2>
+    <p>The baseline is constructed as follows: for each combination of imaging mode, display depth, transmit
+    frequency and transmit focus, the median optimum over the training subjects, applied to the test
+    subjects. Whether it can be beaten is the central question &mdash; on phantom data it could not.</p>
     <div class="charts">
       <div class="card"><h3>Error, lower is better</h3>${metrics}</div>
-      <div class="card"><h3>Agreement with the teacher, higher is better</h3>${scores}</div>
+      <div class="card"><h3>Agreement with the solver, higher is better</h3>${scores}</div>
     </div>
     <div class="scroll"><table>
-      <thead><tr><th>Axis</th><th>Network</th><th>Lookup</th><th>State</th></tr></thead>
+      <thead><tr><th>Parameter</th><th>Proposed</th><th>Lookup</th><th>Status</th></tr></thead>
       <tbody>
-        <tr><td>TGC, 8 bands</td><td class="num">${net_tgc3} dB</td><td class="num">${base_tgc3} dB</td><td>working</td></tr>
-        <tr><td>Gain</td><td class="num">${net_gain3} dB</td><td class="num">${base_gain3} dB</td><td>working</td></tr>
-        <tr><td>Transmit focus</td><td class="num">${net_focus}</td><td class="num">${base_focus}</td><td>marginal</td></tr>
-        <tr class="off"><td>Display depth</td><td class="num">&mdash;</td><td class="num">0.775</td><td>off: guessable from the setting</td></tr>
-        <tr class="off"><td>Transmit frequency</td><td class="num">&mdash;</td><td class="num">0.946</td><td>off: guessable from the setting</td></tr>
-        <tr class="off"><td>Dynamic range</td><td class="num">&mdash;</td><td class="num">&mdash;</td><td>off: no criterion in the labels</td></tr>
+        <tr><td>TGC, 8 bands</td><td class="num">${net_tgc3} dB</td><td class="num">${base_tgc3} dB</td><td>usable</td></tr>
+        <tr><td>Gain</td><td class="num">${net_gain3} dB</td><td class="num">${base_gain3} dB</td><td>usable</td></tr>
+        <tr><td>Transmit focus</td><td class="num">${net_focus}</td><td class="num">${base_focus}</td><td>marginally above the baseline</td></tr>
+        <tr class="off"><td>Display depth</td><td class="num">&mdash;</td><td class="num">0.775</td><td>not trained: label follows from the setting</td></tr>
+        <tr class="off"><td>Transmit frequency</td><td class="num">&mdash;</td><td class="num">0.946</td><td>not trained: label follows from the setting</td></tr>
+        <tr class="off"><td>Dynamic range</td><td class="num">&mdash;</td><td class="num">&mdash;</td><td>not trained: no criterion in the labels</td></tr>
       </tbody>
     </table></div>
   </section>
@@ -813,6 +867,98 @@ footer p { max-width: 72ch; }
     three. Back-end labels are solved per frame against the brightness the operator accepted in that session;
     the front-end target depth comes from provisional readings of the vessel&rsquo;s far wall. Checkpoints:
     back end epoch ${epoch}, front end epoch ${front_epoch}.</p>
+  </footer>
+</div>
+"""
+
+
+BODY["zh"] = u"""<div class="wrap">
+  <p class="eyebrow">颈动脉在体数据 &middot; 场景 ${family} &middot; 留出测试集</p>
+  <h1>一帧图像上的六参数闭环优化</h1>
+  <p class="lede">本页全部图像均由主机记录的同一组原始回波数据渲染得到。增益与时间增益补偿不改变回波数据本身，仅改变其到灰阶的映射，因此模型输出参数下的图像可以被精确重建，而非示意。本受试者取自留出测试集，未参与训练与模型选择。</p>
+  <div class="hero-stats">
+    <div><b>${net_tgc} dB</b><span>时间增益补偿误差（29 位未见过的受试者）；设置查表基线 ${base_tgc}</span></div>
+    <div><b>${net_gain} dB</b><span>增益误差；设置查表基线 ${base_gain}</span></div>
+    <div><b>${converged}%</b><span>后端闭环收敛比例，均在 2&ndash;3 次迭代内</span></div>
+  </div>
+
+  <section>
+    <p class="eyebrow">一 &middot; 模型输出</p>
+    <h2>采集设置、模型输出与求解器最优解</h2>
+    <p>帧 ${frame}：显示深度 ${depth} mm，发射频率 ${frequency} MHz（谐波成像），发射聚焦 ${focus} mm，增益档位 ${gain_level}，动态范围 ${dr}。血管远壁位于 ${far_wall}。采集时时间增益补偿各段均为 127，本数据集中 98.5% 的帧为该设置。</p>
+    <div class="triptych">
+      <figure><img src="${current_img}" alt="采集状态"/><figcaption><b>采集状态</b>
+        <span>增益档位 ${gain_level} &middot; 时间增益补偿各段 127</span></figcaption></figure>
+      <figure><img src="${model_img}" alt="模型输出参数下的图像"/>
+        <figcaption><b>模型输出</b>
+        <span>增益 ${gain_clicks} 档：${gain_from} &rarr; ${gain_to}（${gain_db} dB）</span>
+        <span>时间增益补偿 近场 ${tgc_near} &middot; 中场 ${tgc_mid} &middot; 远场 ${tgc_far} 档</span></figcaption></figure>
+      <figure><img src="${teacher_img}" alt="求解器最优解下的图像"/>
+        <figcaption><b>求解器最优解</b><span>相对采集设置 ${teacher_gain_db} dB</span>
+        <span>在本帧上求解得到，非预测</span></figcaption></figure>
+    </div>
+    <div class="charts">
+      <div class="card"><h3>时间增益补偿曲线（以中位档为零点，单位 dB）</h3>${curves}</div>
+      <div class="card"><h3>远场增益上抬的成因</h3>
+        <p class="note">组织衰减随深度累积，深部各段需要更高的增益。求解器求解的是使各深度达到本场次操作者所接受亮度的曲线；网络由该帧自身的逐行深度剖面预测这条曲线，因此在新受试者上几乎不衰减：训练集受试者 0.23 dB，本测试集 ${net_tgc} dB。</p></div>
+    </div>
+  </section>
+
+  <section>
+    <p class="eyebrow">二 &middot; 闭环迭代</p>
+    <h2>输出、执行、重新观测，直至停止判据满足</h2>
+    <p>后端闭环可在已记录的帧上精确复现：增益与时间增益补偿只改变渲染、不改变回波数据，因此可以对模型刚刚产生的图像再次提问。本轨迹共 ${loop_steps} 次迭代。</p>
+    <div class="steps">${steps}</div>
+    <div class="charts">
+      <div class="card"><h3>增益与求解器最优解的偏差（dB）</h3>${gain_chart}</div>
+      <div class="card"><h3>时间增益补偿与最优解的偏差（dB）</h3>${tgc_chart}</div>
+    </div>
+    <p class="note">在 28 位验证受试者的全部 2631 帧上，${converged1}% 的轨迹收敛；增益偏差由 ${loop_gain_start} 降至 ${loop_gain_final} dB，时间增益补偿由 ${loop_tgc_start} 降至 ${loop_tgc_final} dB。收敛点与单步精度一致，迭代过程中不存在误差累积。</p>
+  </section>
+
+  <section>
+    <p class="eyebrow">三 &middot; 前端参数</p>
+    <h2>发射聚焦：同一探头位置的六档实采图像</h2>
+    <p>发射聚焦改变回波数据本身，因此以下为同一探头位置下分别采集的六帧，各自渲染于其求解器最优后端设置，以使差异仅来自聚焦。扫描档位：${focus_swept} mm。求解器最优档为 ${focus_teacher} mm，模型输出为 ${focus_model} mm&mdash;&mdash;${focus_verdict}。</p>
+    <div class="focus-row">${focus_cards}</div>
+    <p class="note">发射聚焦是三根可用轴中最弱的一根：测试集首选命中率 ${net_focus}，设置查表基线 ${base_focus}；而在训练集受试者上约为 0.99，说明该输出头以记忆为主、泛化有限。显示深度、发射频率与动态范围未参与训练：其标签可由当前设置直接推得、不依赖图像，网络无从学习。</p>
+  </section>
+
+  <section>
+    <p class="eyebrow">四 &middot; 误差的分布形态</p>
+    <h2>增益残差以受试者为单位呈常数偏置</h2>
+    <p>按帧平均，增益收敛于与求解器最优解相差 ${loop_gain_final} dB，但该平均值掩盖了误差的结构。同一受试者内部，模型的一致性达 ${bias_sd} dB；变化的是该受试者整体的常数偏置，正负皆有。平方误差中 ${bias_share}% 来自这一受试者间偏置，而非帧间离散。</p>
+    <div class="charts">
+      <div class="card"><h3>验证集各受试者的增益偏置</h3>${bias_strip}</div>
+      <div class="card"><h3>实际使用中的含义</h3>
+        <p class="note">${bias_total} 位受试者中有 ${bias_within} 位的偏置在 &plusmn;1 dB 以内；其余最大偏离 ${bias_worst} dB，且该受试者每一帧的偏离量相同，因此一次人工校正即可修正整次检查。这正是单帧图像无法承载的分量：求解器的亮度目标由本场次操作者所接受的帧测得，不同场次的整体亮度存在差异。</p></div>
+    </div>
+  </section>
+
+  <section>
+    <p class="eyebrow">五 &middot; 对照实验</p>
+    <h2>与设置查表基线的对照</h2>
+    <p>基线构造如下：对每一组（成像模式、显示深度、发射频率、发射聚焦），取训练集受试者最优解的中位数，应用于测试集受试者。能否超过该基线是本工作的核心问题——在体模数据上网络未能做到。</p>
+    <div class="charts">
+      <div class="card"><h3>误差，数值越低越优</h3>${metrics}</div>
+      <div class="card"><h3>与求解器的一致性，数值越高越优</h3>${scores}</div>
+    </div>
+    <div class="scroll"><table>
+      <thead><tr><th>参数轴</th><th>本方法</th><th>查表基线</th><th>状态</th></tr></thead>
+      <tbody>
+        <tr><td>时间增益补偿（8 段）</td><td class="num">${net_tgc3} dB</td><td class="num">${base_tgc3} dB</td><td>可用</td></tr>
+        <tr><td>增益</td><td class="num">${net_gain3} dB</td><td class="num">${base_gain3} dB</td><td>可用</td></tr>
+        <tr><td>发射聚焦</td><td class="num">${net_focus}</td><td class="num">${base_focus}</td><td>略优于基线</td></tr>
+        <tr class="off"><td>显示深度</td><td class="num">&mdash;</td><td class="num">0.775</td><td>未训练：标签可由设置推得</td></tr>
+        <tr class="off"><td>发射频率</td><td class="num">&mdash;</td><td class="num">0.946</td><td>未训练：标签可由设置推得</td></tr>
+        <tr class="off"><td>动态范围</td><td class="num">&mdash;</td><td class="num">&mdash;</td><td>未训练：标签缺少判据</td></tr>
+      </tbody>
+    </table></div>
+  </section>
+
+  <footer>
+    <p>${survey}</p>
+    <p>数据集共 17545 帧，来自 189 位受试者、跨 9 个采集日，L15-4 探头，谐波成像。训练前按受试者划分：训练 132 位、验证 28 位、测试 29 位，每个采集日均出现于三个集合。后端标签逐帧求解，目标为本场次操作者所接受的亮度；前端目标深度来自血管远壁的阶段性阅片结果。检查点：后端第 ${epoch} 轮，前端第 ${front_epoch} 轮。</p>
   </footer>
 </div>
 """
