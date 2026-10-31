@@ -349,6 +349,28 @@ def section_target(groups, per_subject, features, calibration, db_per_gray):
                 np.median([g["sd_gray"] for g in groups if np.isfinite(g["sd_gray"])])))
         emit("    (the recovery is only used as a check; everything below uses the stored target)")
     emit()
+    values = stored
+    median = float(np.median(values))
+    robust = float(np.median(np.abs(values - median)) * 1.4826)
+    flagged = sorted([(key, float(g["target_gray"]))
+                      for key, g in calibration.items()
+                      if abs(float(g["target_gray"]) - median) > 3 * robust], key=lambda kv: kv[1])
+    emit("  sessions whose target sits beyond 3 robust sd (%.1f gray) of the median %.1f: %d of %d"
+         % (robust, median, len(flagged), len(values)))
+    for key, value in flagged:
+        emit("    %-24s target %3.0f gray  (z %+.1f)" % (key, value, (value - median) / robust))
+    on_split = [s for s in per_subject
+                if any(k.startswith(s["subject"]) for k, _ in flagged)]
+    if on_split:
+        weight = np.asarray([s["n"] for s in per_subject], float)
+        mae = np.asarray([s["mae"] for s in per_subject], float)
+        keep = np.asarray([s not in on_split for s in per_subject])
+        emit("  on this split %d of them show up; gain MAE %.3f dB -> %.3f dB without them"
+             % (len(on_split), float((mae * weight).sum() / weight.sum()),
+                float((mae[keep] * weight[keep]).sum() / weight[keep].sum())))
+        emit("  a target near the noise floor or near saturation is more likely a mis-measured")
+        emit("  label than an operator preference; these sessions are worth re-measuring.")
+    emit()
 
 
 def section_verdict(per_subject, features, db_per_gray):
