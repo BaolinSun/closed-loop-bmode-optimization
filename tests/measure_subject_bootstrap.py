@@ -106,10 +106,9 @@ SHOWN = ("gain_mae_db", "gain_within_deadband", "tgc_mae_db", "focus_top1", "foc
          "depth_top1", "frequency_top1")
 
 
-def section_table(stats, draws):
+def section_table(stats, draws, other="settings lookup"):
     emit("--- 1. metric by metric, 95%% cluster bootstrap over subjects (%d draws) ---" % draws)
-    emit("  %-22s %18s %18s %20s %7s" % ("metric", "network", "settings lookup",
-                                         "difference", "favours"))
+    emit("  %-22s %18s %18s %20s %7s" % ("metric", "network", other, "difference", "favours"))
     for name in SHOWN:
         if name not in stats:
             continue
@@ -208,6 +207,9 @@ def parse_args(argv=None):
     parser = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     parser.add_argument("--run", default=os.path.join(ROOT, "runs", "invivo_bf_v2"))
     parser.add_argument("--groups", choices=("val", "test"), default="test")
+    parser.add_argument("--compare", default=None,
+                        help="another run directory: compare the two models on the same frames "
+                             "instead of comparing against the settings-lookup baseline")
     parser.add_argument("--cache", default=str(DPATH.output_dir("console_dl_cache_invivo_carotid")))
     parser.add_argument("--labels", default=os.path.join(
         ROOT, "data", "labels_console_invivo_carotid_target.jsonl"))
@@ -244,7 +246,26 @@ def main(argv=None):
 
     with torch.no_grad():
         preds, tg = predict(model, data, builder, eval_idx, start="label", batch_size=args.batch_size)
-    base_preds, base_tg = settings_lookup_baseline(data, train_idx, eval_idx, start="label")
+    if args.compare:
+        other_fold = os.path.join(args.compare, "fold_0")
+        other, other_builder, other_payload, other_front = load_combined(
+            os.path.join(other_fold, "best_frontend.pt"), os.path.join(other_fold, "best_backend.pt"),
+            args.device)
+        if other_payload["ladders"] != payload["ladders"]:
+            raise SystemExit("the two runs were trained on different ladders")
+        if other_payload["config"].get("scalar_norm") != payload["config"].get("scalar_norm"):
+            emit("  WARNING: the two runs use different --scalar-norm (%s vs %s); each model is fed"
+                 % (payload["config"].get("scalar_norm"), other_payload["config"].get("scalar_norm")))
+            emit("  through its own builder, but the comparison then mixes two changes at once.")
+        emit("  comparing against %s (front end epoch %s + back end epoch %s)"
+             % (other_fold, other_front.get("epoch"), other_payload.get("epoch")))
+        with torch.no_grad():
+            # 必须用对方自己的 builder：--scalar-norm 不同的两个 run 之间，输入标量的
+            # 归一化方式不一样，借用 builder 会把模型喂坏
+            base_preds, base_tg = predict(other, data, other_builder, eval_idx, start="label",
+                                          batch_size=args.batch_size)
+    else:
+        base_preds, base_tg = settings_lookup_baseline(data, train_idx, eval_idx, start="label")
     emit("  forward pass done in %.0f s" % (time.time() - started))
     emit()
 
@@ -276,7 +297,8 @@ def main(argv=None):
             "ties": int((per_net == per_base).sum()),
         }
 
-    section_table(stats, args.draws)
+    section_table(stats, args.draws, os.path.basename(args.compare.rstrip("/\\")) if args.compare
+                  else "settings lookup")
     section_sign(stats)
     section_focus(stats, args.draws)
     section_subjects(stats)
