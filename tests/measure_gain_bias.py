@@ -14,8 +14,10 @@
 
     怎么判
 
-决定性的一步在第 5 节：把每个（场次, 成像模式）组**被接受的组织亮度**从已有数字里反解出来。
-后端求解器的定心增益是
+决定性的一步在第 5 节：每个（场次, 成像模式）组**被接受的组织亮度** target_gray 就存在标定
+文件 console_calibration_invivo_carotid.json 里（tissue.measure_accepted_brightness 测的，正是
+后端标签的目标），直接取来与模型的受试者偏置对照。同时按后端求解器的定心增益反解一遍作交叉
+验证：
 
     optimal_gain_db = (target_gray - 43) * window_db / 255 + reference_db - tissue_median_db
 
@@ -24,9 +26,16 @@
 
     target_gray = 43 + 255 / window_db * (optimal_gain_db - reference_db + tissue_median_db)
 
-一组之内 target_gray 是常数，所以组内散布量的是反解噪声（应当只有几个灰阶），组间散布量的
-才是场次之间的目标漂移。再看模型的受试者偏置与这个目标的相关：网络看不见目标，若两者强相关，
+一组之内 target_gray 是常数，所以反解值的组内散布量的是反解噪声，与存着的值对照即可验证这条
+推导。再看模型的受试者偏置与这个目标的相关：网络只看图像，看不见本场次的目标，若两者强相关，
 那 1.37 dB 里的大头就是标签侧的漂移，模型再调也降不下去。
+
+判别「模型没学到」与「标签漂移」的关键是把最优增益拆成两部分：
+
+    optimal_gain_db = [reference_db - tissue_median_db] + [(target_gray - 43) * window_db / 255]
+                       ^ 图像可见（网络看得到）          ^ 场次主观（网络看不到）
+
+偏置若与可见部分相关，是模型没学好；若只与主观部分相关，是标签漂移。
 
 缓存里的 db 是 BC0/counts_per_db 加本组深度响应（正是解后端标签时用的那张 dB 图），floor 是
 本组底噪加同一条深度响应，因此组织掩膜按 db > floor + 3 dB 取，与标注时同口径（缓存按行存
@@ -205,14 +214,26 @@ def find_run(run, tag):
     return fold, files[0]
 
 
+def read_calibration(path):
+    """(场次/模式) -> 本组被接受的组织亮度等标定量。"""
+    with io.open(path, encoding="utf-8") as handle:
+        payload = json.load(handle)
+    out = {}
+    for group in payload.get("groups", []):
+        if group.get("target_gray") is None:
+            continue
+        out["%s/%d" % (group["session"], int(group["image_mode"]))] = group
+    return out
+
+
 def subject_of(row):
     return row["group_id"].rsplit("/", 1)[0]
 
 
 # ---------------------------------------------------------------------------------------
 
-def section_subjects(per_subject):
-    emit("--- 1. per-subject gain bias on the held-out test set ---")
+def section_subjects(per_subject, split):
+    emit("--- 1. per-subject gain bias on the %s split ---" % split)
     bias = np.asarray([s["bias"] for s in per_subject])
     sd = np.asarray([s["sd"] for s in per_subject])
     frames = int(sum(s["n"] for s in per_subject))
@@ -259,8 +280,11 @@ def section_days(per_subject):
 def section_features(per_subject, features):
     emit("--- 3. per-subject features vs bias (n=%d) ---" % len(per_subject))
     bias = [s["bias"] for s in per_subject]
-    rows = []
+    rows, constant = [], []
     for name, values in features:
+        if np.nanstd(np.asarray(values, float)) == 0:
+            constant.append(name)
+            continue
         r, n = pearson(values, bias)
         rows.append((name, r, spearman(values, bias), fisher_p(r, n), n))
     rows.sort(key=lambda row: -abs(row[1]) if np.isfinite(row[1]) else 0.0)
@@ -270,6 +294,8 @@ def section_features(per_subject, features):
     emit()
     emit("  p is a normal approximation; with %d features the Bonferroni 0.05 threshold is %.4f"
          % (len(rows), 0.05 / max(1, len(rows))))
+    if constant:
+        emit("  constant over this split, left out: %s" % ", ".join(constant))
     emit()
     return rows
 
@@ -277,14 +303,15 @@ def section_features(per_subject, features):
 def section_models(per_subject, features, days):
     emit("--- 4. multivariate explanatory power ---")
     bias = np.asarray([s["bias"] for s in per_subject])
-    table = [("acquisition day (one-hot)", one_hot([s["day"] for s in per_subject]))]
     lookup = dict(features)
-    for name in ("accepted_target_gray", "reference_db", "tissue_median_db", "harmonic_fraction"):
+    table = [("acquisition day (one-hot)", one_hot([s["day"] for s in per_subject]))]
+    for name in ("session_target_gray", "recovered_target_gray", "visible_part_db",
+                 "reference_db", "tissue_median_db"):
         if name in lookup and np.isfinite(np.asarray(lookup[name], float)).all():
             table.append((name, [lookup[name]]))
-    if "accepted_target_gray" in lookup and "reference_db" in lookup:
-        table.append(("accepted_target_gray + reference_db",
-                      [lookup["accepted_target_gray"], lookup["reference_db"]]))
+    if "session_target_gray" in lookup and "visible_part_db" in lookup:
+        table.append(("session_target_gray + visible_part_db",
+                      [lookup["session_target_gray"], lookup["visible_part_db"]]))
     emit("  %-38s %7s %9s %4s" % ("predictors", "R2", "adj R2", "k"))
     for name, columns in table:
         r2, adj, k = ols_r2(columns, bias)
@@ -292,38 +319,75 @@ def section_models(per_subject, features, days):
     emit()
 
 
-def section_target(groups, per_subject, features):
-    emit("--- 5. label side: accepted tissue brightness recovered per group ---")
-    within = np.asarray([g["sd_gray"] for g in groups if np.isfinite(g["sd_gray"])])
-    target = np.asarray([g["target_gray"] for g in groups])
-    db_per_gray = np.asarray([g["db_per_gray"] for g in groups])
-    emit("  groups %d (session x imaging mode), frames used %d"
-         % (len(groups), int(sum(g["n"] for g in groups))))
-    emit("  within-group sd of the recovered target   median %.1f gray  (recovery noise;"
-         % np.median(within))
-    emit("                                             a group's target is a constant by"
-         " construction)")
-    emit("  between-group sd of the target            %.1f gray = %.2f dB"
-         % (target.std(ddof=1), target.std(ddof=1) * np.median(db_per_gray)))
-    for mode in sorted(set(g["mode"] for g in groups)):
-        values = np.asarray([g["target_gray"] for g in groups if g["mode"] == mode])
-        emit("    %-11s groups %3d, target %5.1f +- %4.1f gray (range %.0f - %.0f)"
-             % (mode, len(values), values.mean(), values.std(ddof=1), values.min(), values.max()))
+def section_target(groups, per_subject, features, calibration, db_per_gray):
+    emit("--- 5. label side: the accepted tissue brightness of each session ---")
+    stored = np.asarray([float(g["target_gray"]) for g in calibration.values()])
+    emit("  target_gray is measured per (session, imaging mode) by tissue.measure_accepted_brightness")
+    emit("  and is exactly what the back-end labels are solved against.")
+    emit("  groups %d: target %.1f +- %.1f gray (range %.0f - %.0f) = +-%.2f dB at %.3f dB/gray"
+         % (len(stored), stored.mean(), stored.std(ddof=1), stored.min(), stored.max(),
+            stored.std(ddof=1) * db_per_gray, db_per_gray))
     by_day = collections.defaultdict(list)
-    for g in groups:
-        by_day[g["day"]].append(g["target_gray"])
+    for key, group in calibration.items():
+        by_day[key[:8]].append(float(group["target_gray"]))
     day_means = np.asarray([np.mean(v) for v in by_day.values()])
-    emit("  between-day sd of the target              %.1f gray = %.2f dB"
-         % (day_means.std(ddof=1), day_means.std(ddof=1) * np.median(db_per_gray)))
+    within_day = np.concatenate([np.asarray(v) - np.mean(v) for v in by_day.values()])
+    emit("  between-day sd                 %.1f gray = %.2f dB"
+         % (day_means.std(ddof=1), day_means.std(ddof=1) * db_per_gray))
+    emit("  between-session within day sd  %.1f gray = %.2f dB"
+         % (within_day.std(ddof=1), within_day.std(ddof=1) * db_per_gray))
+    emit("  => the drift is per session, not per day.")
     emit()
+    if groups:
+        diff = np.asarray([g["recovered_gray"] - g["stored_gray"] for g in groups
+                           if np.isfinite(g["recovered_gray"])])
+        r, n = pearson([g["recovered_gray"] for g in groups], [g["stored_gray"] for g in groups])
+        emit("  cross-check of the algebraic recovery against the stored target:")
+        emit("    groups %d, r = %+.2f, offset %+.1f gray, scatter %.1f gray,"
+             " within-group sd %.1f gray"
+             % (n, r, diff.mean(), diff.std(ddof=1),
+                np.median([g["sd_gray"] for g in groups if np.isfinite(g["sd_gray"])])))
+        emit("    (the recovery is only used as a check; everything below uses the stored target)")
+    emit()
+
+
+def section_verdict(per_subject, features, db_per_gray):
+    emit("--- 6. verdict: how much of the gain residual is label-side drift ---")
     lookup = dict(features)
-    if "accepted_target_gray" in lookup:
-        bias = [s["bias"] for s in per_subject]
-        r, n = pearson(lookup["accepted_target_gray"], bias)
-        emit("  model bias vs the session's own accepted target:  r = %+.2f (n = %d, p ~ %.4f)"
-             % (r, n, fisher_p(r, n)))
-        emit("  the network only sees the image, so it cannot know this target; a strong positive")
-        emit("  correlation means that much of the residual is label-side drift, not model error.")
+    bias = np.asarray([s["bias"] for s in per_subject], float)
+    target = np.asarray(lookup["session_target_gray"], float)
+    visible = np.asarray(lookup["visible_part_db"], float)
+    r_target, n = pearson(target, bias)
+    r_visible, _ = pearson(visible, bias)
+    slope = np.polyfit(target * db_per_gray, bias, 1)[0]
+    explained = abs(r_target) * bias.std(ddof=1)
+    emit("  bias vs the session's accepted target   r = %+.2f  (p ~ %.4f)"
+         % (r_target, fisher_p(r_target, n)))
+    emit("  bias vs the image-visible part          r = %+.2f  (p ~ %.4f)"
+         % (r_visible, fisher_p(r_visible, n)))
+    emit("  slope against the target                %.2f dB per dB of target drift"
+         " (1.0 = the model ignores the drift entirely)" % slope)
+    emit()
+    emit("  variance budget of the per-subject bias (sd %.2f dB):" % bias.std(ddof=1))
+    emit("    explained by the session target       %.2f dB" % explained)
+    emit("    left over                             %.2f dB"
+         % math.sqrt(max(0.0, bias.std(ddof=1) ** 2 - explained ** 2)))
+    emit("    within-subject sd (median)            %.2f dB" % np.median([s["sd"] for s in per_subject]))
+    emit()
+    weight = np.asarray([s["n"] for s in per_subject], float)
+    mae = float((np.asarray([s["mae"] for s in per_subject]) * weight).sum() / weight.sum())
+    mae_centred = float((np.asarray([s["mae_centred"] for s in per_subject]) * weight).sum()
+                        / weight.sum())
+    emit("  what one calibration per wearing would buy (frame-weighted over this split):")
+    emit("    gain MAE as it stands                 %.2f dB" % mae)
+    emit("    with each subject's constant removed  %.2f dB  (-%.0f%%)"
+         % (mae_centred, 100 * (1 - mae_centred / mae)))
+    emit()
+    emit("  the network sees the image but not the session's accepted brightness, so this part of")
+    emit("  the residual is not a modelling error and cannot be trained away. Two ways out:")
+    emit("    (a) one calibration per wearing: give the model that session's target, or correct")
+    emit("        its output once; the floor is then the within-subject sd above.")
+    emit("    (b) change the label definition so the target is not per-session subjective.")
     emit()
 
 
@@ -335,6 +399,8 @@ def parse_args(argv=None):
     parser.add_argument("--tag", default="bloop", help="which closed-loop file to read")
     parser.add_argument("--labels", default=os.path.join(
         ROOT, "data", "labels_console_invivo_carotid_target.jsonl"))
+    parser.add_argument("--calibration", default=os.path.join(
+        ROOT, "bmode_opt", "console_calibration_invivo_carotid.json"))
     parser.add_argument("--cache", default=str(
         DPATH.output_dir("console_dl_cache_invivo_carotid") / "cache.npz"))
     parser.add_argument("--frames-per-group", type=int, default=12,
@@ -349,6 +415,7 @@ def main(argv=None):
     fold, trajectory_path = find_run(args.run, args.tag)
     trajectories = read_trajectories(trajectory_path)
     labels = read_labels(args.labels)
+    calibration = read_calibration(args.calibration)
     cache = cache_arrays(args.cache)
     index = dict((str(f), i) for i, f in enumerate(cache["frame_id"]))
 
@@ -357,6 +424,8 @@ def main(argv=None):
     emit("  trajectories %s (%d frames)" % (os.path.basename(trajectory_path), len(trajectories)))
     emit("  labels       %s (%d rows)" % (os.path.basename(args.labels), len(labels)))
     emit("  cache        %s (%d frames)" % (args.cache, len(index)))
+    emit("  calibration  %s (%d groups with a measured target)"
+         % (os.path.basename(args.calibration), len(calibration)))
     emit()
 
     # ---- 测试集：每帧残差 + 每帧的组织中位 dB
@@ -409,9 +478,15 @@ def main(argv=None):
         i = [index[frame_id] for frame_id, _, _ in values]
         grays = np.asarray([target_gray(frame_id, row)[0] for frame_id, _, row in values], float)
         modes = [row["imaging_mode"] for row in rows]
+        stored = [calibration.get(row["group_id"], {}).get("target_gray") for row in rows]
+        stored = [v for v in stored if v is not None]
+        visible = [float(cache["reference_db"][index[f]]) - medians.get(f, float("nan"))
+                   for f, _, _ in values]
         per_subject.append({
             "subject": subject, "day": subject[:8], "n": len(errors),
             "bias": float(errors.mean()), "sd": float(errors.std(ddof=1) if len(errors) > 1 else 0.0),
+            "mae": float(np.abs(errors).mean()),
+            "mae_centred": float(np.abs(errors - errors.mean()).mean()),
             "mode": "harmonic" if modes.count("harmonic") >= len(modes) / 2.0 else "fundamental",
             "harmonic_fraction": float(np.mean([m == "harmonic" for m in modes])),
             "hour": float(int(subject[9:11]) + int(subject[11:13]) / 60.0),
@@ -419,7 +494,9 @@ def main(argv=None):
             "noise_floor_top_db": float(np.mean(cache["noise_floor_top_db"][i])),
             "noise_floor_bottom_db": float(np.mean(cache["noise_floor_bottom_db"][i])),
             "tissue_median_db": float(np.nanmean([medians[f] for f, _, _ in values])),
-            "accepted_target_gray": float(np.nanmean(grays)),
+            "recovered_target_gray": float(np.nanmean(grays)),
+            "session_target_gray": float(np.mean(stored)) if stored else float("nan"),
+            "visible_part_db": float(np.nanmean(visible)),
             "depth_mm": float(np.mean([row["depth_mm"] for row in rows])),
             "frequency_mhz": float(np.mean([row["frequency_mhz"] for row in rows])),
             "focus_mm": float(np.mean([row["focus_mm"] for row in rows])),
@@ -432,20 +509,25 @@ def main(argv=None):
             "deadband_gain_levels": float(np.mean([row["deadband_gain_levels"] for row in rows])),
         })
 
-    keys = ("accepted_target_gray", "reference_db", "tissue_median_db", "noise_floor_top_db",
+    keys = ("session_target_gray", "recovered_target_gray", "visible_part_db",
+            "reference_db", "tissue_median_db", "noise_floor_top_db",
             "noise_floor_bottom_db", "optimal_gain_db", "start_gain_db", "harmonic_fraction",
             "depth_mm", "frequency_mhz", "focus_mm", "dr_ui", "label_uncertainty",
             "calibration_borrowed", "motion_flag", "deadband_gain_levels", "hour", "n")
     features = [(key, [s[key] for s in per_subject]) for key in keys]
 
-    section_subjects(per_subject)
+    splits = collections.Counter(row.get("split") for _, _, row in
+                                 [v for values in per_frame.values() for v in values])
+    section_subjects(per_subject, "/".join(sorted(k or "?" for k in splits)))
     days = section_days(per_subject)
     section_features(per_subject, features)
     section_models(per_subject, features, days)
 
-    # ---- 标签侧：每组的目标
-    groups = []
+    # ---- 标签侧：每组的目标（存着的）与反解的交叉验证
+    groups, per_db_all = [], []
     for group, frames in sorted(by_group.items()):
+        if group not in calibration:
+            continue
         values, per_db = [], []
         for frame_id in frames:
             if frame_id not in medians:
@@ -457,12 +539,14 @@ def main(argv=None):
         if len(values) < 2:
             continue
         values = np.asarray(values, float)
-        row = labels[frames[0]]
-        groups.append({"group": group, "day": group[:8], "mode": row["imaging_mode"],
-                       "n": len(values), "target_gray": float(np.median(values)),
-                       "sd_gray": float(values.std(ddof=1)),
-                       "db_per_gray": float(np.mean(per_db))})
-    section_target(groups, per_subject, features)
+        per_db_all.extend(per_db)
+        groups.append({"group": group, "day": group[:8], "n": len(values),
+                       "stored_gray": float(calibration[group]["target_gray"]),
+                       "recovered_gray": float(np.median(values)),
+                       "sd_gray": float(values.std(ddof=1))})
+    db_per_gray = float(np.median(per_db_all)) if per_db_all else float("nan")
+    section_target(groups, per_subject, features, calibration, db_per_gray)
+    section_verdict(per_subject, features, db_per_gray)
 
     emit("  done in %.0f s" % (time.time() - started))
     text = "\n".join(LINES)
