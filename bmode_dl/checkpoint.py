@@ -35,7 +35,9 @@ def model_from_config(config, ladders, norm=None):
                        dropout=float(config.get("dropout", 0.1)),
                        backend_output=config.get("backend_output", "delta"),
                        backend_norm=norm,
-                       frontend_dropout=None if frontend_dropout is None else float(frontend_dropout))
+                       frontend_dropout=None if frontend_dropout is None else float(frontend_dropout),
+                       focus_head=config.get("focus_head", "softmax"),
+                       far_wall=bool(config.get("far_wall", False)))
 
 
 def load_checkpoint(path, device="cpu"):

@@ -145,7 +145,9 @@ def encode_rows(rows, ladders):
         "focus_mask": np.zeros(n, np.float32),
         "frequency_weight": np.zeros(n, np.float32),
         "frequency_borderline": np.zeros(n, np.float32),
-        # 辅助目标（仿真真值，只作监督，不作输入）
+        # 辅助目标（只作监督，不作输入）
+        "far_wall_mm": np.zeros(n, np.float32),
+        "far_wall_mask": np.zeros(n, np.float32),
         "attenuation_db_cm_mhz": np.zeros(n, np.float32),
         "electronic_noise_db": np.zeros(n, np.float32),
         "aux_mask": np.zeros(n, np.float32),
@@ -230,6 +232,9 @@ def encode_rows(rows, ladders):
                 out["frequency_weight"][i] = float(row.get("frequency_loss_weight", 1.0) or 0.0)
                 out["frequency_borderline"][i] = 1.0 if row.get("frequency_confidence") == "borderline" else 0.0
 
+        if row.get("far_wall_mm") is not None:
+            out["far_wall_mm"][i] = float(row["far_wall_mm"])
+            out["far_wall_mask"][i] = 1.0
         if row.get("attenuation_db_cm_mhz") is not None and row.get("electronic_noise_db") is not None:
             out["attenuation_db_cm_mhz"][i] = row["attenuation_db_cm_mhz"]
             out["electronic_noise_db"][i] = row["electronic_noise_db"]

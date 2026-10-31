@@ -22,14 +22,15 @@ import torch.nn.functional as F
 
 from .model import masked_logits
 
-TASKS = ("gain", "tgc", "depth", "frequency", "focus", "dynamic_range", "aux")
+TASKS = ("gain", "tgc", "depth", "frequency", "focus", "dynamic_range", "aux", "far_wall")
 
 DEFAULT_WEIGHTS = {
     "gain_reg": 1.0, "gain_dir": 0.5,
     "tgc_reg": 1.0, "tgc_smooth": 0.02, "tgc_dir": 0.5,
     "depth_cls": 1.0, "depth_ord": 0.5, "depth_dir": 0.5,
     "frequency_cls": 1.0, "frequency_dir": 0.5,
-    "focus_cls": 1.0, "focus_ord": 0.5, "focus_dir": 0.5,
+    "focus_cls": 1.0, "focus_ord": 0.5, "focus_dir": 0.5, "focus_coral": 1.0,
+    "far_wall": 0.5,
     "dr_reg": 1.0, "dr_dir": 0.5,
     "aux": 0.1,
 }
@@ -38,6 +39,7 @@ TERM_TASK = {"gain_reg": "gain", "gain_dir": "gain", "tgc_reg": "tgc", "tgc_smoo
              "depth_cls": "depth", "depth_ord": "depth", "depth_dir": "depth",
              "frequency_cls": "frequency", "frequency_dir": "frequency",
              "focus_cls": "focus", "focus_ord": "focus", "focus_dir": "focus",
+             "focus_coral": "focus", "far_wall": "far_wall",
              "dr_reg": "dynamic_range", "dr_dir": "dynamic_range", "aux": "aux"}
 
 
@@ -82,6 +84,19 @@ def ladder_losses(logits, valid, target, mask, smoothing=0.0):
     distance = (prob * (k[None, :] - safe[:, None].to(prob.dtype)).abs()).sum(dim=1)
     ordinal, _ = masked_mean(distance, m)
     return ce, ordinal, total
+
+
+def coral_loss(cum_logits, target, mask):
+    """有序回归：对每个阈值 k 回答「最优档是否大于 k」，二元交叉熵。
+
+    与逐档 softmax 的区别是把序关系写进了目标：档 5 的样本会同时告诉 0..4 四个阈值「更大」，
+    所以相邻档之间共享统计量，档少人少的时候更省样本。
+    """
+    k = torch.arange(cum_logits.shape[1], device=cum_logits.device)
+    safe = target.clamp(min=0)
+    y = (safe[:, None] > k[None, :]).to(cum_logits.dtype)
+    bce = F.binary_cross_entropy_with_logits(cum_logits.float(), y.float(), reduction="none").mean(dim=1)
+    return masked_mean(bce, mask.float() * (target >= 0).float())
 
 
 def predicted_optimum(out, tg):
@@ -195,6 +210,12 @@ class SixParamLoss(nn.Module):
         focus_w = near_weight("focus")
         terms["focus_cls"], terms["focus_ord"], counts["focus"] = ladder_losses(
             out["focus_logits"], tg["focus_valid"], tg["optimal_focus_idx"], focus_w, self.smoothing)
+        if "focus_cum_logits" in out:
+            terms["focus_coral"], _ = coral_loss(out["focus_cum_logits"], tg["optimal_focus_idx"], focus_w)
+        if "far_wall_mm" in out and "far_wall_mm" in tg:
+            # 远壁深度回归，4 mm 为一个单位（远壁读数本身的散布中位数 0.3 mm，4 mm 是档距量级）
+            error = (out["far_wall_mm"].float() - tg["far_wall_mm"].float()) / 4.0
+            terms["far_wall"], counts["far_wall"] = masked_mean(huber(error), tg["far_wall_mask"])
         terms["focus_dir"], _ = weighted_ce(out["focus_dir"], tg["focus_dir"], focus_w, self.cw("focus_dir"),
                                             self.smoothing)
 
@@ -216,7 +237,8 @@ class SixParamLoss(nn.Module):
 
         total = torch.zeros((), device=backend.device)
         for task, value in task_loss.items():
-            if float(counts[task]) <= 0:
+            # 本次没有这一项的头（如未开远壁头），counts 里就没有它
+            if float(counts.get(task, 0.0)) <= 0:
                 continue                     # 本批无定出的行：不计入（也不更新不确定性参数）
             if self.uncertainty_weighting and task != "aux":
                 s = self.log_vars[task]

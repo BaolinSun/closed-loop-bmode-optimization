@@ -1163,6 +1163,104 @@ def check_invivo_grouping():
     emit("")
 
 
+def check_focus_ordinal():
+    """有序聚焦头（CORAL）与远壁先验：接口不变、序关系成立、损失方向正确。"""
+    emit("")
+    emit("=========== 13. ordinal focus head and far-wall prior ===========")
+    from bmode_dl.model import SixParamNet, ordinal_logits
+    from bmode_dl.losses import coral_loss
+
+    ladders = {"depth_mm": [25.1, 33.5, 41.9], "frequency_mhz": [4.4, 5.0, 5.7],
+               "focus_mm": [10.0, 15.0, 20.0, 25.0, 30.0, 35.0, 40.0]}
+    k = len(ladders["focus_mm"])
+    torch.manual_seed(0)
+    inputs = {"image": torch.randn(4, 3, 512, 128), "profile": torch.randn(4, 5, 512),
+              "scalars": torch.randn(4, 17)}
+
+    # 逐档概率：非负、和为 1，且与 softmax 头的接口形状一致
+    outs = {}
+    for kind in ("softmax", "ordinal"):
+        model = SixParamNet(ladders, focus_head=kind, far_wall=True, d_model=64,
+                            transformer_layers=1).eval()
+        with torch.no_grad():
+            outs[kind] = model(inputs)
+    shapes_ok = all(o["focus_logits"].shape == (4, k) for o in outs.values())
+    prob = outs["ordinal"]["focus_logits"].exp()
+    check("ordinal head keeps the focus_logits interface (%d rungs) and yields a distribution" % k,
+          shapes_ok and bool((prob >= 0).all()) and float((prob.sum(dim=1) - 1).abs().max()) < 1e-5,
+          "sum of per-rung probabilities %s" % [round(float(v), 6) for v in prob.sum(dim=1)])
+    check("ordinal head exposes the cumulative logits for the CORAL loss",
+          outs["ordinal"]["focus_cum_logits"].shape == (4, k - 1)
+          and "focus_cum_logits" not in outs["softmax"],
+          "cumulative logits %s" % (tuple(outs["ordinal"]["focus_cum_logits"].shape),))
+
+    # 单调的累积概率 -> 单峰分布，没有负质量
+    cum = torch.tensor([[2.0, 1.0, 0.0, -1.0, -2.0, -3.0]])
+    logits = ordinal_logits(cum)
+    check("a monotone score decodes to one coherent distribution",
+          abs(float(logits.exp().sum()) - 1.0) < 1e-5 and bool((logits.exp() >= 0).all()),
+          "argmax rung %d of %d" % (int(logits.argmax()), k))
+    # 阈值乱序时 cummin 仍保证概率非负
+    jumbled = torch.tensor([[-2.0, 3.0, 0.0, 1.0, -1.0, 2.0]])
+    jp = ordinal_logits(jumbled).exp()
+    check("out-of-order thresholds still decode to a valid distribution (cummin guard)",
+          bool((jp >= 0).all()) and abs(float(jp.sum()) - 1.0) < 1e-5,
+          "sum %.6f, min %.2e" % (float(jp.sum()), float(jp.min())))
+
+    # CORAL 损失：预测正确时最小，离得越远越大
+    target = torch.tensor([3, 3, 3, 3])
+    mask = torch.ones(4)
+    losses = []
+    for rung in range(k):
+        score = torch.full((4, 1), 0.0)
+        cuts = torch.tensor([6.0 if i < rung else -6.0 for i in range(k - 1)])[None, :]
+        losses.append(float(coral_loss(score + cuts, target, mask)[0]))
+    best = int(torch.tensor(losses).argmin())
+    monotone = all(losses[i] >= losses[i + 1] - 1e-6 for i in range(best)) and \
+               all(losses[i] <= losses[i + 1] + 1e-6 for i in range(best, k - 1))
+    check("CORAL loss is smallest at the right rung and grows with the distance",
+          best == 3 and monotone,
+          "loss by predicted rung %s" % [round(v, 3) for v in losses])
+
+    # 远壁头：有输出、有监督、关掉时整条链路照常
+    model = SixParamNet(ladders, focus_head="ordinal", far_wall=True, d_model=64,
+                        transformer_layers=1).eval()
+    plain = SixParamNet(ladders, focus_head="ordinal", far_wall=False, d_model=64,
+                        transformer_layers=1).eval()
+    with torch.no_grad():
+        with_wall, without = model(inputs), plain(inputs)
+    check("the far-wall head is optional and only present when asked for",
+          "far_wall_mm" in with_wall and "far_wall_mm" not in without
+          and with_wall["far_wall_mm"].shape == (4,),
+          "far wall mm %s" % [round(float(v), 1) for v in with_wall["far_wall_mm"]])
+    check("the focus head sees the predicted far wall (one extra input)",
+          model.focus_head.net[0].in_features == plain.focus_head.net[0].in_features + 1,
+          "focus head input %d vs %d" % (model.focus_head.net[0].in_features,
+                                         plain.focus_head.net[0].in_features))
+
+    # 标签里的远壁深度进了编码
+    rows = [{"frame_id": "f0", "group_id": "g/1", "far_wall_mm": 17.3, "depth_mm": 41.9,
+             "frequency_mhz": 5.0, "focus_mm": 15.0, "gain_db": 0.0, "dr_ui": 67.0,
+             "tgc_levels": [127] * 8, "imaging_mode": "harmonic", "optimal_tgc_levels": [127] * 8,
+             "optimal_gain_db": 0.0, "deadband_gain_levels": 4.0, "gain_db_per_level": 0.2,
+             "tgc_db_per_level": 0.078, "gain_direction": "correct",
+             "delta_gain_db": 0.0, "delta_tgc_db": [0.0] * 8,
+             "slider_directions": {"near": "correct", "mid": "correct", "far": "correct"}},
+            {"frame_id": "f1", "group_id": "g/1", "far_wall_mm": None, "depth_mm": 41.9,
+             "frequency_mhz": 5.0, "focus_mm": 15.0, "gain_db": 0.0, "dr_ui": 67.0,
+             "tgc_levels": [127] * 8, "imaging_mode": "harmonic", "optimal_tgc_levels": [127] * 8,
+             "optimal_gain_db": 0.0, "deadband_gain_levels": 4.0, "gain_db_per_level": 0.2,
+             "tgc_db_per_level": 0.078, "gain_direction": "correct",
+             "delta_gain_db": 0.0, "delta_tgc_db": [0.0] * 8,
+             "slider_directions": {"near": "correct", "mid": "correct", "far": "correct"}}]
+    encoded = L.encode_rows(rows, L.collect_ladders(rows))
+    check("far_wall_mm and its mask reach the encoded targets",
+          abs(float(encoded["far_wall_mm"][0]) - 17.3) < 1e-4
+          and list(encoded["far_wall_mask"]) == [1.0, 0.0],
+          "mm %s mask %s" % (list(np.round(encoded["far_wall_mm"], 2)),
+                             list(encoded["far_wall_mask"])))
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--labels", default=os.path.join(ROOT, "data", "labels_fieldii.jsonl"))
@@ -1181,6 +1279,7 @@ def main():
     check_suggestion()
     check_loop_tools()
     check_invivo_grouping()
+    check_focus_ordinal()
     emit("=========== result ===========")
     emit("  %d failure(s)%s" % (len(FAILURES), (": " + ", ".join(FAILURES)) if FAILURES else ""))
     captured = list(LINES)

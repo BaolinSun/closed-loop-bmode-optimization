@@ -132,6 +132,8 @@ def decode(out, tg):
         "dr_delta_ui": out["dr_delta_ui"].float(),
         "aux": out["aux"].float(),
     }
+    if "far_wall_mm" in out:
+        decoded["far_wall_mm"] = out["far_wall_mm"].float()
     for axis in ("depth", "frequency", "focus"):
         logits, valid = out["%s_logits" % axis], tg["%s_valid" % axis]
         decoded["%s_idx" % axis], decoded["%s_prob" % axis] = ladder_decision(logits, valid, "argmax")
@@ -320,6 +322,9 @@ def compute_metrics(preds, tg, norm=None):
             m["%s_mean_signed_steps_expected" % axis] = float(np.mean(target - expected))
 
     m["dynamic_range_n"] = int((tg["dr_mask"] > 0).sum())
+    if "far_wall_mm" in preds and "far_wall_mask" in tg and (tg["far_wall_mask"] > 0).any():
+        w = tg["far_wall_mask"] > 0
+        m["far_wall_mae_mm"] = float(np.abs(preds["far_wall_mm"][w] - tg["far_wall_mm"][w]).mean())
     if "aux" in preds and norm is not None and (tg["aux_mask"] > 0).any():
         a = tg["aux_mask"] > 0
         att = preds["aux"][a, 0] * norm["att_std"] + norm["att_mean"]

@@ -43,6 +43,24 @@ def _groups(channels):
     return 1
 
 
+FOCUS_HEADS = ("softmax", "ordinal")
+FAR_WALL_SCALE_MM = 40.0
+
+
+def ordinal_logits(cum_logits, eps=1e-6):
+    """CORAL 的累积 logit -> 逐档对数概率。
+
+    cum_logits[:, k] 是 P(档 > k) 的 logit，k = 0..K-2。阈值在训练中不保证单调，先按
+    cummin 压成单调的累积概率，再差分得到逐档概率，这样 p 恒为非负且和为 1。
+    """
+    cum = torch.cummin(torch.sigmoid(cum_logits), dim=1).values
+    ones = torch.ones_like(cum[:, :1])
+    zeros = torch.zeros_like(cum[:, :1])
+    upper = torch.cat([ones, cum], dim=1)          # P(档 > k-1)
+    lower = torch.cat([cum, zeros], dim=1)         # P(档 > k)
+    return torch.log((upper - lower).clamp(min=eps))
+
+
 class FiLM(nn.Module):
     """x * (1 + gamma) + beta，gamma/beta 由参数嵌入给出，初始化为 0（恒等）。"""
 
@@ -153,10 +171,12 @@ class MLP(nn.Module):
 class SixParamNet(nn.Module):
     def __init__(self, ladders, input_mode="full", d_model=256, seq_len=32, transformer_layers=2,
                  use_transformer=True, dropout=0.1, backend_output="optimum", backend_norm=None,
-                 frontend_dropout=None):
+                 frontend_dropout=None, focus_head="softmax", far_wall=False):
         super().__init__()
         if input_mode not in INPUT_MODES:
             raise ValueError("input_mode must be one of %s" % (INPUT_MODES,))
+        if focus_head not in FOCUS_HEADS:
+            raise ValueError("focus_head must be one of %s" % (FOCUS_HEADS,))
         if backend_output not in BACKEND_OUTPUTS:
             raise ValueError("backend_output must be one of %s" % (BACKEND_OUTPUTS,))
         self.input_mode = input_mode
@@ -205,7 +225,21 @@ class SixParamNet(nn.Module):
         self.slider_dir_head = MLP(d_model, hidden, 3 * len(K.SLIDER_GROUPS), dropout)
         self.depth_head = MLP(d_model, hidden, self.num_depth + 3, front_dropout)
         self.frequency_head = MLP(d_model, hidden, self.num_frequency + 3, front_dropout)
-        self.focus_head = MLP(d_model, hidden, self.num_focus + 3, front_dropout)
+        # 远壁深度：教师定聚焦档就是先找远壁再比散斑，所以把它作为辅助监督，并喂给聚焦头
+        self.far_wall = bool(far_wall)
+        if self.far_wall:
+            self.far_wall_head = MLP(d_model, hidden, 1, front_dropout)
+            # 从量程中部起步（20 mm），否则头一个 epoch 这一项的损失会盖过别的
+            nn.init.zeros_(self.far_wall_head.net[-1].weight)
+            nn.init.constant_(self.far_wall_head.net[-1].bias, 20.0 / FAR_WALL_SCALE_MM)
+        self.focus_kind = focus_head if self.num_focus > 1 else "softmax"
+        focus_in = d_model + (1 if self.far_wall else 0)
+        if self.focus_kind == "ordinal":
+            # 一个分数 + K-1 个阈值（CORAL：阈值共享同一个分数，序关系写进结构里）
+            self.focus_head = MLP(focus_in, hidden, 1 + 3, front_dropout)
+            self.focus_cut = nn.Parameter(torch.linspace(2.0, -2.0, self.num_focus - 1))
+        else:
+            self.focus_head = MLP(focus_in, hidden, self.num_focus + 3, front_dropout)
         self.dr_head = MLP(d_model, hidden, 1 + 3, dropout)
         self.aux_head = MLP(d_model, hidden, 2, dropout)
         self.register_buffer("band_onehot", torch.eye(K.NUM_TGC_BANDS), persistent=False)
@@ -283,8 +317,17 @@ class SixParamNet(nn.Module):
         out["depth_logits"], out["depth_dir"] = depth[:, :self.num_depth], depth[:, self.num_depth:]
         freq = self.frequency_head(h)
         out["frequency_logits"], out["frequency_dir"] = freq[:, :self.num_frequency], freq[:, self.num_frequency:]
-        focus = self.focus_head(h)
-        out["focus_logits"], out["focus_dir"] = focus[:, :self.num_focus], focus[:, self.num_focus:]
+        if self.far_wall:
+            out["far_wall_mm"] = self.far_wall_head(h)[:, 0].float() * FAR_WALL_SCALE_MM
+            focus_in = torch.cat([h, (out["far_wall_mm"] / FAR_WALL_SCALE_MM).detach()[:, None]], dim=1)
+        else:
+            focus_in = h
+        focus = self.focus_head(focus_in)
+        if self.focus_kind == "ordinal":
+            out["focus_cum_logits"] = focus[:, :1] + self.focus_cut[None, :]
+            out["focus_logits"], out["focus_dir"] = ordinal_logits(out["focus_cum_logits"]), focus[:, 1:]
+        else:
+            out["focus_logits"], out["focus_dir"] = focus[:, :self.num_focus], focus[:, self.num_focus:]
         dr = self.dr_head(h)
         out["dr_delta_ui"], out["dr_dir"] = dr[:, 0], dr[:, 1:]
         out["aux"] = self.aux_head(h)
