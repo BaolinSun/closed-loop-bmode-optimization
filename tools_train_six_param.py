@@ -161,9 +161,9 @@ def parse_args(argv=None):
                         "only by a _GEN/_THI suffix); subject = console session without the mode suffix, "
                         "which is one person in the in-vivo data. A fold unit never sits in both sets")
     p.add_argument("--focus-head", choices=("softmax", "ordinal"), default="softmax",
-                   help="ordinal = CORAL 有序回归，把档位的序关系写进输出头")
+                   help="ordinal = CORAL ordinal regression; puts the rung order into the head itself")
     p.add_argument("--far-wall", action="store_true",
-                   help="加远壁深度回归头，并把预测的远壁深度喂给聚焦头")
+                   help="add a far-wall depth head and feed its prediction to the focus head")
     p.add_argument("--invariance-weight", type=float, default=1.0,
                    help="weight of the penalty on the predicted optimum gain / TGC changing with the back-end "
                         "start (a second pass on the same images from a re-drawn start); 0 turns it off")
