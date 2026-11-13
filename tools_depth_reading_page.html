@@ -1,0 +1,310 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>颈动脉深度阅片</title>
+<!-- 由 tools_build_depth_reading.py 复制到 data/depth_reading/index.html；条目清单在同目录 manifest.js -->
+<style>
+  :root { --bg:#141414; --panel:#1f1f1f; --line:#3a3a3a; --text:#e6e6e6; --muted:#9a9a9a;
+          --accent:#e0b040; --ok:#5fb36b; --bad:#d06060; }
+  * { box-sizing:border-box; }
+  body { margin:0; background:var(--bg); color:var(--text); font:15px/1.5 "Microsoft YaHei","PingFang SC",sans-serif; }
+  header { display:flex; flex-wrap:wrap; gap:12px; align-items:center; padding:10px 16px;
+           background:var(--panel); border-bottom:1px solid var(--line); position:sticky; top:0; z-index:5; }
+  header .title { font-weight:600; margin-right:8px; }
+  header .grow { flex:1; }
+  input[type=text] { background:#111; color:var(--text); border:1px solid var(--line); padding:5px 8px; border-radius:4px; width:120px; }
+  button { background:#2c2c2c; color:var(--text); border:1px solid var(--line); padding:6px 14px; border-radius:4px;
+           cursor:pointer; font:inherit; }
+  button:hover { border-color:#666; }
+  button.primary { background:var(--accent); color:#111; border-color:var(--accent); font-weight:600; }
+  button.danger { border-color:var(--bad); color:#f0b0b0; }
+  button:disabled { opacity:.4; cursor:default; }
+  main { padding:16px; max-width:1500px; margin:0 auto; }
+  .step { color:var(--accent); font-weight:600; font-size:17px; margin:4px 0 10px; }
+  .hint { color:var(--muted); margin:0 0 12px; }
+  .refwrap { position:relative; display:inline-block; cursor:crosshair; border:1px solid var(--line); }
+  .refwrap img { display:block; height:min(62vh, 560px); width:auto; }
+  .hline { position:absolute; left:0; right:0; height:0; border-top:2px solid var(--accent); pointer-events:none; }
+  .dot { position:absolute; width:10px; height:10px; margin:-5px 0 0 -5px; border-radius:50%;
+         background:var(--accent); pointer-events:none; }
+  .grid { display:flex; flex-wrap:wrap; gap:14px; align-items:flex-start; }
+  .cand { background:var(--panel); border:3px solid transparent; border-radius:6px; padding:6px; cursor:pointer; }
+  .cand img { display:block; height:min(30vh, 270px); width:auto; }
+  .cand.best { border-color:var(--accent); }
+  .cand .row { display:flex; justify-content:space-between; align-items:center; margin-top:6px; }
+  .cand .letter { font-weight:700; font-size:16px; }
+  .cand label { color:var(--muted); cursor:pointer; user-select:none; }
+  .cand.best label { color:var(--text); }
+  .actions { display:flex; flex-wrap:wrap; gap:10px; margin-top:16px; }
+  .status { color:var(--muted); }
+  .badge { display:inline-block; padding:1px 8px; border-radius:10px; background:#333; color:var(--muted); font-size:13px; }
+  .help { background:var(--panel); border:1px solid var(--line); border-radius:6px; padding:12px 16px; margin-bottom:14px; }
+  .help ol { margin:6px 0 0 18px; padding:0; }
+  .center { text-align:center; padding:60px 0; }
+</style>
+</head>
+<body>
+<header>
+  <span class="title">颈动脉深度阅片</span>
+  <label>阅片者编号 <input type="text" id="reader" placeholder="如 D01"></label>
+  <button id="start">开始 / 继续</button>
+  <span class="grow"></span>
+  <span class="status" id="progress"></span>
+  <button id="toggleHelp">说明</button>
+  <button id="export">导出结果</button>
+</header>
+<main>
+  <div class="help" id="help">
+    <b>每个条目是同一受试者、同一切面、探头不动时采的一组图像。</b>
+    <ol>
+      <li>第 1 步：在参考图上<b>点击颈动脉远壁（内中膜）</b>的位置，可以重点；看不到颈动脉时点「看不到远壁」。</li>
+      <li>第 2 步：同一切面的 6 档显示深度已打乱顺序、隐去深度数字。<b>点击你认为最合适的一张</b>（按临床颈动脉检查的习惯），
+          再勾选其余你也能接受的。也可以按数字键 1–6 选最合适的一张。</li>
+      <li>图像有明显移动、不是颈动脉切面等情况，点「整组无法判断」。</li>
+    </ol>
+    结果自动保存在本机浏览器里（按阅片者编号分开），可以随时关闭、下次继续。结束后点「导出结果」，把下载的文件交给研究人员。
+    少数条目会在后面再出现一次，用来估计同一阅片者前后判断的一致性，请照常判断。
+  </div>
+  <div id="stage"><div class="center status">请输入阅片者编号，然后点「开始 / 继续」。</div></div>
+</main>
+<script src="manifest.js"></script>
+<script>
+(function () {
+  "use strict";
+  var M = window.MANIFEST;
+  var stage = document.getElementById("stage");
+  var readerBox = document.getElementById("reader");
+  var progressEl = document.getElementById("progress");
+  var state = null;        // {reader, queue:[{view, repeat}], results:{key: record}, pos}
+  var LETTERS = ["A", "B", "C", "D", "E", "F"];
+
+  function storageKey(reader) { return "depthReading:v" + M.version + ":" + reader; }
+  function load(reader) {
+    try { return JSON.parse(localStorage.getItem(storageKey(reader)) || "null"); } catch (e) { return null; }
+  }
+  function save() {
+    try { localStorage.setItem(storageKey(state.reader), JSON.stringify(state)); } catch (e) {
+      alert("浏览器本地存储写入失败，请先导出结果。");
+    }
+  }
+  // 以阅片者编号为种子的伪随机数，保证同一阅片者每次打开顺序一致
+  function rng(seedText) {
+    var h = 2166136261;
+    for (var i = 0; i < seedText.length; i++) { h ^= seedText.charCodeAt(i); h = Math.imul(h, 16777619); }
+    return function () {
+      h += 0x6D2B79F5; var t = h;
+      t = Math.imul(t ^ (t >>> 15), t | 1); t ^= t + Math.imul(t ^ (t >>> 7), t | 61);
+      return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+    };
+  }
+  function shuffle(list, rand) {
+    var a = list.slice();
+    for (var i = a.length - 1; i > 0; i--) { var j = Math.floor(rand() * (i + 1)); var t = a[i]; a[i] = a[j]; a[j] = t; }
+    return a;
+  }
+  function buildQueue(reader) {
+    var rand = rng(reader + ":" + M.seed);
+    var ids = shuffle(M.views.map(function (v) { return v.id; }), rand);
+    var queue = ids.map(function (id) { return { view: id, repeat: false }; });
+    // 重复条目插在其第一次出现之后的后半段
+    M.repeats.forEach(function (id) {
+      // 第一次出现的位置要在当前队列里找：前面已插入的复查条目会把它往后推，
+      // 用打乱后的原始下标会让复查条目排到第一次出现之前。
+      var first = -1;
+      for (var k = 0; k < queue.length; k++) {
+        if (queue[k].view === id && !queue[k].repeat) { first = k; break; }
+      }
+      var lo = Math.max(first + 1, Math.floor(queue.length / 2));
+      var at = lo + Math.floor(rand() * (queue.length - lo + 1));
+      queue.splice(at, 0, { view: id, repeat: true });
+    });
+    return queue;
+  }
+  function viewById(id) {
+    for (var i = 0; i < M.views.length; i++) if (M.views[i].id === id) return M.views[i];
+    return null;
+  }
+  function keyOf(item) { return item.view + (item.repeat ? "#r" : ""); }
+  function doneCount() { return Object.keys(state.results).length; }
+  function updateProgress() {
+    progressEl.textContent = state ? ("阅片者 " + state.reader + "：已完成 " + doneCount() + " / " + state.queue.length) : "";
+  }
+
+  function start() {
+    var reader = readerBox.value.trim();
+    if (!reader) { alert("请先输入阅片者编号。"); return; }
+    state = load(reader);
+    if (!state || !state.queue) {
+      state = { reader: reader, queue: buildQueue(reader), results: {}, pos: 0, created: new Date().toISOString() };
+    }
+    // 从第一个还没做的条目开始
+    var p = 0;
+    while (p < state.queue.length && state.results[keyOf(state.queue[p])]) p++;
+    state.pos = Math.min(p, state.queue.length);
+    save();
+    document.getElementById("help").style.display = doneCount() ? "none" : "";
+    render();
+  }
+
+  function render() {
+    updateProgress();
+    if (state.pos >= state.queue.length) {
+      stage.innerHTML = '<div class="center"><p class="step">全部完成，谢谢！</p>' +
+        '<p class="hint">请点右上角「导出结果」，把下载的文件交给研究人员。</p>' +
+        '<button id="back">返回上一个</button></div>';
+      document.getElementById("back").onclick = function () { state.pos = state.queue.length - 1; renderItem(1); };
+      return;
+    }
+    renderItem(1);
+  }
+
+  function renderItem(step) {
+    var item = state.queue[state.pos];
+    var view = viewById(item.view);
+    var key = keyOf(item);
+    var prev = state.results[key] || null;
+    var draft = state.draft && state.draft.key === key ? state.draft : {
+      key: key, view: item.view, repeat: item.repeat,
+      far_wall: prev ? prev.far_wall : null, no_far_wall: prev ? prev.no_far_wall : false,
+      best: prev ? prev.best_depth_mm : null,
+      acceptable: prev ? prev.acceptable_depth_mm.slice() : [],
+      t_start: Date.now()
+    };
+    state.draft = draft;
+    var base = "images/" + view.id + "/";
+    var head = '<p class="status">条目 ' + (state.pos + 1) + ' / ' + state.queue.length +
+      (item.repeat ? ' <span class="badge">复查</span>' : '') + (prev ? ' <span class="badge">已作答，可修改</span>' : '') + '</p>';
+
+    if (step === 1) {
+      stage.innerHTML = head +
+        '<p class="step">第 1 步：点击颈动脉远壁（内中膜）</p>' +
+        '<p class="hint">可以重复点击修改位置。</p>' +
+        '<div class="refwrap" id="refwrap"><img id="refimg" src="' + base + 'ref.jpg" alt="参考图"></div>' +
+        '<div class="actions">' +
+        (state.pos > 0 ? '<button id="prevItem">上一个条目</button>' : '') +
+        '<button id="noWall">看不到远壁</button>' +
+        '<button class="danger" id="invalid">整组无法判断</button>' +
+        '<button class="primary" id="next1"' + (draft.far_wall ? '' : ' disabled') + '>下一步</button></div>';
+      var wrap = document.getElementById("refwrap");
+      function mark() {
+        Array.prototype.slice.call(wrap.querySelectorAll(".hline,.dot")).forEach(function (n) { n.remove(); });
+        if (!draft.far_wall) return;
+        var img = document.getElementById("refimg");
+        var y = draft.far_wall.y * img.clientHeight, x = draft.far_wall.x * img.clientWidth;
+        var l = document.createElement("div"); l.className = "hline"; l.style.top = y + "px"; wrap.appendChild(l);
+        var d = document.createElement("div"); d.className = "dot"; d.style.top = y + "px"; d.style.left = x + "px"; wrap.appendChild(d);
+      }
+      document.getElementById("refimg").onload = mark;
+      wrap.onclick = function (ev) {
+        var r = ev.currentTarget.querySelector("img").getBoundingClientRect();
+        draft.far_wall = { x: (ev.clientX - r.left) / r.width, y: (ev.clientY - r.top) / r.height };
+        draft.no_far_wall = false;
+        document.getElementById("next1").disabled = false;
+        mark();
+      };
+      document.getElementById("noWall").onclick = function () { draft.far_wall = null; draft.no_far_wall = true; renderItem(2); };
+      document.getElementById("next1").onclick = function () { renderItem(2); };
+      document.getElementById("invalid").onclick = function () { commit(true); };
+      if (state.pos > 0) document.getElementById("prevItem").onclick = function () { state.draft = null; state.pos--; renderItem(1); };
+      mark();
+      return;
+    }
+
+    // 第 2 步：6 档深度，按阅片者 + 条目固定打乱
+    var order = shuffle(view.frames.map(function (f, i) { return i; }), rng(state.reader + ":" + key));
+    draft.order = order.map(function (i) { return view.frames[i].depth_mm; });
+    var html = head + '<p class="step">第 2 步：选出最合适的显示深度</p>' +
+      '<p class="hint">点击图像选最合适的一张（数字键 1–6 亦可），再勾选其余也能接受的。</p><div class="grid">';
+    order.forEach(function (i, k) {
+      var f = view.frames[i];
+      var isBest = draft.best === f.depth_mm;
+      var ok = isBest || draft.acceptable.indexOf(f.depth_mm) >= 0;
+      html += '<div class="cand' + (isBest ? ' best' : '') + '" data-depth="' + f.depth_mm + '">' +
+        '<img src="' + base + f.file + '" alt="' + LETTERS[k] + '">' +
+        '<div class="row"><span class="letter">' + LETTERS[k] + '（' + (k + 1) + '）</span>' +
+        '<label><input type="checkbox" data-acc="' + f.depth_mm + '"' + (ok ? ' checked' : '') + (isBest ? ' disabled' : '') +
+        '> 可接受</label></div></div>';
+    });
+    html += '</div><div class="actions"><button id="back1">上一步</button>' +
+      '<button class="danger" id="invalid2">整组无法判断</button>' +
+      '<button class="primary" id="save"' + (draft.best === null ? ' disabled' : '') + '>保存，下一个</button></div>';
+    stage.innerHTML = html;
+    function choose(depth) {
+      draft.best = depth;
+      if (draft.acceptable.indexOf(depth) < 0) draft.acceptable.push(depth);
+      renderItem(2);
+    }
+    Array.prototype.slice.call(stage.querySelectorAll(".cand")).forEach(function (el) {
+      el.onclick = function (ev) {
+        if (ev.target.tagName === "INPUT" || ev.target.tagName === "LABEL") return;
+        choose(parseFloat(el.getAttribute("data-depth")));
+      };
+    });
+    Array.prototype.slice.call(stage.querySelectorAll("input[data-acc]")).forEach(function (cb) {
+      cb.onchange = function () {
+        var d = parseFloat(cb.getAttribute("data-acc"));
+        var i = draft.acceptable.indexOf(d);
+        if (cb.checked && i < 0) draft.acceptable.push(d);
+        if (!cb.checked && i >= 0) draft.acceptable.splice(i, 1);
+      };
+    });
+    document.onkeydown = function (ev) {
+      if (!state || !state.draft || state.draft.key !== key || !document.getElementById("save")) return;
+      var n = parseInt(ev.key, 10);
+      if (n >= 1 && n <= order.length) choose(view.frames[order[n - 1]].depth_mm);
+      if (ev.key === "Enter" && draft.best !== null) commit(false);
+    };
+    document.getElementById("back1").onclick = function () { renderItem(1); };
+    document.getElementById("invalid2").onclick = function () { commit(true); };
+    document.getElementById("save").onclick = function () { commit(false); };
+  }
+
+  function commit(invalid) {
+    var d = state.draft;
+    var view = viewById(d.view);
+    state.results[d.key] = {
+      view: d.view, subject: view.subject, repeat: d.repeat, invalid: !!invalid,
+      far_wall: invalid ? null : d.far_wall,
+      far_wall_mm: (!invalid && d.far_wall) ? +(d.far_wall.y * view.ref_depth_mm).toFixed(2) : null,
+      no_far_wall: !invalid && !!d.no_far_wall,
+      ref_depth_mm: view.ref_depth_mm,
+      best_depth_mm: invalid ? null : d.best,
+      acceptable_depth_mm: invalid ? [] : d.acceptable.slice().sort(function (a, b) { return a - b; }),
+      shown_order_mm: d.order || [],
+      seconds: Math.round((Date.now() - d.t_start) / 100) / 10,
+      saved_at: new Date().toISOString()
+    };
+    state.draft = null;
+    state.pos++;
+    while (state.pos < state.queue.length && state.results[keyOf(state.queue[state.pos])]) state.pos++;
+    save();
+    render();
+  }
+
+  function exportResults() {
+    if (!state) { alert("还没有开始阅片。"); return; }
+    var out = { reader: state.reader, manifest_version: M.version, manifest_seed: M.seed,
+                exported_at: new Date().toISOString(), completed: doneCount(), total: state.queue.length,
+                results: Object.keys(state.results).map(function (k) { return state.results[k]; }) };
+    var blob = new Blob([JSON.stringify(out, null, 1)], { type: "application/json" });
+    var a = document.createElement("a");
+    a.href = URL.createObjectURL(blob);
+    a.download = "depth_reading_" + state.reader + "_" + new Date().toISOString().slice(0, 10) + ".json";
+    document.body.appendChild(a); a.click(); a.remove();
+  }
+
+  document.getElementById("start").onclick = start;
+  readerBox.onkeydown = function (ev) { if (ev.key === "Enter") start(); };
+  document.getElementById("export").onclick = exportResults;
+  document.getElementById("toggleHelp").onclick = function () {
+    var h = document.getElementById("help"); h.style.display = h.style.display === "none" ? "" : "none";
+  };
+  if (!M || !M.views || !M.views.length) {
+    stage.innerHTML = '<div class="center status">没有找到条目清单 manifest.js，请先运行 tools_build_depth_reading.py。</div>';
+  }
+})();
+</script>
+</body>
+</html>
