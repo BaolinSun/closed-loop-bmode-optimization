@@ -1,0 +1,27 @@
+{
+  "note": "Provisional far-wall depths (mm) of the carotid, one reading per block, read by Claude on the R3 frame (0-40 mm, 5 mm grid) on 2026-11-12. Not a sonographer reading: replace with doctor readings before any training. confidence low = the wall is faint or the vessel is oblique. Blocks absent here are not readable (ZHT block 1: probe not coupled; ZHT block 2: no identifiable lumen).",
+  "readings": [
+    {"session": "LYC_17岁_颈动脉_20261106_170016_ffcf7053", "block": 3, "view": "横切", "far_wall_mm": 28.0, "confidence": "ok"},
+    {"session": "LYC_17岁_颈动脉_20261106_170016_ffcf7053", "block": 4, "view": "横切", "far_wall_mm": 30.0, "confidence": "ok"},
+    {"session": "LYC_17岁_颈动脉_20261106_170016_ffcf7053", "block": 5, "view": "纵切", "far_wall_mm": 27.0, "confidence": "ok"},
+    {"session": "LYC_17岁_颈动脉_20261106_170016_ffcf7053", "block": 6, "view": "纵切", "far_wall_mm": 29.0, "confidence": "low"},
+    {"session": "MZY_25岁_颈动脉_20261106_173022_20d936b9", "block": 7, "view": "横切", "far_wall_mm": 29.0, "confidence": "ok"},
+    {"session": "MZY_25岁_颈动脉_20261106_173022_20d936b9", "block": 8, "view": "横切", "far_wall_mm": 28.5, "confidence": "ok"},
+    {"session": "MZY_25岁_颈动脉_20261106_173022_20d936b9", "block": 9, "view": "纵切", "far_wall_mm": 27.0, "confidence": "ok"},
+    {"session": "MZY_25岁_颈动脉_20261106_173022_20d936b9", "block": 10, "view": "纵切", "far_wall_mm": 26.0, "confidence": "low"},
+    {"session": "SBL_30岁_颈动脉_20261109_110222_4ec25d17", "block": 1, "view": "横切", "far_wall_mm": 27.5, "confidence": "ok"},
+    {"session": "SBL_30岁_颈动脉_20261109_110222_4ec25d17", "block": 2, "view": "横切", "far_wall_mm": 26.0, "confidence": "low"},
+    {"session": "SBL_30岁_颈动脉_20261109_110222_4ec25d17", "block": 3, "view": "纵切", "far_wall_mm": 25.0, "confidence": "ok"},
+    {"session": "SBL_30岁_颈动脉_20261109_110222_4ec25d17", "block": 4, "view": "纵切", "far_wall_mm": 27.0, "confidence": "low"},
+    {"session": "SBL_30岁_颈动脉_20261109_110222_4ec25d17", "block": 5, "view": "横切", "far_wall_mm": 30.0, "confidence": "ok"},
+    {"session": "SBL_30岁_颈动脉_20261109_110222_4ec25d17", "block": 6, "view": "横切", "far_wall_mm": 25.0, "confidence": "low"},
+    {"session": "SBL_30岁_颈动脉_20261109_110222_4ec25d17", "block": 7, "view": "纵切", "far_wall_mm": 26.0, "confidence": "ok"},
+    {"session": "SBL_30岁_颈动脉_20261109_110222_4ec25d17", "block": 8, "view": "纵切", "far_wall_mm": 29.0, "confidence": "low"},
+    {"session": "ZHT_17岁_颈动脉_20261109_131527_b056d05b", "block": 3, "view": "横切", "far_wall_mm": 27.5, "confidence": "ok"},
+    {"session": "ZHT_17岁_颈动脉_20261109_131527_b056d05b", "block": 4, "view": "纵切", "far_wall_mm": 30.0, "confidence": "ok"},
+    {"session": "ZHT_17岁_颈动脉_20261109_131527_b056d05b", "block": 5, "view": "纵切", "far_wall_mm": 30.0, "confidence": "low"}
+  ],
+  "excluded_blocks": [
+    {"session": "ZHT_17岁_颈动脉_20261109_131527_b056d05b", "block": 1, "reason": "probe not coupled: almost every frame is noise only"}
+  ]
+}

@@ -2,9 +2,12 @@
 # 但两个标签文件要进：它们是所有下游工作的输入，体积小（git 内部按 zlib 压缩后
 # Field II 约 1.1 MB、实机约 0.1 MB），而且每次重新生成都需要能看出改了什么。
 # 备份版本（labels_*_before_*.jsonl、labels_fieldii_1?phantoms.jsonl）仍然不进。
+# 可穿戴那批同理：标签 768 行（压缩后 97 KB），远壁深度是手工标注、生不回来。
 data/*
 !data/labels_console.jsonl
 !data/labels_fieldii.jsonl
+!data/labels_wear_carotid.jsonl
+!data/wear_far_walls_provisional.json
 
 __pycache__/
 *.pyc
