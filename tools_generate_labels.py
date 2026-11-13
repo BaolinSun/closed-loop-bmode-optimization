@@ -8,17 +8,16 @@ import calibration as CAL
 import labels as LB
 import tissue as T
 from fieldii_loader import find_shards, load_shard
-from hisense_loader import DEFAULT_DATA_DIR, find_captures, get_leaf, load_capture
+import console_sessions as CS
+from hisense_loader import get_leaf, load_capture
 
-CAL_PATH = "bmode_opt/console_calibration.json"
-CONSOLE_SESSIONS = ["20260814", "20260819", "20260831", "20260901", "20260901_E2",
-                    "20260901_E3", "20260903", "20260903_GEN",
-                    "20260903_replication_check", "20260904", "20260904_DR", "20260909_GEN", "20260910",
-                    "20260828/GEN", "20260828/THI"]
+# 体模标定。人体数据传 console_sessions.output_path("invivo", "calibration")。
+# 标定文件里有哪些组，就给哪些组打标签；场次目录由 console_sessions 找，不再写死列表。
+CAL_PATH = CS.output_path("phantom", "calibration")
 
 
-def load_calibration():
-    data = json.load(io.open(CAL_PATH, encoding="utf-8"))
+def load_calibration(path=CAL_PATH):
+    data = json.load(io.open(path, encoding="utf-8"))
     out, skipped = {}, []
     for g in data["groups"]:
         # A group whose frames are mostly black cannot pin the mapping, and the fit runs off
@@ -53,25 +52,37 @@ def load_calibration():
     return out
 
 
+def group_captures(key):
+    """一个 (场次, 成像模式) 组的全部单帧采集，按目录名排序。"""
+    caps = [load_capture(p) for p in CS.session_captures(key[0])]
+    return [c for c in caps if T.capture_image_mode(c) == key[1]]
+
+
+def group_target(entry, caps):
+    """Accepted tissue brightness of one group, under that group's own calibration."""
+    cal, floor = entry["cal"], entry["floor"]
+    if floor is None or not caps:
+        return None
+    r = T.measure_accepted_brightness(
+        caps,
+        lambda c: S.render(c.bc0, tgc_levels=c.tgc_levels,
+                           gain_db=S.capture_gain_db(c),
+                           dynamic_range_db=S.dr_ui_to_window_db(c.dynamic_range_level),
+                           depth_response_db=CAL.depth_response_for(c, cal),
+                           reference_db=cal.pivot_db, counts_per_db=cal.counts_per_db),
+        lambda c: T.console_tissue_mask(S.bc0_to_db(c.bc0, cal.counts_per_db), floor))
+    return r["target_gray"] if r else None
+
+
 def console_targets(cal_by_group):
     """Accepted tissue brightness per group, under that group's own calibration."""
     targets = {}
     for key, entry in cal_by_group.items():
-        caps = [load_capture(p) for p in find_captures(DEFAULT_DATA_DIR / key[0])]
-        caps = [c for c in caps if T.capture_image_mode(c) == key[1]]
-        cal, floor = entry["cal"], entry["floor"]
-        if floor is None or not caps:
+        if entry["floor"] is None:
             continue
-        r = T.measure_accepted_brightness(
-            caps,
-            lambda c: S.render(c.bc0, tgc_levels=c.tgc_levels,
-                               gain_db=S.capture_gain_db(c),
-                               dynamic_range_db=S.dr_ui_to_window_db(c.dynamic_range_level),
-                               depth_response_db=CAL.depth_response_for(c, cal),
-                               reference_db=cal.pivot_db, counts_per_db=cal.counts_per_db),
-            lambda c: T.console_tissue_mask(S.bc0_to_db(c.bc0, cal.counts_per_db), floor))
-        if r:
-            targets[key] = r["target_gray"]
+        target = group_target(entry, group_captures(key))
+        if target is not None:
+            targets[key] = target
     return targets
 
 
@@ -81,47 +92,53 @@ def label_console(cal_by_group, targets, limit=None):
         entry = cal_by_group[key]
         if key not in targets or entry["floor"] is None:
             continue
-        cal, floor = entry["cal"], entry["floor"]
-        caps = [load_capture(p) for p in find_captures(DEFAULT_DATA_DIR / key[0])]
-        caps = [c for c in caps if T.capture_image_mode(c) == key[1]]
+        caps = group_captures(key)
         if limit:
             caps = caps[:limit]
-        for cap in caps:
-            db = (S.bc0_to_db(cap.bc0, cal.counts_per_db)
-                  + CAL.depth_response_for(cap, cal)[:, None])
-            vm = T.console_tissue_mask(db, floor)
-            if vm.sum() < 1000:
-                continue
-            notes = []
-            if not entry["floor_measured"]:
-                notes.append("noise floor borrowed from another session in this mode")
-            if not entry["uncertainty_measured"]:
-                notes.append("label uncertainty borrowed from another session in this mode")
-            def leaf(name):
-                try:
-                    return float(get_leaf(cap.fe_params, name))
-                except Exception:
-                    return None
-            freq = leaf("BFreqValue")
-            # BFocusArrayPos is a 16-slot list with the active foci first; a single transmit
-            # focus is the first entry, the rest are zero padding.
+        rows.extend(label_group(key, entry, targets[key], caps))
+    return rows
+
+
+def label_group(key, entry, target, caps):
+    """Back-end labels for the captures of one group."""
+    rows = []
+    cal, floor = entry["cal"], entry["floor"]
+    for cap in caps:
+        db = (S.bc0_to_db(cap.bc0, cal.counts_per_db)
+              + CAL.depth_response_for(cap, cal)[:, None])
+        vm = T.console_tissue_mask(db, floor)
+        if vm.sum() < 1000:
+            continue
+        notes = []
+        if not entry["floor_measured"]:
+            notes.append("noise floor borrowed from another session in this mode")
+        if not entry["uncertainty_measured"]:
+            notes.append("label uncertainty borrowed from another session in this mode")
+        def leaf(name):
             try:
-                focus = float(str(get_leaf(cap.fe_params, "BFocusArrayPos")).split(",")[0])
+                return float(get_leaf(cap.fe_params, name))
             except Exception:
-                focus = None
-            rows.append(LB.label_frame(
-                db, vm, dr_ui=cap.dynamic_range_level, reference_db=cal.pivot_db,
-                current=(S.capture_gain_db(cap),
-                         np.asarray(cap.tgc_levels, dtype=np.float64),
-                         float(cap.dynamic_range_level)),
-                target_gray=targets[key], source="console", frame_id=cap.name,
-                group_id="%s/%d" % key, imaging_mode=T.IMAGE_MODE_NAMES[key[1]],
-                depth_mm=cap.geometry.depth_mm, frequency_mhz=freq,
-                focus_mm=focus, split=None,
-                image_mode=key[1],
-                label_uncertainty=entry["uncertainty"],
-                calibration_borrowed=not entry["floor_measured"],
-                notes=notes).as_dict())
+                return None
+        freq = leaf("BFreqValue")
+        # BFocusArrayPos is a 16-slot list with the active foci first; a single transmit
+        # focus is the first entry, the rest are zero padding.
+        try:
+            focus = float(str(get_leaf(cap.fe_params, "BFocusArrayPos")).split(",")[0])
+        except Exception:
+            focus = None
+        rows.append(LB.label_frame(
+            db, vm, dr_ui=cap.dynamic_range_level, reference_db=cal.pivot_db,
+            current=(S.capture_gain_db(cap),
+                     np.asarray(cap.tgc_levels, dtype=np.float64),
+                     float(cap.dynamic_range_level)),
+            target_gray=target, source="console", frame_id=cap.name,
+            group_id="%s/%d" % key, imaging_mode=T.IMAGE_MODE_NAMES[key[1]],
+            depth_mm=cap.geometry.depth_mm, frequency_mhz=freq,
+            focus_mm=focus, split=None,
+            image_mode=key[1],
+            label_uncertainty=entry["uncertainty"],
+            calibration_borrowed=not entry["floor_measured"],
+            notes=notes).as_dict())
     return rows
 
 

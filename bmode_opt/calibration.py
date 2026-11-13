@@ -109,7 +109,7 @@ from hisense_backend_sim import (
     scan_convert_linear,
     tgc_level_to_db,
 )
-from hisense_loader import NUM_TGC_BANDS, get_leaf
+from hisense_loader import NUM_TGC_BANDS, get_leaf, image_fits_window
 import display_palette as DP
 
 
@@ -161,7 +161,9 @@ class GroupCalibration:
 
 def _select_fit_frames(captures, limit=DEFAULT_FIT_FRAMES):
     """A spread of frames over display depth and gain, so the fit is not one operating point."""
-    usable = [c for c in captures if is_flat_tgc(c)]
+    # A display zoom above the default draws the image larger than the B window, so its
+    # screenshot holds only part of the BC0 and cannot be compared band by band.
+    usable = [c for c in captures if is_flat_tgc(c) and image_fits_window(c.geometry)]
     if not usable:
         return []
     ordered = sorted(usable, key=lambda c: (c.geometry.depth_mm, c.gain_level,

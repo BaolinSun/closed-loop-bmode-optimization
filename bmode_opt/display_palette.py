@@ -147,8 +147,11 @@ def capture_display_gray(capture, crop=True, palette=None):
     returns PIL's luma instead, which reads 3 to 16 levels low across the range because the
     display map is tinted; see the module docstring.
     """
-    from hisense_loader import crop_image_area
+    from hisense_loader import crop_image_area, image_fits_window, screen_image_bounds
 
+    if crop and not image_fits_window(capture.geometry):
+        raise ValueError("%s: display zoom puts the image past the window edges; the "
+                         "screenshot shows only part of it" % capture.name)
     screen = capture_screen_rgb(capture)
     if palette is None:
         # Per-frame extraction can misread; pass a session_palette() when one is available.
@@ -160,8 +163,11 @@ def capture_display_gray(capture, crop=True, palette=None):
                 % capture.name)
     if not crop:
         return invert_palette_fast(screen, palette), palette
-    luma = 0.299 * screen[..., 0] + 0.587 * screen[..., 1] + 0.114 * screen[..., 2]
-    _, (row0, row1, col0, col1) = crop_image_area(luma, capture.geometry.image_width_px)
+    bounds = screen_image_bounds(capture.geometry, screen.shape)
+    if bounds is None:
+        luma = 0.299 * screen[..., 0] + 0.587 * screen[..., 1] + 0.114 * screen[..., 2]
+        _, bounds = crop_image_area(luma, capture.geometry.image_width_px)
+    row0, row1, col0, col1 = bounds
     return invert_palette_fast(screen[row0:row1, col0:col1], palette), palette
 
 

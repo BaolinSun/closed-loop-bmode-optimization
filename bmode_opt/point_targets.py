@@ -26,7 +26,8 @@ from scipy import ndimage
 
 import calibration as CAL
 import hisense_backend_sim as S
-from hisense_loader import DEFAULT_DATA_DIR, find_captures, load_capture
+import console_sessions as CS
+from hisense_loader import load_capture
 
 # 没有场次标定时的缺省换算。不是「只影响刻度」：BC0 是对数域，dB = 计数 / counts_per_db，
 # 换算系数变了，-6 dB 半高全宽的位置和 25 dB 的靶判据都跟着变。2026-09-15 起 resolution_table
@@ -158,7 +159,12 @@ def load_set(mode, session, depth, focus):
     +48.5%、轴向 +22.4% 的假结果。去掉那一帧后谐波轴向是 -19.4%。
     """
     frames = {}
-    for path in sorted(find_captures(DEFAULT_DATA_DIR / session)):
+    try:
+        paths = CS.session_captures(session)
+    except KeyError:
+        # E8 / E9 / 0903_GEN 的 BC0 不在本机：那张表建不出来，由 resolution_table 跳过。
+        return frames
+    for path in sorted(paths):
         capture = load_capture(path)
         if (S.capture_image_mode(capture) == MODE_CODES[mode]
                 and abs(capture.geometry.depth_mm - depth) < 0.5 and capture.focus_mm == focus):

@@ -59,8 +59,9 @@ import point_targets as PT
 import tissue as T
 from fieldii_loader import find_shards, load_shard, parse_shard_name
 import tools_generate_console_labels as G
+import data_paths as DPATH
 
-DATA_DIR = "data/field_ii/full_noise"
+DATA_DIR = str(DPATH.FIELDII_DATA_DIR)
 # 分辨率表的来源。2026-09-21 起用本数据集自己的训练集点靶体模；在它们生成之前借用的是
 # 无噪声旧数据集 data/field_ii/full。两张表最锐的一档都是 8 MHz，各频率分数最大差 0.046
 # （4 MHz），排序完全一致；换成新表的好处是同源、同噪声，而且多了 25 mm 显示深度这一档

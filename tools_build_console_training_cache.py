@@ -14,14 +14,17 @@
 BC0 为 (870 深度点, 256 线)。深度方向按强度分块平均到 512 行（与 Field II 缓存相同的分块
 规则），横向相邻两线按强度平均成 128 线，与 Field II 预训练时的宽度一致。
 
-用法：python tools_build_console_training_cache.py [--labels data/labels_console.jsonl]
-      [--out data/console_dl_cache] [--rows 512] [--lines 128]
-需要 bmode_opt 与 data/hisense_medical（本地 cubdl 环境即可）；生成后把 data/console_dl_cache
-整个目录拷到服务器。
+用法：python tools_build_console_training_cache.py [--dataset invivo]
+      [--labels ...] [--out ...] [--rows 512] [--lines 128] [--workers N]
+--dataset 决定标签、标定与输出目录的默认值（phantom：data/labels_console.jsonl ->
+data/console_dl_cache；invivo：data/labels_console_invivo_carotid.jsonl ->
+data/console_dl_cache_invivo_carotid）。场次目录由 bmode_opt/console_sessions.py 找。
+生成后把输出目录整个拷到服务器。
 """
 
 import argparse
 import collections
+import concurrent.futures
 import hashlib
 import io
 import json
@@ -32,7 +35,11 @@ import time
 sys.path.insert(0, "bmode_opt")
 import numpy as np
 
+import console_sessions as CS
+
 REPORT_PATH = "tools_build_console_training_cache.txt"
+SCALARS = ("min_depth_mm", "max_depth_mm", "reference_db", "noise_floor_top_db",
+           "noise_floor_bottom_db")
 
 
 def block_edges(out_rows, source_rows):
@@ -70,20 +77,59 @@ def file_sha1(path):
     return h.hexdigest()
 
 
+def session_job(session, items, cal_by_group, out_rows, out_lines):
+    """工作进程：一个场次里要缓存的帧。items 为 [(frame_id, mode)]。
+
+    返回 {frame_id: (db, floor, 标量...)}、缺失的 frame_id 与源深度点数。
+    """
+    import calibration as CAL
+    import hisense_backend_sim as S
+    from hisense_loader import load_capture
+
+    wanted = {frame_id for frame_id, _ in items}
+    captures = {}
+    for path in CS.session_captures(session):
+        if path.name in wanted:
+            captures[path.name] = load_capture(path)
+    done, missing, source_rows = {}, [], set()
+    for frame_id, mode in items:
+        capture = captures.get(frame_id)
+        entry = cal_by_group.get((session, mode))
+        if capture is None or entry is None or entry["floor"] is None:
+            missing.append(frame_id)
+            continue
+        cal = entry["cal"]
+        response = CAL.depth_response_for(capture, cal)
+        if response is None:
+            response = np.zeros(capture.bc0.shape[0])
+        db = S.bc0_to_db(capture.bc0, cal.counts_per_db) + response[:, None]
+        floor = float(entry["floor"]) + response
+        source_rows.add(db.shape[0])
+        done[frame_id] = (
+            pool_lines(pool_rows(db, out_rows), out_lines).astype(np.float32),
+            pool_rows(floor, out_rows).astype(np.float32),
+            float(capture.geometry.min_depth_mm), float(capture.geometry.depth_mm),
+            float(cal.pivot_db), float(floor[0]), float(floor[-1]))
+    return done, missing, source_rows
+
+
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--labels", default="data/labels_console.jsonl")
-    parser.add_argument("--out", default="data/console_dl_cache")
+    parser.add_argument("--dataset", choices=sorted(CS.DATASETS), default="phantom")
+    parser.add_argument("--labels", default=None)
+    parser.add_argument("--calibration", default=None)
+    parser.add_argument("--out", default=None)
     parser.add_argument("--rows", type=int, default=512)
     parser.add_argument("--lines", type=int, default=128)
+    parser.add_argument("--workers", type=int, default=max(1, (os.cpu_count() or 2) - 4))
     args = parser.parse_args()
+    args.labels = args.labels or CS.output_path(args.dataset, "labels")
+    args.out = args.out or CS.output_path(args.dataset, "cache")
+    cal_path = args.calibration or CS.output_path(args.dataset, "calibration")
     started = time.time()
     lines = []
     emit = lines.append
 
-    import calibration as CAL
-    import hisense_backend_sim as S
-    from hisense_loader import DEFAULT_DATA_DIR, find_captures, load_capture
     import tools_generate_labels as TG
     import tools_generate_console_labels as G
 
@@ -91,57 +137,55 @@ def main():
         rows = [json.loads(line) for line in handle if line.strip()]
 
     # 与生成标签时同一顺序：读标定 -> 把借来的底噪按计数换算
-    cal_by_group = TG.load_calibration()
+    cal_by_group = TG.load_calibration(cal_path)
     G.floors_in_counts(cal_by_group)
 
     by_session = collections.defaultdict(list)
     for row in rows:
         session, mode = row["group_id"].rsplit("/", 1)
-        by_session[session].append((row, int(mode)))
+        by_session[session].append((row["frame_id"], int(mode)))
 
-    out = collections.defaultdict(list)
+    # 预先分配，几万帧时不必先攒一份列表再 np.stack 复制一遍。
+    order = [frame_id for session in sorted(by_session) for frame_id, _ in by_session[session]]
+    position = {frame_id: i for i, frame_id in enumerate(order)}
+    db_all = np.empty((len(order), args.rows, args.lines), np.float32)
+    floor_all = np.empty((len(order), args.rows), np.float32)
+    scalars = np.empty((len(order), len(SCALARS)), np.float32)
+    filled = np.zeros(len(order), bool)
     missing, source_rows = [], set()
-    for session in sorted(by_session):
-        captures = {}
-        for path in find_captures(DEFAULT_DATA_DIR / session):
-            capture = load_capture(path)
-            captures[capture.name] = capture
-        for row, mode in by_session[session]:
-            capture = captures.get(row["frame_id"])
-            entry = cal_by_group.get((session, mode))
-            if capture is None or entry is None or entry["floor"] is None:
-                missing.append(row["frame_id"])
-                continue
-            cal = entry["cal"]
-            response = CAL.depth_response_for(capture, cal)
-            if response is None:
-                response = np.zeros(capture.bc0.shape[0])
-            db = S.bc0_to_db(capture.bc0, cal.counts_per_db) + response[:, None]
-            floor = float(entry["floor"]) + response
-            source_rows.add(db.shape[0])
-            out["frame_id"].append(row["frame_id"])
-            out["db"].append(pool_lines(pool_rows(db, args.rows), args.lines).astype(np.float32))
-            out["floor"].append(pool_rows(floor, args.rows).astype(np.float32))
-            out["min_depth_mm"].append(float(capture.geometry.min_depth_mm))
-            out["max_depth_mm"].append(float(capture.geometry.depth_mm))
-            out["reference_db"].append(float(cal.pivot_db))
-            out["noise_floor_top_db"].append(float(floor[0]))
-            out["noise_floor_bottom_db"].append(float(floor[-1]))
+    with concurrent.futures.ProcessPoolExecutor(args.workers) as pool:
+        futures = [pool.submit(session_job, session, by_session[session],
+                               {k: v for k, v in cal_by_group.items() if k[0] == session},
+                               args.rows, args.lines)
+                   for session in sorted(by_session)]
+        for count, future in enumerate(concurrent.futures.as_completed(futures), 1):
+            done, lost, seen = future.result()
+            missing.extend(lost)
+            source_rows |= seen
+            for frame_id, (db, floor, *values) in done.items():
+                i = position[frame_id]
+                db_all[i], floor_all[i], scalars[i] = db, floor, values
+                filled[i] = True
+            if count % 20 == 0 or count == len(futures):
+                print("  %d / %d sessions" % (count, len(futures)), flush=True)
 
     if len(source_rows) != 1:
         raise SystemExit("captures have different depth sample counts: %s" % sorted(source_rows))
     source = source_rows.pop()
 
     os.makedirs(args.out, exist_ok=True)
-    arrays = {k: np.asarray(v) for k, v in out.items()}
-    arrays["db"] = np.stack(out["db"])
-    arrays["floor"] = np.stack(out["floor"])
-    for k in ("min_depth_mm", "max_depth_mm", "reference_db", "noise_floor_top_db", "noise_floor_bottom_db"):
-        arrays[k] = arrays[k].astype(np.float32)
+    keep = np.flatnonzero(filled)
+    arrays = {"frame_id": np.asarray(order)[keep],
+              "db": db_all[keep] if keep.size < len(order) else db_all,
+              "floor": floor_all[keep] if keep.size < len(order) else floor_all}
+    for k, name in enumerate(SCALARS):
+        arrays[name] = scalars[keep, k]
     np.savez(os.path.join(args.out, "cache.npz"), **arrays)
     index = {
         "created": time.strftime("%Y-%m-%d %H:%M"),
         "source": "console",
+        "dataset": args.dataset,
+        "calibration": cal_path,
         "labels": args.labels,
         "labels_sha1": file_sha1(args.labels),
         "frames": int(len(arrays["frame_id"])),
@@ -163,15 +207,18 @@ def main():
     emit("  wrote %s/cache.npz: db %s (source rows %d), floor %s, %.0f MB"
          % (args.out, arrays["db"].shape, source, arrays["floor"].shape,
             (arrays["db"].nbytes + arrays["floor"].nbytes) / 1e6))
-    emit("  db range p1 %.1f  p50 %.1f  p99 %.1f dB" % tuple(np.percentile(arrays["db"], [1, 50, 99])))
+    # 几万帧时按帧抽样算分位数，免得整块再复制一份。
+    sample = arrays["db"][::max(1, len(arrays["db"]) // 2000)]
+    emit("  db range p1 %.1f  p50 %.1f  p99 %.1f dB" % tuple(np.percentile(sample, [1, 50, 99])))
     emit("  reference_db (group pivot) %.2f - %.2f dB; noise floor top %.1f - %.1f dB"
          % (arrays["reference_db"].min(), arrays["reference_db"].max(),
             arrays["noise_floor_top_db"].min(), arrays["noise_floor_top_db"].max()))
     emit("  display depth %s mm" % sorted(set(np.round(arrays["max_depth_mm"], 1).tolist())))
     emit("  done in %.0f s" % (time.time() - started))
     text = "\n".join(lines)
-    io.open(REPORT_PATH, "w", encoding="utf-8").write(text + "\n")
-    print(text)
+    io.open(CS.report_path(REPORT_PATH, args.dataset,
+                                 args.out if args.out != CS.output_path(args.dataset, "cache") else None), "w", encoding="utf-8").write(text + "\n")
+    print(text.encode("ascii", "replace").decode("ascii"))
 
 
 if __name__ == "__main__":

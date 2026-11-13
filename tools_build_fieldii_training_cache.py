@@ -32,6 +32,8 @@ from pathlib import Path
 sys.path.insert(0, "bmode_opt")
 import numpy as np
 
+import data_paths as DPATH
+
 REPORT_PATH = "tools_build_fieldii_training_cache.txt"
 SOURCE_ROWS = 1851
 
@@ -76,9 +78,9 @@ def file_sha1(path, limit_bytes=None):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--labels", default="data/labels_fieldii.jsonl")
-    parser.add_argument("--data-dir", default="data/field_ii/full_noise",
+    parser.add_argument("--data-dir", default=str(DPATH.FIELDII_DATA_DIR),
                         help="used when a label row has no data_dir field")
-    parser.add_argument("--out", default="data/fieldii_dl_cache")
+    parser.add_argument("--out", default=str(DPATH.output_dir("fieldii_dl_cache")))
     parser.add_argument("--rows", type=int, default=512)
     parser.add_argument("--workers", type=int, default=8)
     parser.add_argument("--limit", type=int, default=None, help="only the first N rows (for a quick test)")

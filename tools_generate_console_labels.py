@@ -59,11 +59,24 @@
 E9_THI 20.67 dB x 551.8 = 11406，差 2.2%；dB 值却差 3.6 dB。所以借的是计数，再按
 本场次的 counts_per_db 换回 dB。
 
-用法：python tools_generate_console_labels.py
+    两套数据（--dataset）
+
+  phantom  体模：锚点相关切族，标定 bmode_opt/console_calibration.json，写 data/labels_console.jsonl。
+  invivo   人体颈动脉（2026-10 新固件）：按采集方案切族（scene_family.segment_protocol），
+           标定 bmode_opt/console_calibration_invivo_carotid.json，写
+           data/labels_console_invivo_carotid.jsonl。每名受试者都有 67 mm 帧，底噪全部自己量，
+           不向体模借：新固件 BC0 底噪约 6270 计数，体模约 11150，差 8-9 dB。
+标签判据两套数据完全相同；人体上是否合适是另一回事（深度按穿透取景、频率在当前深度上
+判、聚焦按散斑宽度），这里不改。
+
+组之间互不依赖，按组并行（--workers）。
+
+用法：python tools_generate_console_labels.py [--dataset invivo] [--workers N]
 """
 
 import argparse
 import collections
+import concurrent.futures
 import io
 import json
 import os
@@ -73,6 +86,7 @@ import time
 sys.path.insert(0, "bmode_opt")
 import numpy as np
 
+import console_sessions as CS
 import front_end as FE
 import hisense_backend_sim as S
 import labels as LB
@@ -80,10 +94,11 @@ import point_targets as PT
 import scene_family as SF
 import tissue as T
 import tools_generate_labels as TG
-from hisense_loader import DEFAULT_DATA_DIR, find_captures, load_capture
+from hisense_loader import load_capture
 
-OUT_PATH = "data/labels_console.jsonl"
-CAL_PATH = "bmode_opt/console_calibration.json"
+OUT_PATH = CS.output_path("phantom", "labels")
+CAL_PATH = CS.output_path("phantom", "calibration")
+SEGMENT_METHOD = {"phantom": "anchor_correlation", "invivo": "protocol"}
 
 # ---- 频率与深度共用的判据（2026-09-14 改）----
 #
@@ -128,16 +143,33 @@ AXIS_INDEX = {"depth_mm": 1, "frequency_mhz": 2, "focus_mm": 3}
 CONSOLE_LADDERS = {}
 
 
-def console_ladders():
+def session_settings(session):
+    """[(模式, 显示深度 mm, 频率 MHz)]，与 scene_family.front_setting 同样取整。
+
+    人体场次直接读清单，不读 BC0；体模场次没有清单，逐帧载入。
+    """
+    meta = CS.session_metadata(session)
+    if meta is not None:
+        return [(f["image_mode"], round(f["depth_mm"], 1), round(f["frequency_mhz"], 2))
+                for f in meta]
+    out = []
+    for path in CS.session_captures(session):
+        setting = SF.front_setting(load_capture(path))
+        out.append(setting[:3])
+    return out
+
+
+def console_ladders(sessions=None):
     """{(模式, 轴): 排好序的档位}。只收深度与频率：聚焦档位随显示深度移动，一个模式里
-    合并起来没有意义，聚焦的边界仍按比较集自己的范围判断。"""
+    合并起来没有意义，聚焦的边界仍按比较集自己的范围判断。
+
+    sessions 默认是体模全部场次；人体数据传自己的受试者列表，阶梯取自它自己的采集。
+    """
     ladders = collections.defaultdict(set)
-    for path in DEFAULT_DATA_DIR.rglob("Algo_BC0.bin"):
-        capture = load_capture(path.parent)
-        mode = S.capture_image_mode(capture)
-        setting = SF.front_setting(capture)
-        ladders[(mode, "depth_mm")].add(setting[AXIS_INDEX["depth_mm"]])
-        ladders[(mode, "frequency_mhz")].add(setting[AXIS_INDEX["frequency_mhz"]])
+    for session in (CS.sessions("phantom") if sessions is None else sessions):
+        for mode, depth, frequency in session_settings(session):
+            ladders[(mode, "depth_mm")].add(depth)
+            ladders[(mode, "frequency_mhz")].add(frequency)
     return {k: sorted(v) for k, v in ladders.items()}
 
 
@@ -163,33 +195,39 @@ def floors_in_counts(cal_by_group):
     高 5.5 dB，会把真实组织当噪声剔除。
 
     量到了的组保留自己的测量值，只替换借来的。
+
+    只在【同一套数据】、同一成像模式内借（键是 (来源, 模式)）。2026-10 的新固件把 BC0
+    整体压低了 8-9 dB：人体受试者的接收机底噪约 6270 计数，体模约 11150。两边混在一起
+    取中位数，会让体模组借到偏低的底噪、人体组借到偏高的底噪。人体受试者都有 67 mm 帧，
+    本来就全部自己量到，不会借。
     """
     deep_enough = {}
     for key in cal_by_group:
         try:
-            paths = find_captures(DEFAULT_DATA_DIR / key[0])
-        except Exception:
+            settings = session_settings(key[0])
+        except (KeyError, OSError):
             deep_enough[key] = False
             continue
-        captures = [load_capture(p) for p in paths]
-        deep_enough[key] = any(
-            S.capture_image_mode(c) == key[1]
-            and c.geometry.depth_mm >= T.NOISE_FLOOR_MIN_DEPTH_MM for c in captures)
+        deep_enough[key] = any(mode == key[1] and depth >= T.NOISE_FLOOR_MIN_DEPTH_MM
+                               for mode, depth, _ in settings)
 
-    per_mode = collections.defaultdict(list)
+    def pool(key):
+        return CS.session_source(key[0]), key[1]
+
+    per_pool = collections.defaultdict(list)
     for key, entry in cal_by_group.items():
         if deep_enough[key] and entry["floor"] is not None:
-            per_mode[key[1]].append(entry["floor"] * entry["cal"].counts_per_db)
+            per_pool[pool(key)].append(entry["floor"] * entry["cal"].counts_per_db)
     changed = []
     for key, entry in cal_by_group.items():
-        if deep_enough[key] or not per_mode.get(key[1]):
+        if deep_enough[key] or not per_pool.get(pool(key)):
             continue
-        counts = float(np.median(per_mode[key[1]]))
+        counts = float(np.median(per_pool[pool(key)]))
         new = counts / entry["cal"].counts_per_db
         changed.append((key, entry["floor"], new))
         entry["floor"] = new
         entry["floor_measured"] = False
-    return changed, {m: (float(np.median(v)), len(v)) for m, v in per_mode.items()}
+    return changed, {p: (float(np.median(v)), len(v)) for p, v in per_pool.items()}
 
 
 def measure_frame(capture, calibration, floor_db):
@@ -273,8 +311,12 @@ def sharpest(candidates, tables):
     return min(scored, key=scored.get), scored
 
 
-def optimum_frequency(members, measured):
+def optimum_frequency(members, measured, excess_depth_mm=None):
     """图像底部仍高出底噪 FREQUENCY_MARGIN_DB 的频率里，分辨率分数最低的一档。
+
+    excess_depth_mm 给定时不看图像底部，改看这个深度处（往上 BOTTOM_WINDOW_MM 的平均）的余量。
+    人体以目标为准的频率规则用它：在颈动脉远壁下方判断覆盖不覆盖得住
+    （tools_generate_target_frontend_labels.py）。不给时与原来完全相同。
 
     2026-09-14 前的规则是「穿透 3 dB 覆盖得住的最高频」，有三处问题：
       一、默认频率越高越锐。点靶显示基波显示深度 >=41.9 mm 时 10/11.4 MHz 反而比
@@ -300,7 +342,8 @@ def optimum_frequency(members, measured):
     by_value = collections.defaultdict(list)
     for name, setting in members:
         by_value[setting[AXIS_INDEX["frequency_mhz"]]].append(
-            excess_at(measured[name], measured[name]["display_depth_mm"]))
+            excess_at(measured[name], measured[name]["display_depth_mm"]
+                      if excess_depth_mm is None else excess_depth_mm))
     swept = sorted(by_value)
     excess = {f: float(np.mean(v)) for f, v in by_value.items()}
     ladder = CONSOLE_LADDERS.get((mode, "frequency_mhz")) or swept
@@ -313,6 +356,8 @@ def optimum_frequency(members, measured):
     nominal = feasible(FREQUENCY_MARGIN_DB)
     strict = feasible(FREQUENCY_MARGIN_DB + FREQUENCY_BORDER_DB)
     excess_text = u" ".join(u"%g:%.1f" % (f, excess[f]) for f in swept)
+    where = (u"the bottom of the %.1f mm image" % depth if excess_depth_mm is None
+             else u"%.1f mm (below the far wall)" % excess_depth_mm)
     table_text = u"/".join(u"%g" % d for _, _, d in tables) or u"none"
 
     if not lenient:
@@ -321,9 +366,8 @@ def optimum_frequency(members, measured):
         extra = {"frequency_label_kind": "infeasible",
                  "frequency_loss_weight": INFEASIBLE_WEIGHT}
         at_edge = best != ladder[0]
-        basis = (u"no swept frequency keeps %.0f dB over the floor at the bottom of the %.1f mm "
-                 u"image (bottom excess dB %s)"
-                 % (FREQUENCY_MARGIN_DB - FREQUENCY_BORDER_DB, depth, excess_text))
+        basis = (u"no swept frequency keeps %.0f dB over the floor at %s (excess dB %s)"
+                 % (FREQUENCY_MARGIN_DB - FREQUENCY_BORDER_DB, where, excess_text))
     else:
         # 正常门槛下没有覆盖得住、宽松门槛下有的，按宽松门槛选；这时按正常门槛本该
         # 是「无解取最低频」，所以最低频也放进可接受集合。
@@ -349,10 +393,10 @@ def optimum_frequency(members, measured):
         extra = {"frequency_label_kind": "measured", "frequency_loss_weight": 1.0}
         # 选中的是扫过的最高档而主机上还有更高的档没扫：那一档也许同样覆盖得住且更锐。
         at_edge = best == swept[-1] and best != ladder[-1]
-        basis = (u"sharpest of %s by resolution table %s mm%s (bottom excess dB %s)"
+        basis = (u"sharpest of %s by resolution table %s mm%s (excess dB at %s: %s)"
                  % (u"/".join(u"%g" % f for f in chosen), table_text,
                     u"" if nominal else u", only under the lenient %.0f dB margin"
-                    % (FREQUENCY_MARGIN_DB - FREQUENCY_BORDER_DB), excess_text))
+                    % (FREQUENCY_MARGIN_DB - FREQUENCY_BORDER_DB), where, excess_text))
     extra.update({
         "frequency_acceptable_mhz": sorted(float(f) for f in acceptable),
         "frequency_confidence": "firm" if acceptable == {best} else "borderline",
@@ -507,6 +551,10 @@ def frontend_labels(family, measured):
         fields[name]["family_id"] = family.family_id
         fields[name]["family_unbracketed"] = name in family.unbracketed
         fields[name]["family_anchor_starved"] = family.anchor_starved
+        # 人体族按采集方案切，相关只作标记：族内相邻锚点相关的最小值，低于
+        # scene_family.SAME_SCENE_CORR 即 family_motion_flag。
+        fields[name]["family_motion_flag"] = family.motion_flag
+        fields[name]["family_anchor_min_corr"] = family.anchor_min_corr
 
     def write(name, axis, result):
         best, ladder, at_edge, basis, extra = result
@@ -596,29 +644,81 @@ def frontend_labels(family, measured):
     return fields
 
 
+def _init_worker(ladders, resolution):
+    """工作进程是新起的解释器（Windows 用 spawn），模块级的阶梯与分辨率表要重新填。"""
+    CONSOLE_LADDERS.update(ladders)
+    RESOLUTION.update(resolution)
+
+
+def label_group_job(key, entry, method):
+    """工作进程：一个 (场次, 模式) 组的后端标签、族与前端字段，只读一遍采集。"""
+    try:
+        captures = sorted(TG.group_captures(key), key=lambda c: c.name)
+        target = TG.group_target(entry, captures)
+        if target is None:
+            return {"rows": [], "front": {}, "families": [], "target": None}
+        rows = TG.label_group(key, entry, target, captures)
+        measured = {c.name: measure_frame(c, entry["cal"], entry["floor"]) for c in captures}
+        front, families = {}, []
+        for family in SF.segment(captures, method, session=key[0]):
+            front.update(frontend_labels(family, measured))
+            families.append({"family_id": family.family_id, "frames": len(family),
+                             "swept_axes": list(family.swept_axes()),
+                             "method": family.method, "motion_flag": family.motion_flag})
+        return {"rows": rows, "front": front, "families": families, "target": target}
+    except Exception as exc:
+        return {"error": "%s: %s" % (type(exc).__name__, exc)}
+
+
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--out", default=OUT_PATH)
+    parser.add_argument("--dataset", choices=sorted(CS.DATASETS), default="phantom")
+    parser.add_argument("--calibration", default=None)
+    parser.add_argument("--out", default=None)
+    parser.add_argument("--sessions", default=None,
+                        help="comma separated subset of the calibrated sessions")
+    parser.add_argument("--workers", type=int, default=max(1, (os.cpu_count() or 2) - 4))
     args = parser.parse_args()
+    out_path = args.out or CS.output_path(args.dataset, "labels")
+    cal_path = args.calibration or CS.output_path(args.dataset, "calibration")
+    method = SEGMENT_METHOD[args.dataset]
     started = time.time()
     lines = []
     emit = lines.append
 
-    CONSOLE_LADDERS.update(console_ladders())
+    sessions = CS.sessions(args.dataset)
+    CONSOLE_LADDERS.update(console_ladders(sessions))
+    # 分辨率表只能在体模点靶上量（人体没有点靶），两套数据共用同一张。
     tables, pins = PT.resolution_table()
     RESOLUTION.update(tables)
+    emit(u"dataset %s: calibration %s, segmentation %s" % (args.dataset, cal_path, method))
+    emit(u"")
     emit(u"=========== console resolution table from point targets (lower = sharper) ===========")
     for (mode, depth), scores in sorted(tables.items()):
         emit(u"  %-12s display %5.1f mm  %2d pins   %s" % (
             T.IMAGE_MODE_NAMES[mode], depth, pins[(mode, depth)],
             u"  ".join(u"%g:%.3f" % (f, s) for f, s in sorted(scores.items()))))
+    missing = [(mode, depth, session) for mode, session, depth, _ in PT.RESOLUTION_SETS
+               if (PT.MODE_CODES[mode], depth) not in tables]
+    for mode, depth, session in missing:
+        emit(u"  %-12s display %5.1f mm  not built: session %s not found"
+             % (mode, depth, session))
     emit(u"")
-    cal_by_group = TG.load_calibration()
-    changed, mode_counts = floors_in_counts(cal_by_group)
+    cal_by_group = TG.load_calibration(cal_path)
+    if args.sessions:
+        wanted = set(args.sessions.split(","))
+        cal_by_group = {k: v for k, v in cal_by_group.items() if k[0] in wanted}
+    changed, pool_counts = floors_in_counts(cal_by_group)
     emit(u"=========== noise floor borrowed in counts, not in dB ===========")
-    for mode, (counts, n) in sorted(mode_counts.items()):
-        emit(u"  %-12s receiver floor %.0f BC0 counts (median of %d groups with deep frames)"
-             % (T.IMAGE_MODE_NAMES[mode], counts, n))
+    for (source, mode), (counts, n) in sorted(pool_counts.items()):
+        emit(u"  %-8s %-12s receiver floor %.0f BC0 counts (median of %d groups with deep frames)"
+             % (source, T.IMAGE_MODE_NAMES[mode], counts, n))
+    floor_counts = [e["floor"] * e["cal"].counts_per_db for e in cal_by_group.values()
+                    if e["floor"] is not None]
+    if floor_counts:
+        emit(u"  per-group floor in counts: min %.0f / median %.0f / max %.0f over %d groups"
+             % (min(floor_counts), float(np.median(floor_counts)), max(floor_counts),
+                len(floor_counts)))
     emit(u"")
     emit(u"=========== console ladders (edge means the console could still go further) ===========")
     for (mode, axis), ladder in sorted(CONSOLE_LADDERS.items()):
@@ -629,24 +729,34 @@ def main():
         emit(u"  %-28s %-12s borrowed floor %6.2f -> %6.2f dB"
              % (key[0], T.IMAGE_MODE_NAMES[key[1]], old, new))
 
-    targets = TG.console_targets(cal_by_group)
-    backend = TG.label_console(cal_by_group, targets)
-    rows = {row["frame_id"]: row for row in backend}
+    jobs = [key for key in sorted(cal_by_group) if cal_by_group[key]["floor"] is not None]
+    results, failures = {}, {}
+    print("labelling %d group(s) with %d worker(s) ..." % (len(jobs), args.workers), flush=True)
+    with concurrent.futures.ProcessPoolExecutor(
+            args.workers, initializer=_init_worker,
+            initargs=(dict(CONSOLE_LADDERS), dict(RESOLUTION))) as pool:
+        futures = {pool.submit(label_group_job, key, cal_by_group[key], method): key
+                   for key in jobs}
+        for done, future in enumerate(concurrent.futures.as_completed(futures), 1):
+            key = futures[future]
+            result = future.result()
+            if "error" in result:
+                failures[key] = result["error"]
+            else:
+                results[key] = result
+            if done % 20 == 0 or done == len(futures):
+                print("  %d / %d groups  (%.0f s)" % (done, len(futures), time.time() - started),
+                      flush=True)
+
+    # 与原来的顺序相同：按组键排序，组内按采集名。
+    rows, front, families = {}, {}, []
+    for key in sorted(results):
+        rows.update((row["frame_id"], row) for row in results[key]["rows"])
+        front.update(results[key]["front"])
+        families.extend(results[key]["families"])
+    no_target = sorted(key for key in results if results[key]["target"] is None)
     emit(u"")
     emit(u"back-end labels: %d frames  (%.0f s)" % (len(rows), time.time() - started))
-
-    front = {}
-    for key in sorted(cal_by_group):
-        session, mode = key
-        entry = cal_by_group[key]
-        if entry["floor"] is None:
-            continue
-        captures = sorted((load_capture(p) for p in find_captures(DEFAULT_DATA_DIR / session)),
-                          key=lambda c: c.name)
-        captures = [c for c in captures if S.capture_image_mode(c) == mode]
-        measured = {c.name: measure_frame(c, entry["cal"], entry["floor"]) for c in captures}
-        for family in SF.segment_session(captures, session=session):
-            front.update(frontend_labels(family, measured))
     emit(u"front-end fields: %d frames  (%.0f s)" % (len(front), time.time() - started))
 
     merged, backend_only = [], 0
@@ -655,20 +765,23 @@ def main():
         # 取一位小数（41.9、67.0）。不统一的话 optimal_depth_mm - depth_mm 与
         # delta_depth_mm 对不上，当前值也不在阶梯里。差的只有 0.01-0.03 mm，统一成一位小数。
         row["depth_mm"] = round(float(row["depth_mm"]), 1)
+        # 新固件把 BFreqValue 写成 9 位小数（4.400000095），旧固件是 6 位（4.400000）。不取整的话
+        # bmode_dl.labels.collect_ladders 会把 4.4 与 4.400000095 当成两档，频率头从 5 档变 9 档。
+        row["frequency_mhz"] = round(float(row["frequency_mhz"]), 1)
         if frame_id in front:
             row.update(front[frame_id])
         else:
             backend_only += 1
         merged.append(row)
 
-    os.makedirs(os.path.dirname(args.out), exist_ok=True)
-    with io.open(args.out, "w", encoding="utf-8") as handle:
+    os.makedirs(os.path.dirname(out_path), exist_ok=True)
+    with io.open(out_path, "w", encoding="utf-8") as handle:
         for row in merged:
             handle.write(json.dumps(row, ensure_ascii=False) + "\n")
 
     emit(u"")
     emit(u"=========== coverage: which axes each frame carries ===========")
-    emit(u"  %d rows written to %s" % (len(merged), args.out))
+    emit(u"  %d rows written to %s" % (len(merged), out_path))
     if backend_only:
         emit(u"  %d rows have back-end labels but no front-end fields" % backend_only)
     for stem, names in [("depth", DEPTH_DIRECTIONS), ("frequency", FREQUENCY_DIRECTIONS),
@@ -692,12 +805,46 @@ def main():
         emit(u"  %-10s %s" % (axis, dict(collections.Counter(r[key] for r in merged))))
     emit(u"  %-10s determined %d / %d" % ("dyn range", sum(r["dr_determined"] for r in merged),
                                           len(merged)))
+    emit(u"  family motion flag on %d / %d rows"
+         % (sum(bool(r.get("family_motion_flag")) for r in merged), len(merged)))
+
+    emit(u"")
+    emit(u"=========== per group ===========")
+    per_group = collections.defaultdict(list)
+    for row in merged:
+        per_group[row["group_id"]].append(row)
+    emit(u"  groups labelled %d of %d calibrated (%d without a brightness target, %d failed)"
+         % (len(per_group), len(cal_by_group), len(no_target), len(failures)))
+    sizes = [len(v) for v in per_group.values()]
+    if sizes:
+        emit(u"  rows per group: min %d / median %d / max %d"
+             % (min(sizes), int(np.median(sizes)), max(sizes)))
+    for stem in ("depth", "frequency", "focus"):
+        share = [np.mean([bool(r.get("%s_determined" % stem)) for r in v])
+                 for v in per_group.values()]
+        if share:
+            emit(u"  %-10s determined share per group: min %.2f / median %.2f / groups at 0: %d"
+                 % (stem, min(share), float(np.median(share)), sum(s == 0 for s in share)))
+    per_session = collections.Counter(f["family_id"].rsplit("/", 1)[0] for f in families)
+    full = collections.Counter(f["family_id"].rsplit("/", 1)[0] for f in families
+                               if len(f["swept_axes"]) == 3)
+    emit(u"  families per group  %s" % dict(sorted(collections.Counter(per_session.values()).items())))
+    emit(u"  families sweeping all three axes per group  %s"
+         % dict(sorted(collections.Counter(full.get(s, 0) for s in per_session).items())))
+    emit(u"  family method %s; motion-flagged families %d of %d"
+         % (dict(collections.Counter(f["method"] for f in families)),
+            sum(f["motion_flag"] for f in families), len(families)))
+    for key in no_target:
+        emit(u"  no brightness target: %s/%d" % key)
+    for key, error in sorted(failures.items()):
+        emit(u"  FAILED %s/%d  %s" % (key[0], key[1], error))
     emit(u"")
     emit(u"done in %.0f s" % (time.time() - started))
 
     text = "\n".join(lines)
-    io.open("tools_generate_console_labels.txt", "w", encoding="utf-8").write(text)
-    print(text)
+    io.open(CS.report_path(__file__, args.dataset,
+                                  args.out or (out_path if args.sessions or args.calibration else None)), "w", encoding="utf-8").write(text)
+    print(text.encode("ascii", "replace").decode("ascii"))
 
 
 if __name__ == "__main__":

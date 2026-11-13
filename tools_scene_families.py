@@ -9,9 +9,18 @@
 一根轴的族，另外两根轴没有可比对象，那两个标签必须留空——这就是后面标签里逐轴
 `*_determined` 标志的依据。
 
-用法：python tools_scene_families.py
+场次由 bmode_opt/console_sessions.py 发现。两套数据切法不同（见 scene_family 模块文档）：
+
+  --dataset phantom  锚点相关切（segment_session），写 data/scene_families.json
+  --dataset invivo   按采集方案切（segment_protocol），相关只作质量标记，
+                     写 data/scene_families_invivo_carotid.json
+
+用法：python tools_scene_families.py [--dataset invivo] [--workers N]
 """
 
+import argparse
+import collections
+import concurrent.futures
 import io
 import json
 import os
@@ -19,55 +28,94 @@ import sys
 
 sys.path.insert(0, "bmode_opt")
 
+import console_sessions as CS
 import scene_family as SF
-from hisense_loader import DEFAULT_DATA_DIR, find_captures, load_capture
+from hisense_loader import load_capture
 
-OUT_JSON = "data/scene_families.json"
 MODE_NAMES = {0: "fundamental", 1: "harmonic"}
+METHOD = {"phantom": "anchor_correlation", "invivo": "protocol"}
 
 
-def sessions():
-    """全部采集场次，含 20260828/GEN 这类嵌套目录。"""
-    found = []
-    for path in sorted(DEFAULT_DATA_DIR.rglob("Algo_BC0.bin")):
-        label = str(path.parent.parent.relative_to(DEFAULT_DATA_DIR)).replace("\\", "/")
-        if label not in found:
-            found.append(label)
-    return found
+def session_families(label, method):
+    """工作进程：读一个场次、切族。"""
+    captures = sorted((load_capture(p) for p in CS.session_captures(label)),
+                      key=lambda c: c.name)
+    return SF.segment(captures, method, session=label)
 
 
 def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--dataset", choices=sorted(CS.DATASETS), default="phantom")
+    parser.add_argument("--out", default=None)
+    parser.add_argument("--workers", type=int, default=max(1, (os.cpu_count() or 2) - 4))
+    args = parser.parse_args()
+    out_json = args.out or CS.output_path(args.dataset, "families")
+    method = METHOD[args.dataset]
     lines = []
     emit = lines.append
 
-    all_families, records = [], []
-    for label in sessions():
-        captures = sorted((load_capture(p) for p in find_captures(DEFAULT_DATA_DIR / label)),
-                          key=lambda c: c.name)
-        families = SF.segment_session(captures, session=label)
-        all_families.extend(families)
+    labels = CS.sessions(args.dataset)
+    all_families, records, failures = [], [], {}
+    with concurrent.futures.ProcessPoolExecutor(args.workers) as pool:
+        futures = {label: pool.submit(session_families, label, method) for label in labels}
+        for label in labels:
+            try:
+                all_families.extend(futures[label].result())
+            except Exception as exc:
+                failures[label] = "%s: %s" % (type(exc).__name__, exc)
 
     emit(u"=========== scene families ===========")
     emit(u"  A family is one probe placement. Frames in different families are of")
     emit(u"  different scenes and must never be compared to pick a front-end setting.")
     emit(u"")
-    emit(u"%-26s %6s %7s %7s %-28s %s"
-         % (u"family", u"frames", u"anchors", u"loose", u"swept axes", u"flag"))
+    emit(u"%-30s %6s %7s %7s %8s %-28s %s"
+         % (u"family", u"frames", u"anchors", u"loose", u"min corr", u"swept axes", u"flag"))
     for family in all_families:
-        emit(u"%-26s %6d %7d %7d %-28s %s"
+        flags = [u"anchor starved"] if family.anchor_starved else []
+        if family.motion_flag:
+            flags.append(u"motion")
+        if family.method != method:
+            flags.append(family.method)
+        emit(u"%-30s %6d %7d %7d %8s %-28s %s"
              % (family.family_id, len(family), len(family.anchor_names),
-                len(family.unbracketed), u", ".join(family.swept_axes()) or u"-",
-                u"anchor starved" if family.anchor_starved else u""))
+                len(family.unbracketed),
+                u"-" if family.anchor_min_corr is None else u"%.3f" % family.anchor_min_corr,
+                u", ".join(family.swept_axes()) or u"-", u", ".join(flags)))
         records.append({
             "family_id": family.family_id,
             "session": family.session,
+            "method": family.method,
             "frame_names": family.frame_names,
             "anchor_names": family.anchor_names,
             "unbracketed": family.unbracketed,
             "anchor_starved": family.anchor_starved,
+            "anchor_min_corr": family.anchor_min_corr,
+            "motion_flag": family.motion_flag,
+            "sweeps": [[axis, list(values)] for axis, values in family.sweeps],
             "swept_axes": list(family.swept_axes()),
             "settings": [list(s) for s in family.settings],
         })
+
+    emit(u"")
+    emit(u"=========== families per session ===========")
+    per_session = collections.Counter(f.session for f in all_families)
+    full = collections.Counter(f.session for f in all_families
+                               if len(f.swept_axes()) == len(SF.FRONT_AXES))
+    emit(u"  sessions %d   families %d   families sweeping all three axes %d"
+         % (len(per_session), len(all_families), sum(full.values())))
+    emit(u"  families per session            %s"
+         % dict(sorted(collections.Counter(per_session.values()).items())))
+    emit(u"  all-three-axes families/session %s"
+         % dict(sorted(collections.Counter(full.get(s, 0) for s in per_session).items())))
+    emit(u"  method                          %s"
+         % dict(collections.Counter(f.method for f in all_families)))
+    corr = [f.anchor_min_corr for f in all_families if f.anchor_min_corr is not None]
+    emit(u"  motion flag (adjacent anchors < %.2f): %d of %d families with >= 2 anchors"
+         % (SF.SAME_SCENE_CORR, sum(f.motion_flag for f in all_families), len(corr)))
+    if failures:
+        emit(u"  FAILED sessions: %d" % len(failures))
+        for label, error in sorted(failures.items()):
+            emit(u"    %s  %s" % (label, error))
 
     emit(u"")
     emit(u"=========== how many families can label each axis ===========")
@@ -140,16 +188,18 @@ def main():
     loose = sum(len(f.unbracketed) for f in all_families)
     emit(u"  %d frames sit outside any anchor pair and carry lower confidence" % loose)
 
-    os.makedirs("data", exist_ok=True)
-    io.open(OUT_JSON, "w", encoding="utf-8").write(
-        json.dumps({"same_scene_corr": SF.SAME_SCENE_CORR,
+    os.makedirs(os.path.dirname(out_json) or ".", exist_ok=True)
+    io.open(out_json, "w", encoding="utf-8").write(
+        json.dumps({"dataset": args.dataset, "method": method,
+                    "same_scene_corr": SF.SAME_SCENE_CORR,
                     "corr_depth_mm": list(SF.CORR_DEPTH_MM),
                     "families": records}, ensure_ascii=False, indent=1))
 
+    report = CS.report_path(__file__, args.dataset, args.out)
     text = "\n".join(lines)
-    io.open("tools_scene_families.txt", "w", encoding="utf-8").write(text)
-    print(text)
-    print("\nwrote %s and tools_scene_families.txt" % OUT_JSON)
+    io.open(report, "w", encoding="utf-8").write(text)
+    print(text.encode("ascii", "replace").decode("ascii"))
+    print("\nwrote %s and %s" % (out_json, os.path.basename(report)))
 
 
 if __name__ == "__main__":
