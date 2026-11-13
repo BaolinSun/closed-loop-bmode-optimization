@@ -9,7 +9,12 @@ import numpy as np
 
 # Resolved from this file so the project can be moved or cloned without editing paths.
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
-DEFAULT_DATA_DIR = PROJECT_ROOT / "data" / "hisense_medical"
+try:
+    from . import data_paths as DP_PATHS
+except ImportError:
+    import data_paths as DP_PATHS
+# Phantom sessions live on the dataset drive (bmode_opt/data_paths.py), not in the project.
+DEFAULT_DATA_DIR = DP_PATHS.PHANTOM_ROOT
 
 FE_PARAM_FILE = "Algo_FeParam.pdt"
 BE_PARAM_FILE = "BEParam.pdt"
@@ -21,6 +26,11 @@ NUM_TGC_BANDS = 8
 BC0_DTYPE = np.uint16
 IMAGE_AREA_THRESHOLD = 0.15
 WINDOW_OCCUPANCY = 0.3
+
+# Screenshot row where the console's image panel starts: the title bar above it (logo, date,
+# probe) is 80 px tall on the 1600 x 940 Screenthum.bmp. BEParam's WinTop / BImageTop are
+# relative to that panel, WinLeft is already a screen column. See screen_image_bounds().
+SCREEN_IMAGE_PANEL_TOP_PX = 80
 
 _MISSING = object()
 
@@ -84,10 +94,32 @@ def leaf_floats(params, name, default=_MISSING):
     return np.array([float(item) for item in value.split(",") if item.strip()], dtype=np.float64)
 
 
+class CineCaptureError(ValueError):
+    """A multi-page (cine) export. Its PartitionInfo fields are per-page comma lists and its BC0
+    holds hundreds of frames; nothing downstream handles that, so it is refused by name."""
+
+
+def capture_page_num(capture_dir):
+    """PageNum of a capture: 1 for a single frame, the number of frames for a cine export.
+
+    Reads only Algo_PartitionInfo.pdt, so it is cheap enough to filter a whole folder with.
+    """
+    return _page_num(parse_pdt(Path(capture_dir) / PARTITION_FILE))
+
+
+def _page_num(partition):
+    return int(str(get_leaf(partition, "PageNum")).split(",")[0])
+
+
 def load_bc0(capture_dir):
     """Load Algo_BC0.bin as a (depth, line) log-domain envelope array."""
     capture_dir = Path(capture_dir)
     partition = parse_pdt(capture_dir / PARTITION_FILE)
+    # 电影回放导出（PageNum > 1）时 Line / Point / PageSize 都是逐页列表，下面的 int() 会
+    # 以一个看不出原因的 ValueError 崩掉。
+    if "," in str(get_leaf(partition, "Line")) or _page_num(partition) > 1:
+        raise CineCaptureError("%s is a cine export (PageNum %s); only single frames load"
+                               % (capture_dir.name, get_leaf(partition, "PageNum")))
     num_lines = leaf_int(partition, "Line")
     num_points = leaf_int(partition, "Point")
     page_size = leaf_int(partition, "PageSize")
@@ -180,9 +212,69 @@ def crop_image_area(gray, image_width_px=None, threshold=IMAGE_AREA_THRESHOLD, o
     return gray[row0:row1, col0:col1], (row0, row1, col0, col1)
 
 
+def _displayed_image_px(geometry):
+    """(rows, cols) the image occupies on screen: physical size over PixelGap (mm per pixel)."""
+    return ((geometry.depth_mm - geometry.min_depth_mm) / geometry.pixel_gap_mm,
+            geometry.width_mm / geometry.pixel_gap_mm)
+
+
+def _has_window(geometry):
+    return all(value is not None for value in (geometry.win_left_px, geometry.win_top_px,
+                                               geometry.win_width_px, geometry.win_height_px,
+                                               geometry.image_top_px))
+
+
+def image_fits_window(geometry):
+    """False when the display zoom makes the image larger than the B window, so the screenshot
+    shows only part of it. Such a screenshot cannot be compared with the whole BC0. True when
+    the export carries no window fields (nothing to check against)."""
+    if not _has_window(geometry):
+        return True
+    rows, cols = _displayed_image_px(geometry)
+    return rows <= geometry.win_height_px + 1.0 and cols <= geometry.win_width_px + 1.0
+
+
+def screen_image_bounds(geometry, screen_shape):
+    """(row0, row1, col0, col1) of the B-mode image in the screenshot, from exported geometry.
+
+    The console draws the image at PixelGap mm per screen pixel, centred in the B window
+    (screen rows 80 + WinTop .. + WinHeight, columns WinLeft .. + WinWidth). PixelGap already
+    carries the display zoom ("Z" on screen, BZoomRatio): on the 2026-10-09/10 carotid captures
+    zoom 1.1 / 1.2 / 1.4 / 1.6 / 1.8 all occur, and the union of the frames at each zoom fills
+    exactly depth / PixelGap rows by width / PixelGap columns around the window centre
+    (1.2: 763 x 695 measured, 762.9 x 694.2 predicted; 1.1: 700 x 637 vs 699.4 x 636.4).
+    BImageWidth / BImageHeight do not follow the zoom, so they cannot be used here.
+
+    Returns None when the export carries no window fields (callers fall back to
+    crop_image_area()) or when the zoom has pushed the image past the window edges (see
+    image_fits_window()). Unlike crop_image_area() this does not look at pixel values, so a
+    dark image, a crushed depth band or background noise rejection cannot move the crop - the
+    occupancy crop came out a median 96 rows short on the 2026-10 firmware.
+    """
+    if not _has_window(geometry) or not image_fits_window(geometry):
+        return None
+    rows, cols = _displayed_image_px(geometry)
+    centre_row = (SCREEN_IMAGE_PANEL_TOP_PX + geometry.win_top_px + geometry.image_top_px
+                  + geometry.win_height_px / 2.0)
+    centre_col = geometry.win_left_px + geometry.win_width_px / 2.0
+    row0 = max(0, int(round(centre_row - rows / 2.0)))
+    row1 = min(screen_shape[0], int(round(centre_row + rows / 2.0)))
+    col0 = max(0, int(round(centre_col - cols / 2.0)))
+    col1 = min(screen_shape[1], int(round(centre_col + cols / 2.0)))
+    return row0, row1, col0, col1
+
+
 def crop_capture_image(capture, **kwargs):
     """Load a capture's screenshot and crop it to the B-mode image using its own geometry."""
-    return crop_image_area(load_screenshot(capture.path), capture.geometry.image_width_px, **kwargs)
+    screen = load_screenshot(capture.path)
+    if not image_fits_window(capture.geometry):
+        raise ValueError("%s: display zoom puts the image past the window edges; the "
+                         "screenshot shows only part of it" % capture.name)
+    bounds = screen_image_bounds(capture.geometry, screen.shape)
+    if bounds is None or kwargs:
+        return crop_image_area(screen, capture.geometry.image_width_px, **kwargs)
+    row0, row1, col0, col1 = bounds
+    return screen[row0:row1, col0:col1], bounds
 
 
 def load_screenshot(capture_dir):
@@ -217,6 +309,13 @@ class Geometry:
     # Depth of the first sample. Zero for Hisense exports, which start at the probe
     # face; Field II shards start at their configured min_depth_mm instead.
     min_depth_mm: float = 0.0
+    # Where the B window sits on the screenshot (BEParam WinLeft / WinTop / WinWidth /
+    # BImageTop). None when not exported; see screen_image_bounds().
+    win_left_px: float = None
+    win_top_px: float = None
+    win_width_px: float = None
+    win_height_px: float = None
+    image_top_px: float = None
 
     @property
     def mm_per_point(self):
@@ -266,6 +365,14 @@ class Capture:
         return self.path.name
 
 
+def _optional_float(params, name):
+    """A leaf as float, or None when it is missing or ambiguous."""
+    try:
+        return leaf_float(params, name, None)
+    except (KeyError, ValueError):
+        return None
+
+
 def load_capture(capture_dir):
     """Load one Hisense export directory into a Capture."""
     capture_dir = Path(capture_dir)
@@ -285,6 +392,11 @@ def load_capture(capture_dir):
         image_height_px=leaf_float(be_params, "BImageHeight"),
         num_points=bc0.shape[0],
         num_lines=bc0.shape[1],
+        win_left_px=_optional_float(be_params, "WinLeft"),
+        win_top_px=_optional_float(be_params, "WinTop"),
+        win_width_px=_optional_float(be_params, "WinWidth"),
+        win_height_px=_optional_float(be_params, "WinHeight"),
+        image_top_px=_optional_float(be_params, "BImageTop"),
     )
 
     return Capture(

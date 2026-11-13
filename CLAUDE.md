@@ -26,7 +26,11 @@ messages and conversation — none of which go through the console.
 - `tests/measure_*.py` — measurements that answer a question; print a report
 - `tests/verify_*.py` — checks that assert an invariant
 - `tools_*.py` — pipeline steps that write artefacts
-- `data/` — gitignored
+- `data/` — gitignored; small generated files only (labels, families, manifests)
+- `E:/数据/` — the dataset root (hard-disk space): raw data under `hisense_medical/`
+  (`体模/`, `颈动脉/原始数据/`, ...), and anything large this project generates (training
+  caches, reading packages) under `closed_loop_bmode_optimization/`. All defaults come from
+  `bmode_opt/data_paths.py`; `BMODE_DATASET_ROOT` moves the whole tree.
 
 ## Naming
 
