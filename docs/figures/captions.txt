@@ -1,0 +1,43 @@
+Figure 1. Architecture of SixParamNet.
+(a) A single forward pass maps a B-mode frame, its depth profile and the 17 scalars that
+describe the settings currently in force onto a shared 256-dimensional representation.
+A 2-D residual encoder reduces the frame from 3 x 512 x 128 to 256 x 32 x 16 and a 1-D
+encoder reduces the profile to 128 x 32; every stage of both encoders is modulated by FiLM
+parameters derived from the current settings. Lateral averaging and concatenation give 32
+depth tokens, a parameter token is prepended, and a two-layer pre-norm Transformer encoder
+(d = 256, 8 heads) lets the parameter token and the depth tokens attend to one another. The
+parameter token and the mean of the depth tokens form the input to the shared trunk; the
+depth tokens are separately pooled into 8 bands for the TGC head. (b) Eight heads read the
+trunk. Back-end heads (blue) emit the optimal gain and the optimal TGC curve; front-end
+heads (orange) emit a distribution over the discrete imaging-depth, transmit-frequency and
+focus-depth rungs; auxiliary heads (green) are supervised during training but not used at
+inference. Every rung head additionally emits a three-way direction class (too low /
+correct / too high).
+
+Figure 2. Four design choices and what motivates them.
+(a) FiLM conditioning. The same raw dB frame is consistent with any current gain and TGC,
+so image brightness is only interpretable relative to the settings in force; the parameter
+embedding therefore modulates all four 2-D and both 1-D encoder stages rather than being
+concatenated once at the end. The modulating projection is zero-initialized, so the layer
+is the identity at initialization. (b) Back-end parameterization. The network predicts the
+optimal gain and TGC, and the correction is obtained by subtracting the current setting
+outside the network. Predicting the correction directly left a residual of about 0.3 dB
+and, when the current gain was standardized into a strong input, degenerated into
+optimum = current + correction: the feedback slope d(predicted optimum)/d(current gain)
+rose to a median of 1.45 and the closed loop diverged. With the present parameterization
+the slope is 0.01-0.03, no frame exceeds 1, and 99.4 % of closed-loop runs converge.
+(c) Ordinal focus head. The seven focus rungs are ordered, so a softmax over seven
+independent classes penalizes a one-rung error as heavily as a five-rung error. CORAL
+replaces it with a single score s and six learnable cut-points b_k, with
+P(rung > k) = sigmoid(s + b_k). The cumulative values are made monotone and then
+differenced, so the head still exposes seven log-probabilities and the decoder is
+unchanged. (d) TGC band head. One head is applied to each of eight depth bands; its input
+concatenates the trunk representation, the band's own pooled sequence feature, the band's
+current slider value and a one-hot band index. Sharing the head keeps the number of bands
+a property of the data rather than of the architecture.
+
+Figure 3. Parameter budget.
+(a) Share of the 4.99 M parameters by functional group. (b) Parameters per module, coloured
+by the same grouping as in (a). The 2-D image encoder accounts for most of the model and
+the Transformer for most of the remainder; the eight output heads together account for
+under 7 %. Modules below 0.03 M are omitted. Disabling the far-wall head gives 4.96 M.
