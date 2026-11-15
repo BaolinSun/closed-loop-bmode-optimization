@@ -81,10 +81,11 @@ from bmode_dl.model import BACKEND_OUTPUTS, count_parameters
 BACKEND_KEYS = ("gain_mae_db", "gain_within_deadband", "gain_dir_f1_derived", "tgc_mae_db", "slider_dir_f1_derived",
                 "gain_feedback_slope", "gain_feedback_frac_gt1")
 FRONTEND_KEYS = ("depth_top1", "depth_within1", "depth_dir_f1_derived", "frequency_hit", "frequency_dir_f1_derived",
-                 "focus_top1", "focus_within1", "focus_dir_f1_derived") + NEAR_KEYS
+                 "focus_top1", "focus_within1", "focus_dir_f1_derived", "depth_hit", "depth_balanced_hit",
+                 "frequency_balanced_hit", "focus_balanced_hit", "frontend_score_balanced") + NEAR_KEYS
 # 只训了一部分前端轴时（人体数据上深度与频率的标签还近乎可猜，先屏蔽），前端检查点不能按三轴
 # 平均分选：被屏蔽的轴只是噪声，会让选出来的那一轮与聚焦好不好无关。focus_top1_near 只看聚焦。
-FRONTEND_SELECT = ("frontend_score_near", "frontend_score", "focus_top1_near", "focus_top1")
+FRONTEND_SELECT = ("frontend_score_near", "frontend_score", "frontend_score_balanced", "focus_top1_near", "focus_top1")
 # 预测最优增益对当前增益的斜率中位数不小于它时，闭环会正反馈发散（fieldii_v4 的 data 模型是 1.45）。
 # 这样的轮次不能被选为 best.pt / best_backend.pt，除非还没有任何稳定的轮次。
 STABLE_SLOPE = 0.5
@@ -125,6 +126,9 @@ def parse_args(argv=None):
     p.add_argument("--frontend-dropout", dest="frontend_dropout", type=float, default=0.3,
                    help="dropout inside the depth/frequency/focus heads")
     p.add_argument("--frontend-label-smoothing", dest="frontend_label_smoothing", type=float, default=0.1)
+    p.add_argument("--frontend-set-targets", action="store_true",
+                   help="use acceptable depth sets and set-consistent depth/frequency directions; "
+                        "frequency directions also follow the label confidence weights")
     p.add_argument("--frontend-select", choices=FRONTEND_SELECT, default="frontend_score_near",
                    help="metric that chooses best_frontend.pt: frontend_score_near counts only frames within one "
                         "ladder step of the optimum, which is where the closed loop actually stops; "
@@ -291,7 +295,16 @@ def train_fold(args, data, fold, out_dir, report):
                              uncertainty_weighting=args.uncertainty_weighting,
                              frontend_label_smoothing=args.frontend_label_smoothing,
                              gain_deadband_fraction=args.gain_deadband_fraction,
-                             near_optimum_weight=args.near_optimum_weight).to(device)
+                             near_optimum_weight=args.near_optimum_weight,
+                             frontend_set_targets=args.frontend_set_targets).to(device)
+    weights = parse_loss_weights(args.loss_weight)
+    active = [axis for axis, terms in (
+        ("depth", ("depth_cls", "depth_ord", "depth_dir")),
+        ("frequency", ("frequency_cls", "frequency_dir")),
+        ("focus", ("focus_cls", "focus_ord", "focus_dir", "focus_coral")),
+        ("gain", ("gain_reg", "gain_dir")), ("tgc", ("tgc_reg", "tgc_dir")))
+        if any(weights.get(term, DEFAULT_WEIGHTS[term]) > 0 for term in terms)]
+    report("  active parameter tasks: %s; front-end set targets: %s" % (", ".join(active), args.frontend_set_targets))
     report("  model: input_mode=%s  backend_output=%s  frontend_dropout=%.2f  label_smoothing=%.2f  parameters=%.2f M"
            % (args.input_mode, args.backend_output, args.frontend_dropout, args.frontend_label_smoothing,
               count_parameters(model) / 1e6))

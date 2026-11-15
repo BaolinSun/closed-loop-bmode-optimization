@@ -298,27 +298,34 @@ def compute_metrics(preds, tg, norm=None):
         m["%s_dir_f1_derived" % axis] = macro_f1(tg["%s_dir" % axis][mask], derived)
         if "%s_dir_head" % axis in preds:
             m["%s_dir_f1_head" % axis] = macro_f1(tg["%s_dir" % axis][mask], preds["%s_dir_head" % axis][mask])
-        accept = tg["frequency_acceptable"][mask] if axis == "frequency" else None
+        accept = tg.get("%s_acceptable" % axis)
+        accept = accept[mask] if accept is not None else None
+        hits = accept[np.arange(len(pred)), pred] if accept is not None else (pred == target).astype(float)
+        # 各主标签档位等权，防止多数档掩盖少数档。集合命中与严格命中同时保留。
+        classes = np.unique(target)
+        per_class = [float(hits[target == c].mean()) for c in classes]
+        m["%s_balanced_hit" % axis] = float(np.mean(per_class))
+        m["%s_class_indices" % axis] = classes.tolist()
+        m["%s_class_counts" % axis] = [int((target == c).sum()) for c in classes]
+        m["%s_class_hit" % axis] = per_class
         if accept is not None:
-            m["frequency_hit"] = float(accept[np.arange(len(pred)), pred].mean())
+            m["%s_hit" % axis] = float(hits.mean())
 
         # 近最优帧：当前设置与最优相差不超过 1 档，闭环停点就落在这一带
         near = np.abs(current - target) <= 1
         m["%s_n_near" % axis] = int(near.sum())
         if near.any():
             if accept is not None:
-                m["frequency_hit_near"] = float(accept[near][np.arange(int(near.sum())), pred[near]].mean())
-            else:
-                m["%s_top1_near" % axis] = accuracy(target[near], pred[near])
+                m["%s_hit_near" % axis] = float(hits[near].mean())
+            m["%s_top1_near" % axis] = accuracy(target[near], pred[near])
             m["%s_mean_signed_steps_near" % axis] = float(np.mean(target[near] - pred[near]))
 
         # 期望档决策，用来判断偏浅是不是 argmax 造成的
         if "%s_idx_expected" % axis in preds:
             expected = preds["%s_idx_expected" % axis][mask]
             if accept is not None:
-                m["frequency_hit_expected"] = float(accept[np.arange(len(expected)), expected].mean())
-            else:
-                m["%s_top1_expected" % axis] = accuracy(target, expected)
+                m["%s_hit_expected" % axis] = float(accept[np.arange(len(expected)), expected].mean())
+            m["%s_top1_expected" % axis] = accuracy(target, expected)
             m["%s_mean_signed_steps_expected" % axis] = float(np.mean(target - expected))
 
     m["dynamic_range_n"] = int((tg["dr_mask"] > 0).sum())
@@ -342,6 +349,7 @@ def compute_metrics(preds, tg, norm=None):
     m["frontend_score"] = mean_of(FRONTEND_SCORE_KEYS)
     m["frontend_score_near"] = mean_of(FRONTEND_SCORE_NEAR_KEYS)
     m["frontend_score_expected"] = mean_of(FRONTEND_SCORE_EXPECTED_KEYS)
+    m["frontend_score_balanced"] = mean_of(("depth_balanced_hit", "frequency_balanced_hit", "focus_balanced_hit"))
     return m
 
 
@@ -368,7 +376,8 @@ def flatten_metrics(m, prefix=""):
     return flat
 
 
-MAIN_KEYS = ("score", "backend_score", "frontend_score", "frontend_score_near", "gain_feedback_slope", "gain_mae_db", "gain_within_deadband", "gain_dir_f1_derived", "tgc_mae_db",
+MAIN_KEYS = ("score", "backend_score", "frontend_score", "frontend_score_near", "frontend_score_balanced",
+             "depth_hit", "depth_balanced_hit", "frequency_balanced_hit", "focus_balanced_hit", "gain_feedback_slope", "gain_mae_db", "gain_within_deadband", "gain_dir_f1_derived", "tgc_mae_db",
              "slider_dir_f1_derived", "depth_top1", "depth_top1_near", "depth_within1", "depth_dir_f1_derived",
              "frequency_hit", "frequency_hit_near", "frequency_dir_f1_derived", "focus_top1", "focus_top1_near",
              "focus_within1", "focus_dir_f1_derived")

@@ -14,6 +14,9 @@
 
 前端三轴可加标签平滑（frontend_label_smoothing）：fieldii_v1 里前端训练损失降到 0.001 量级、验证
 在第 10–40 轮见顶，是在记训练体模。平滑只摊到可选档上。
+
+frontend_set_targets 启用时，深度改用可接受集合似然与最近集合距离，深度 / 频率方向与集合一致，
+频率方向也按标签置信降权。不开该选项时保留原损失，便于旧实验复现。
 """
 
 import torch
@@ -99,6 +102,35 @@ def coral_loss(cum_logits, target, mask):
     return masked_mean(bce, mask.float() * (target >= 0).float())
 
 
+def acceptable_losses(logits, valid, acceptable, mask, smoothing=0.0):
+    """集合似然与到最近可接受档的期望距离；空集合不参与监督。"""
+    allowed = (acceptable > 0) & (valid > 0)
+    weights = mask.float() * allowed.any(dim=1).float()
+    logits = masked_logits(logits, valid)
+    logp = F.log_softmax(logits, dim=1)
+    nll = -torch.logsumexp(logp.masked_fill(~allowed, -1e4), dim=1)
+    if smoothing > 0:
+        uniform = smoothing_target(valid, smoothing)
+        nll = (1.0 - smoothing) * nll - smoothing * (uniform * logp).sum(dim=1)
+    k = torch.arange(logits.shape[1], device=logits.device, dtype=torch.float32)
+    distances = (k[:, None] - k[None, :]).abs()[None, :, :]
+    nearest = distances.masked_fill(~allowed[:, None, :], 1e4).amin(dim=2)
+    ordinal = (logp.exp() * nearest).sum(dim=1)
+    return masked_mean(nll, weights)[0], masked_mean(ordinal, weights)[0], weights.sum()
+
+
+def acceptable_direction_loss(logits, current, valid, acceptable, mask, class_weights, smoothing=0.0):
+    """当前档已可接受就保持；否则只监督能走向可接受集合的方向。"""
+    allowed = (acceptable > 0) & (valid > 0)
+    k = torch.arange(allowed.shape[1], device=logits.device)[None, :]
+    keep = ((k == current[:, None]) & allowed).any(dim=1)
+    directions = torch.stack([((k > current[:, None]) & allowed).any(dim=1) & ~keep,
+                              keep, ((k < current[:, None]) & allowed).any(dim=1) & ~keep], dim=1)
+    weights = mask.float() * directions.any(dim=1).float()
+    cw = (directions.float() * class_weights[None, :]).sum(dim=1) / directions.sum(dim=1).clamp(min=1)
+    return acceptable_losses(logits, torch.ones_like(logits), directions, weights * cw, smoothing)[0]
+
+
 def predicted_optimum(out, tg):
     """网络给出的最优增益（dB）与最优 TGC 曲线（各段 dB）。两种后端输出方式都适用：
     最优 = 当前 + 修正量。"""
@@ -125,7 +157,7 @@ def invariance_loss(out_a, tg_a, out_b, tg_b):
 class SixParamLoss(nn.Module):
     def __init__(self, class_weights, norm, weights=None, borderline_weight=0.5,
                  uncertainty_weighting=False, frontend_label_smoothing=0.0,
-                 gain_deadband_fraction=1.0, near_optimum_weight=1.0):
+                 gain_deadband_fraction=1.0, near_optimum_weight=1.0, frontend_set_targets=False):
         super().__init__()
         self.weights = dict(DEFAULT_WEIGHTS)
         if weights:
@@ -145,6 +177,7 @@ class SixParamLoss(nn.Module):
         # 前端三轴里「当前设置离最优不超过一档」的帧的权重。闭环停点全都在这一带，而
         # invivo_bf_v1 测试集上聚焦「教师说已经正确」的那一类只保持了 103/361 = 29%。
         self.near_optimum_weight = float(near_optimum_weight)
+        self.frontend_set_targets = bool(frontend_set_targets)
         if self.uncertainty_weighting:
             self.log_vars = nn.ParameterDict({t: nn.Parameter(torch.zeros(())) for t in TASKS})
 
@@ -191,6 +224,12 @@ class SixParamLoss(nn.Module):
             out["depth_logits"], tg["depth_valid"], tg["optimal_depth_idx"], depth_w, self.smoothing)
         terms["depth_dir"], _ = weighted_ce(out["depth_dir"], tg["depth_dir"], depth_w, self.cw("depth_dir"),
                                             self.smoothing)
+        if self.frontend_set_targets:
+            terms["depth_cls"], terms["depth_ord"], counts["depth"] = acceptable_losses(
+                out["depth_logits"], tg["depth_valid"], tg["depth_acceptable"], depth_w, self.smoothing)
+            terms["depth_dir"] = acceptable_direction_loss(
+                out["depth_dir"], tg["depth_idx"], tg["depth_valid"], tg["depth_acceptable"],
+                depth_w, self.cw("depth_dir"), self.smoothing)
 
         # 频率：可接受集合
         f_logits = masked_logits(out["frequency_logits"], tg["frequency_valid"])
@@ -205,6 +244,14 @@ class SixParamLoss(nn.Module):
         terms["frequency_cls"], counts["frequency"] = masked_mean(nll, f_weight)
         terms["frequency_dir"], _ = weighted_ce(out["frequency_dir"], tg["frequency_dir"],
                                                 near_weight("frequency"), self.cw("frequency_dir"), self.smoothing)
+        if self.frontend_set_targets:
+            # 档位与方向使用相同的置信权重，避免低可信方向盖过集合监督。
+            terms["frequency_cls"], _, counts["frequency"] = acceptable_losses(
+                out["frequency_logits"], tg["frequency_valid"], tg["frequency_acceptable"],
+                f_weight, self.smoothing)
+            terms["frequency_dir"] = acceptable_direction_loss(
+                out["frequency_dir"], tg["frequency_idx"], tg["frequency_valid"], tg["frequency_acceptable"],
+                f_weight, self.cw("frequency_dir"), self.smoothing)
 
         # 聚焦
         focus_w = near_weight("focus")

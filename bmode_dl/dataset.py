@@ -390,7 +390,7 @@ class InputBuilder(torch.nn.Module):
 
 TARGET_KEYS = ("mode", "depth_idx", "frequency_idx", "focus_idx", "optimal_gain_db", "optimal_tgc_levels",
                "deadband_gain_levels", "backend_mask", "delta_dr_ui", "dr_dir", "dr_mask",
-               "optimal_depth_idx", "optimal_focus_idx", "optimal_frequency_idx", "frequency_acceptable",
+               "optimal_depth_idx", "optimal_focus_idx", "optimal_frequency_idx", "frequency_acceptable", "depth_acceptable",
                "depth_valid", "frequency_valid", "focus_valid", "depth_dir", "frequency_dir", "focus_dir",
                "depth_mask", "frequency_mask", "focus_mask", "frequency_weight", "frequency_borderline",
                "attenuation_db_cm_mhz", "electronic_noise_db", "aux_mask",

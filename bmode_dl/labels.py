@@ -134,6 +134,7 @@ def encode_rows(rows, ladders):
         "optimal_focus_idx": np.full(n, -1, np.int64),
         "optimal_frequency_idx": np.full(n, -1, np.int64),
         "frequency_acceptable": np.zeros((n, nf), np.float32),
+        "depth_acceptable": np.zeros((n, nd), np.float32),
         "depth_valid": np.zeros((n, nd), np.float32),
         "frequency_valid": np.zeros((n, nf), np.float32),
         "focus_valid": np.zeros((n, nz), np.float32),
@@ -211,6 +212,12 @@ def encode_rows(rows, ladders):
             if j >= 0 and d >= 0:
                 out["optimal_depth_idx"][i], out["depth_dir"][i], out["depth_mask"][i] = j, d, 1.0
                 out["depth_valid"][i, j] = 1.0
+                for v in (row.get("depth_acceptable_mm") or [row.get("optimal_depth_mm")]):
+                    a = ladder_index(ladders["depth_mm"], v)
+                    if a >= 0:
+                        out["depth_acceptable"][i, a] = 1.0
+                        out["depth_valid"][i, a] = 1.0
+                out["depth_acceptable"][i, j] = 1.0
         if row.get("focus_determined"):
             j = ladder_index(ladders["focus_mm"], row.get("optimal_focus_mm"))
             d = direction_index(K.FOCUS_DIRECTIONS, row.get("focus_direction"))

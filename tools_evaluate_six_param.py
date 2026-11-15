@@ -211,6 +211,9 @@ def evaluate_checkpoint(path, args, data_cache, frontend_path=None, label=None):
     m = compute_metrics(preds, tg, payload["norm"])
     results["network_recorded_start"] = m
     report("  network  %s" % format_metrics(m))
+    for axis in ("depth", "frequency", "focus"):
+        report("  %s by primary target rung: indices=%s counts=%s hit=%s" % (
+            axis, m.get(axis + "_class_indices"), m.get(axis + "_class_counts"), m.get(axis + "_class_hit")))
     report("  near optimum (frames within one ladder step of it; the closed loop stops in this band)")
     report("    %s" % format_metrics(m, NEAR_KEYS))
     report("  expected-step decision instead of argmax")

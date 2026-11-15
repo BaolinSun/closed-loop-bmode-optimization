@@ -66,7 +66,14 @@ python hisense_tgc_optimizer.py --data-dir ../data/hisense_medical/20260819 \
 python hisense_analyze.py --data-dir ../data/hisense_medical/20260819 --out-dir ../output
 ```
 
-## 当前进度
+## 海信人体五参数训练（2026-11-15）
+
+人体颈动脉联合训练深度、频率、聚焦、增益、TGC，暂不训练动态范围。
+服务器命令、所需缓存及评估口径见
+[五参数训练说明](docs/five_parameter_training_20261115.md)。
+`tests/verify_five_param_training.py` 只做标签与合成梯度检查，不执行训练。
+
+## 早期体模阶段进度
 
 前端采集与七个判定性实验（E0 / E0b / E1 / E2 / E3 / E4 / E5）**全部完成**，
 后端前向模型已按 E5 的结果改造并通过灰阶域保真度检验（1.86 灰阶）。
